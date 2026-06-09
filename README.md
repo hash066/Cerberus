@@ -285,3 +285,26 @@ To keep network communication light and prevent processing lags, Cerberus avoids
 
 ---
 
+2. How to Actually Do It Today
+If you want to start pooling your devices right now to achieve , here are the exact tools and approaches you should look into.
+
+A. For Running Giant AI Models (The 64GB Model on Four 16GB Laptops)
+If your main goal is to run massive AI models by splitting the load across whatever laptops or devices you have lying around, you don't even have to write complex code.
+
+Exo (exo-explore): This is an incredible open-source project that does exactly what Pranav is describing. It allows you to connect multiple devices (Macs, iPhones, Linux/Windows laptops) into a single cluster over Wi-Fi. It automatically discovers other devices and splits the execution of LLMs across them based on available memory and compute.
+
+Petals: Think of this as BitTorrent for text generation. It allows you to load bits and pieces of massive models (like LLaMA-3 70B) across multiple distributed computers. You run a small client, and other people (or your own other laptops) host different layers of the model.
+
+B. For General Compute Pooling (CPU/GPU)
+If you aren't just running AI, but want to distribute heavy coding compilation, math simulations, or rendering:
+
+Ray.io: A powerful open-source unified framework for scaling AI and Python applications. You can install Ray on three different laptops, connect them to a head node, and write Python code that seamlessly scales across all available CPU threads and GPUs across those machines.
+
+Distcc: If you are compiling massive software projects, distcc distributes the compilation of C/C++ code across several machines on a local network without requiring them to share a filesystem or have the same headers.
+
+C. For Peripherals (Audio & Storage)
+To get that "all resources combined" feel for hardware like mics, speakers, and storage, you have to use network abstraction layers:
+
+Audio Pooling (Mics/Speakers): Tools like Audio Relay or Jack Audio Connection Kit (JACK) allow you to route audio seamlessly over a local network, turning one laptop's mic into the input for another laptop, or playing audio out of 4 different devices simultaneously.
+
+Storage Pooling: Ceph or GlusterFS allow you to take the hard drives of multiple different machines and pool them into one giant, distributed virtual hard drive.
