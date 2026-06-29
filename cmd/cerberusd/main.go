@@ -17,6 +17,7 @@ import (
 	"github.com/hash066/cerberus/daemon/ffi"
 	"github.com/hash066/cerberus/daemon/gateway"
 	"github.com/hash066/cerberus/daemon/lifecycle"
+	"github.com/hash066/cerberus/daemon/system"
 	e2enode "github.com/hash066/cerberus/test/e2e/node"
 )
 
@@ -81,6 +82,19 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	mon.Start(ctx)
+
+	// Compose the real control plane: OCap kernel + libp2p/QUIC mesh + telemetry
+	// + scheduler + 9P namespace, under one supervision tree.
+	if sys, serr := system.Compose(ctx, k, "local"); serr != nil {
+		log.Printf("cerberusd: compose system failed: %v", serr)
+	} else {
+		log.Println("cerberusd: composed system up (mesh + telemetry + scheduler + 9P under supervisor)")
+		go func() {
+			if err := sys.Serve(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("cerberusd: system exited: %v", err)
+			}
+		}()
+	}
 
 	// Start Gateway
 	// We use a mock executor since we're in Workstream C
