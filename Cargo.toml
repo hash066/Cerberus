@@ -9,6 +9,13 @@ members = [
     "core/identity",
     "core/economy",
 ]
+# Built with their own toolchains (Tauri CLI / cargo-component for wasm32),
+# excluded from the host workspace build so `cargo build --workspace` stays green.
+exclude = [
+    "tray/src-tauri",
+    "components/examples/hello-shard",
+    "components/examples/matmul",
+]
 
 [workspace.package]
 version = "0.1.0"

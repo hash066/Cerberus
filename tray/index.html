@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cerberus Telemetry</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+        background-color: #1e1e2e;
+        color: #cdd6f4;
+        margin: 0;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+      }
+      h1 { color: #89b4fa; }
+      #telemetry-container {
+        background-color: #313244;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        text-align: left;
+        width: 100%;
+        max-width: 400px;
+      }
+      .metric { margin-bottom: 10px; }
+      .label { font-weight: bold; color: #a6e3a1; }
+    </style>
+  </head>
+  <body>
+    <h1>Cerberus Topology</h1>
+    <div id="telemetry-container">
+      <div class="metric"><span class="label">Daemon State:</span> <span id="state">Connecting...</span></div>
+      <div class="metric"><span class="label">Version:</span> <span id="version">Unknown</span></div>
+      <button id="refresh-btn">Refresh</button>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

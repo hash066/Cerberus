@@ -19,7 +19,7 @@ fn kernel() -> &'static MemKernel {
 /// Returns the contract version as a static C string. Never freed.
 #[no_mangle]
 pub extern "C" fn cerberus_version() -> *const c_char {
-    b"0.1.0\0".as_ptr() as *const c_char
+    c"0.1.0".as_ptr()
 }
 
 /// Mint a VRAM capability scoped to `bytes`. Returns an opaque handle (>0), or 0 on error.

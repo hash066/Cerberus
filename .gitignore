@@ -32,4 +32,5 @@ Thumbs.db
 # local runtime
 *.sock
 /.cerberus/
+.cerberus-e2e-*/
 *.log

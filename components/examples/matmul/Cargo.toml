@@ -1,0 +1,19 @@
+[package]
+name = "matmul"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "cerberus:matmul"
+
+[package.metadata.component.target]
+path = "../../wit/cerberus-agent.wit"
+world = "agent"

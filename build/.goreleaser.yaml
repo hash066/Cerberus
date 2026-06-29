@@ -1,0 +1,76 @@
+version: 2
+
+project_name: cerberus
+
+dist: build/dist
+
+before:
+  hooks:
+    - go test ./...
+    - cargo test --workspace
+
+builds:
+  - id: cerberus
+    main: ./cmd/cerberus
+    binary: cerberus
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: cerberusd
+    main: ./cmd/cerberusd
+    binary: cerberusd
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: cerberus-binaries
+    ids:
+      - cerberus
+      - cerberusd
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+      - ARCHITECTURE.md
+      - CONTRACT.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: true

@@ -1,42 +1,48 @@
-// Command cerberus is the Cerberus CLI (vertical 10).
-// v0.1 skeleton: version/status/run subcommands. Lane C grows this onto the
-// gRPC-over-UDS IPC contract (ARCHITECTURE.md §3.8) talking to cerberusd.
 package main
 
 import (
 	"fmt"
+	"log"
+	"net/rpc"
 	"os"
-
-	contract "github.com/hash066/cerberus/contract/go"
 )
 
-func usage() {
-	fmt.Print(`cerberus — Cerberus CLI (v0.1 skeleton)
-
-usage:
-  cerberus version              print contract version
-  cerberus status               show local node status (stub)
-  cerberus run <wasm> --on <p>  run a capability-gated WASM task on a peer (integration)
-`)
+type StatusRequest struct{}
+type StatusResponse struct {
+	Version string
+	State   string
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
+		fmt.Println("Usage: cerberus <command>")
+		fmt.Println("Commands: status, run")
+		os.Exit(1)
 	}
-	switch os.Args[1] {
-	case "version":
-		fmt.Printf("cerberus %s\n", contract.ContractVersion)
+
+	cmd := os.Args[1]
+
+	client, err := rpc.Dial("tcp", "127.0.0.1:9092")
+	if err != nil {
+		log.Fatalf("Failed to connect to cerberusd: %v", err)
+	}
+	defer client.Close()
+
+	switch cmd {
 	case "status":
-		fmt.Println("node: local  state: skeleton  peers: 0  (IPC to cerberusd wired during integration)")
+		var req StatusRequest
+		var resp StatusResponse
+		err = client.Call("DaemonRPC.Status", &req, &resp)
+		if err != nil {
+			log.Fatalf("RPC error: %v", err)
+		}
+		fmt.Printf("Cerberus Daemon Status\n")
+		fmt.Printf("Version: %s\n", resp.Version)
+		fmt.Printf("State:   %s\n", resp.State)
 	case "run":
-		fmt.Println("run: requires a live cerberusd + mesh (integration milestone) — see test/e2e for the in-process demo")
-	case "-h", "--help", "help":
-		usage()
+		fmt.Println("Run command stub. Will dispatch to gateway/scheduler in the future.")
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
-		usage()
-		os.Exit(2)
+		fmt.Printf("Unknown command: %s\n", cmd)
+		os.Exit(1)
 	}
 }

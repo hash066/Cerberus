@@ -39,10 +39,9 @@ tasks:
         ignore_error: true
 
   gen:
-    desc: Regenerate bindings from proto/WIT (requires buf + wit-bindgen). v0.1 uses handwritten contract types.
+    desc: Regenerate proto + WIT bindings (raw: go run ./build/gen.go)
     cmds:
-      - cmd: buf generate || echo "buf not installed — v0.1 uses handwritten contract/ types (see CONTRACT.md)"
-        ignore_error: true
+      - go run ./build/gen.go
 
   demo:
     desc: v0.1 acceptance — 2-node mesh + remote WASM exec (raw: go run ./test/e2e)

@@ -1,8 +1,7 @@
 version: v2
-# v0.1: codegen optional — contract/go and contract/rust are handwritten mirrors (see CONTRACT.md).
-# When buf + plugins are installed, `buf generate` (run from proto/) emits Go bindings.
+# v0.1: codegen output is generated only; do not edit contract/go/gen by hand.
 plugins:
-  - remote: buf.build/protocolbuffers/go
+  - local: protoc-gen-go
     out: ../contract/go/gen
     opt:
-      - paths=source_relative
+      - module=github.com/hash066/cerberus/contract/go/gen
