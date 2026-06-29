@@ -107,8 +107,18 @@ impl std::error::Error for CapError {}
 
 /// The capability kernel seam — implemented by `core/ocap` (lane A).
 pub trait CapKernel {
-    fn mint(&self, r: ResourceRef, rights: &[Right], caveats: &[Caveat]) -> Result<CapHandle, CapError>;
-    fn attenuate(&self, parent: CapHandle, drop: &[Right], add: &[Caveat]) -> Result<CapHandle, CapError>;
+    fn mint(
+        &self,
+        r: ResourceRef,
+        rights: &[Right],
+        caveats: &[Caveat],
+    ) -> Result<CapHandle, CapError>;
+    fn attenuate(
+        &self,
+        parent: CapHandle,
+        drop: &[Right],
+        add: &[Caveat],
+    ) -> Result<CapHandle, CapError>;
     fn verify(&self, h: CapHandle, op: &str, now_unix: u64) -> Result<(), CapError>;
     fn revoke(&self, h: CapHandle) -> Result<(), CapError>;
     fn is_revoked(&self, h: CapHandle) -> bool;
@@ -117,7 +127,7 @@ pub trait CapKernel {
 // serde_json is only needed because Caveat.val is dynamic JSON; serde dep is
 // re-exported through the workspace. (serde_json is a thin, ubiquitous dep.)
 mod serde_bytes_64 {
-    use serde::{Deserializer, Serializer, Deserialize};
+    use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(b: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_bytes(b)
     }
@@ -143,7 +153,10 @@ mod tests {
 
     #[test]
     fn error_display() {
-        let e = CapError { code: CapErrorCode::Denied, msg: "no vram".into() };
+        let e = CapError {
+            code: CapErrorCode::Denied,
+            msg: "no vram".into(),
+        };
         assert_eq!(format!("{e}"), "Denied: no vram");
     }
 }

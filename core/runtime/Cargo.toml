@@ -3,8 +3,12 @@ name = "cerberus-runtime"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Vertical 03 — WASM Component Model runtime + promise pipelining. Lane A. (wasmtime)"
+description = "Vertical 03 — WASM runtime (wasmi) + promise pipelining. Lane A."
 
 [dependencies]
 cerberus-contract = { path = "../../contract/rust" }
 cerberus-ocap = { path = "../ocap" }
+wasmi = "1.1.0"
+
+[dev-dependencies]
+wat = "1.252.0"

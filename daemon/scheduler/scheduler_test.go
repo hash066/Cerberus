@@ -1,0 +1,86 @@
+package scheduler
+
+import (
+	"testing"
+
+	contract "github.com/hash066/cerberus/contract/go"
+)
+
+func node(id byte, vramFree uint64, throttling bool, ac bool) contract.NodeTelemetry {
+	src := contract.PowerBattery
+	if ac {
+		src = contract.PowerAC
+	}
+	return contract.NodeTelemetry{
+		PeerID:  contract.PeerID{id},
+		Memory:  contract.Memory{VRAMFree: vramFree},
+		Thermal: contract.Thermal{HeadroomC: 20, Throttling: throttling},
+		Power:   contract.Power{Src: src},
+	}
+}
+
+func task(id byte) contract.ComputeTask {
+	return contract.ComputeTask{TaskID: []byte{id}, Shard: contract.Shard{Kind: contract.ShardPipeline}}
+}
+
+func TestPlacePicksBestFeasibleNode(t *testing.T) {
+	s := New(nil)
+	s.UpdateNode(node(1, 4_000_000_000, false, false)) // 4GB, battery
+	s.UpdateNode(node(2, 8_000_000_000, false, true))  // 8GB, AC -> best
+	s.UpdateNode(node(3, 16_000_000_000, true, true))  // throttling -> infeasible
+
+	plan, err := s.Place(task(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Placements[0].Node != (contract.PeerID{2}) {
+		t.Fatalf("expected node 2 primary, got %v", plan.Placements[0].Node[0])
+	}
+	if len(plan.Standbys) != 1 || plan.Standbys[0].Node != (contract.PeerID{1}) {
+		t.Fatalf("expected node 1 standby")
+	}
+}
+
+func TestPlaceFailsWithNoFeasibleNode(t *testing.T) {
+	s := New(nil)
+	s.UpdateNode(node(1, 8_000_000_000, true, true)) // throttling only
+	if _, err := s.Place(task(11)); err == nil {
+		t.Fatal("expected error when no feasible node")
+	}
+}
+
+func TestRereotePromotesStandby(t *testing.T) {
+	s := New(nil)
+	s.UpdateNode(node(1, 4_000_000_000, false, true))
+	s.UpdateNode(node(2, 8_000_000_000, false, true)) // best -> primary
+	plan, err := s.Place(task(12))
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := plan.Placements[0].Node
+	standby := plan.Standbys[0].Node
+
+	newPlan, err := s.Reroute([]byte{12}, primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newPlan.Placements[0].Node != standby {
+		t.Fatalf("expected standby %v promoted, got %v", standby[0], newPlan.Placements[0].Node[0])
+	}
+}
+
+func TestMinVRAMConstraint(t *testing.T) {
+	s := New(DefaultCostModel{MinVRAM: 6_000_000_000})
+	s.UpdateNode(node(1, 4_000_000_000, false, true)) // below min -> infeasible
+	s.UpdateNode(node(2, 8_000_000_000, false, true)) // ok
+	plan, err := s.Place(task(13))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Placements[0].Node != (contract.PeerID{2}) {
+		t.Fatal("expected only node 2 feasible")
+	}
+	if len(plan.Standbys) != 0 {
+		t.Fatal("expected no standby (only one feasible node)")
+	}
+}

@@ -29,9 +29,15 @@ pub extern "C" fn cerberus_cap_mint_vram(bytes: u64) -> u64 {
         kind: ResourceKind::Vram,
         node: [0u8; 32],
         path: String::from("/cer/dev/vram/local/0"),
-        quota: Some(cerberus_contract::Quota { bytes, flops: 0, secs: 0 }),
+        quota: Some(cerberus_contract::Quota {
+            bytes,
+            flops: 0,
+            secs: 0,
+        }),
     };
-    kernel().mint(r, &[Right::Read, Right::Alloc], &[]).unwrap_or(0)
+    kernel()
+        .mint(r, &[Right::Read, Right::Alloc], &[])
+        .unwrap_or(0)
 }
 
 /// Verify a capability handle. Returns 0 if valid, nonzero error code otherwise.
