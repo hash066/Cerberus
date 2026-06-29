@@ -7,3 +7,6 @@ description = "Vertical 07 — Identity & capability lifecycle (issuance/revocat
 
 [dependencies]
 cerberus-contract = { path = "../../contract/rust" }
+ed25519-dalek = { workspace = true }
+ciborium = { workspace = true }
+getrandom = "0.2"
