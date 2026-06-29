@@ -1,0 +1,9 @@
+[package]
+name = "cerberus-economy"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Vertical 05 — eUTXO settlement + Open Mesh economy (optional/profile-gated). Lane C."
+
+[dependencies]
+cerberus-contract = { path = "../../contract/rust" }

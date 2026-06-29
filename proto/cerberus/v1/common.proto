@@ -1,0 +1,25 @@
+syntax = "proto3";
+package cerberus.v1;
+
+option go_package = "github.com/hash066/cerberus/contract/go/gen/cerberusv1;cerberusv1";
+
+// Logical causality clock used across telemetry and CRDT ops.
+message VectorClock {
+  map<string, uint64> entries = 1; // peer-id (hex) -> logical counter
+}
+
+// A peer identity is an Ed25519 public key (32 bytes).
+message PeerId { bytes key = 1; }
+
+// Resource kinds a capability may point at. Mirrors schemas/capability.cddl `rkind`.
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  RESOURCE_KIND_VRAM = 1;
+  RESOURCE_KIND_GPU = 2;
+  RESOURCE_KIND_CPU = 3;
+  RESOURCE_KIND_FS = 4;
+  RESOURCE_KIND_AUDIO = 5;
+  RESOURCE_KIND_TOPIC = 6;
+  RESOURCE_KIND_WALLET = 7;
+  RESOURCE_KIND_KILLSWITCH = 8;
+}

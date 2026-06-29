@@ -1,0 +1,57 @@
+# Taskfile for Cerberus. Install runner: go install github.com/go-task/task/v3/cmd/task@latest
+# Every target also documents the raw command so it can be run without `task`.
+version: "3"
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build Go + Rust (raw: `go build ./...` && `cargo build`)
+    cmds:
+      - go build ./...
+      - cargo build
+
+  build:go:
+    desc: "raw: go build ./..."
+    cmds:
+      - go build ./...
+
+  build:rust:
+    desc: "raw: cargo build"
+    cmds:
+      - cargo build
+
+  test:
+    desc: Unit tests, Go + Rust (raw: `go test ./...` && `cargo test`)
+    cmds:
+      - go test ./...
+      - cargo test
+
+  lint:
+    desc: golangci-lint + clippy (best-effort; skips if linters absent)
+    cmds:
+      - cmd: golangci-lint run ./... || echo "golangci-lint not installed, skipping"
+        ignore_error: true
+      - cmd: cargo clippy --all-targets || echo "clippy issues / not installed"
+        ignore_error: true
+
+  gen:
+    desc: Regenerate bindings from proto/WIT (requires buf + wit-bindgen). v0.1 uses handwritten contract types.
+    cmds:
+      - cmd: buf generate || echo "buf not installed — v0.1 uses handwritten contract/ types (see CONTRACT.md)"
+        ignore_error: true
+
+  demo:
+    desc: v0.1 acceptance — 2-node mesh + remote WASM exec (raw: go run ./test/e2e)
+    cmds:
+      - go run ./test/e2e
+
+  ci:
+    desc: What CI runs
+    cmds:
+      - task: build
+      - task: test
+      - task: lint

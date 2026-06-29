@@ -1,0 +1,68 @@
+syntax = "proto3";
+package cerberus.v1;
+
+import "cerberus/v1/common.proto";
+
+option go_package = "github.com/hash066/cerberus/contract/go/gen/cerberusv1;cerberusv1";
+
+// Published on Zenoh key cerberus/<site>/telemetry/<peer> at 1-4 Hz.
+// Consumed by scheduler (06), lifecycle (09), tray (10). See ARCHITECTURE.md §3.2.
+message NodeTelemetry {
+  bytes peer_id = 1;
+  uint64 epoch_ms = 2;
+  Compute compute = 3;
+  Memory memory = 4;
+  repeated Link links = 5;
+  Thermal thermal = 6;
+  Power power = 7;
+  VectorClock clock = 8;
+}
+
+message Compute {
+  uint32 p_cores = 1;
+  uint32 e_cores = 2;
+  uint32 npu_tops = 3;
+  double flops = 4;
+  double ipc = 5;
+}
+
+message Memory {
+  uint64 ram_total = 1;
+  uint64 ram_free = 2;
+  uint64 vram_total = 3;
+  uint64 vram_free = 4;
+  uint64 swap_free = 5;
+}
+
+message Link {
+  bytes peer = 1;
+  Medium medium = 2;
+  double mbps = 3;
+  double rtt_ms = 4;
+  uint32 mtu = 5;
+}
+
+enum Medium {
+  MEDIUM_WIFI = 0;
+  MEDIUM_ETH = 1;
+  MEDIUM_THUNDERBOLT = 2;
+  MEDIUM_RDMA_TB = 3;
+}
+
+message Thermal {
+  double cpu_c = 1;
+  double gpu_c = 2;
+  double headroom_c = 3;
+  bool throttling = 4;
+}
+
+message Power {
+  PowerSource src = 1;
+  double battery_pct = 2;
+  LidState lid = 3;
+  SleepHint hint = 4;
+}
+
+enum PowerSource { POWER_SOURCE_AC = 0; POWER_SOURCE_BATTERY = 1; }
+enum LidState { LID_STATE_OPEN = 0; LID_STATE_CLOSED = 1; }
+enum SleepHint { SLEEP_HINT_AWAKE = 0; SLEEP_HINT_IDLE = 1; SLEEP_HINT_IMMINENT = 2; }

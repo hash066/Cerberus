@@ -1,0 +1,14 @@
+[package]
+name = "cerberus-cabi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "C-ABI surface exposing the Rust core to the Go daemon (the FFI keystone)."
+
+[lib]
+name = "cerberus_cabi"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+cerberus-contract = { path = "../../contract/rust" }
+cerberus-ocap = { path = "../ocap" }

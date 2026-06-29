@@ -1,0 +1,48 @@
+// The capability spine expressed as component-model types.
+// A guest sees ONLY what its world imports — that IS the sandbox.
+// Mirrors docs/schemas/schemas.md §7. Frozen contract — do not edit unilaterally.
+package cerberus:agent@0.1.0;
+
+interface caps {
+  // capabilities are opaque, unforgeable resource handles
+  record quota { bytes: u64, flops: u64, secs: u64 }
+  type peer = list<u8>;
+  type proof = list<u8>;
+
+  variant error {
+    denied,
+    revoked,
+    quota-exceeded,
+    partitioned,
+    internal(string),
+  }
+
+  resource vram {
+    info: func() -> quota;
+  }
+
+  resource gpu {
+    submit: func(work: list<u8>) -> result<list<u8>, error>;
+  }
+
+  resource topic {
+    publish: func(msg: list<u8>) -> result<_, error>;
+  }
+
+  resource memory {
+    apply: func(op: list<u8>) -> result<_, error>;   // CRDT delta
+    snapshot: func() -> list<u8>;
+  }
+
+  // OpenMesh profile only.
+  resource wallet {
+    balance: func() -> u64;
+    spend: func(to: peer, amt: u64) -> result<proof, error>;
+  }
+}
+
+// The world an agent/worker component is compiled against.
+world agent {
+  import caps;
+  export run: func(args: list<string>) -> result<list<u8>, string>;
+}

@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/hash066/Cerberus/schemas/profile.schema.json",
+  "title": "Cerberus Profile Config",
+  "description": "Two profiles, one codebase. See ARCHITECTURE.md §3.7 / §7.",
+  "type": "object",
+  "required": ["profile"],
+  "properties": {
+    "profile": { "enum": ["open_mesh", "sealed"] },
+    "economy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "chain": { "type": "string" },
+        "settlement": { "enum": ["optimistic", "zkwasm"] }
+      }
+    },
+    "attestation": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "require_tee": { "type": "boolean" },
+        "tee": { "type": "array", "items": { "enum": ["tdx", "sev", "sep"] } }
+      }
+    },
+    "compliance": {
+      "type": "object",
+      "properties": {
+        "audit_export": { "type": "boolean" },
+        "retention_days": { "type": "integer", "minimum": 0 },
+        "pii_redaction": { "type": "boolean" }
+      }
+    },
+    "killswitch": {
+      "type": "object",
+      "properties": { "mode": { "enum": ["on_chain", "governed"] } }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "profile": { "const": "sealed" } } },
+      "then": {
+        "properties": {
+          "economy": { "properties": { "enabled": { "const": false } } },
+          "attestation": { "properties": { "enabled": { "const": true } } }
+        }
+      }
+    }
+  ]
+}

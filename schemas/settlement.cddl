@@ -1,0 +1,20 @@
+; Cerberus eUTXO settlement — OpenMesh profile only.
+; Frozen contract. Normative in ARCHITECTURE.md §3.6 / docs/verticals/05.
+
+settlement-tx = {
+  inputs:  [+ utxo-ref],            ; spent compute credits
+  outputs: [+ utxo],                ; new credits / payment to provider
+  proof:   zk-proof / optimistic,   ; honesty guarantee
+  task:    bytes,                   ; task_id settled
+  ? killswitch: bool .default false ; on-chain revocation flag
+}
+
+utxo      = { owner: peer-id, value: uint, ? datum: any }
+utxo-ref  = { tx: bytes, index: uint }
+peer-id   = bytes .size 32
+
+; Default mode: optimistic — provider paid on claim; challengeable in a dispute window.
+optimistic = { mode: "optimistic", bond: uint, dispute_until: uint }
+
+; Opt-in mode: zk-WASM validity proof (Frontier, ~100x overhead).
+zk-proof  = { mode: "zkwasm", program: bytes, public: [* any], proof: bytes }

@@ -1,0 +1,38 @@
+syntax = "proto3";
+package cerberus.v1;
+
+option go_package = "github.com/hash066/cerberus/contract/go/gen/cerberusv1;cerberusv1";
+
+// Compute task allocation + promise pipelining. See ARCHITECTURE.md §3.4, docs/verticals/03.
+message ComputeTask {
+  bytes task_id = 1;
+  bytes component = 2;          // IPLD CID of the WASM component to run
+  Shard shard = 3;
+  repeated bytes caps = 4;      // capabilities granted to this task
+  repeated Promise deps = 5;    // promise-pipelined inputs (CapTP-style)
+  bytes result_cap = 6;         // where to deliver / settle
+}
+
+message Shard {
+  ShardKind kind = 1;
+  uint32 layer_lo = 2;
+  uint32 layer_hi = 3;
+  uint32 tp_rank = 4;
+  uint32 tp_world = 5;
+}
+
+enum ShardKind { SHARD_KIND_PIPELINE = 0; SHARD_KIND_TENSOR = 1; SHARD_KIND_DATA = 2; }
+
+// An unresolved future referenced before its producer finishes.
+message Promise {
+  bytes promise_id = 1;
+  bytes producer = 2;          // peer-id
+}
+
+// Result returned for a completed task (the v0.1 demo carries bytes here).
+message ComputeResult {
+  bytes task_id = 1;
+  bool ok = 2;
+  bytes output = 3;
+  string error = 4;
+}

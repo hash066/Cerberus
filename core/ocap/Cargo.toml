@@ -1,0 +1,13 @@
+[package]
+name = "cerberus-ocap"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "OCap security kernel (vertical 00) — capability mechanism + WIT host. Lane A."
+
+[dependencies]
+cerberus-contract = { path = "../../contract/rust" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"

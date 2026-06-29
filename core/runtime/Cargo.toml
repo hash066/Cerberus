@@ -1,0 +1,10 @@
+[package]
+name = "cerberus-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Vertical 03 — WASM Component Model runtime + promise pipelining. Lane A. (wasmtime)"
+
+[dependencies]
+cerberus-contract = { path = "../../contract/rust" }
+cerberus-ocap = { path = "../ocap" }

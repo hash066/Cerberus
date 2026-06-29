@@ -1,0 +1,9 @@
+[package]
+name = "cerberus-identity"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Vertical 07 — Identity & capability lifecycle (issuance/revocation/attestation). Lane B."
+
+[dependencies]
+cerberus-contract = { path = "../../contract/rust" }

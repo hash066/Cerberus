@@ -1,0 +1,32 @@
+syntax = "proto3";
+package cerberus.v1;
+
+import "cerberus/v1/common.proto";
+
+option go_package = "github.com/hash066/cerberus/contract/go/gen/cerberusv1;cerberusv1";
+
+// CRDT operation envelope. See ARCHITECTURE.md §3.3 and docs/verticals/02.
+// `domain` selects the reducer; `agent.belief` triggers contradiction flagging.
+message CrdtOp {
+  bytes doc_id = 1;
+  bytes actor = 2;          // peer-id
+  VectorClock clock = 3;
+  string domain = 4;        // kv | counter | set | log | agent.belief
+  bytes delta = 5;          // Automerge/yrs binary change
+  bytes cap = 6;            // capability authorizing the write (topic/memory)
+  bytes sig = 7;            // Ed25519 over the op
+}
+
+// Emitted instead of a silent merge when `agent.belief` detects contradiction.
+message BeliefConflict {
+  bytes doc_id = 1;
+  string subject = 2;
+  repeated Candidate candidates = 3;
+  uint64 detected_at = 4;
+}
+
+message Candidate {
+  bytes actor = 1;
+  bytes value = 2;
+  VectorClock clock = 3;
+}

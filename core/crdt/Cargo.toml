@@ -1,0 +1,9 @@
+[package]
+name = "cerberus-crdt"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Vertical 02 — CRDT agent memory + vector clocks. Lane A. (wrap automerge/yrs)"
+
+[dependencies]
+cerberus-contract = { path = "../../contract/rust" }

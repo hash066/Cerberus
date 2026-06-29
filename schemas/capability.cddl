@@ -1,0 +1,27 @@
+; Cerberus capability token — canonical CBOR, Ed25519-signed.
+; Frozen contract. Normative in ARCHITECTURE.md §3.1 / docs/schemas/schemas.md §1.
+
+capability = {
+  ? v: uint .default 1,
+  id:        bytes .size 16,         ; ULID/UUIDv7 of this capability
+  resource:  resource-ref,           ; what it points at
+  rights:    [+ right],              ; e.g. ["read"], ["alloc","exec"]
+  caveats:   [* caveat],             ; attenuations (macaroon-style)
+  parent:    bytes / null,           ; capability it was attenuated from
+  issuer:    peer-id,                ; node that minted it
+  nbf:       uint,                   ; not-before (unix sec)
+  exp:       uint / null,            ; expiry
+  nonce:     bytes .size 12,
+  sig:       bytes .size 64          ; Ed25519 over the canonical encoding sans `sig`
+}
+
+resource-ref = { kind: rkind, node: peer-id, path: tstr, ? quota: quota }
+rkind   = "vram" / "gpu" / "cpu" / "fs" / "audio" / "topic" / "wallet" / "killswitch"
+quota   = { ? bytes: uint, ? flops: uint, ? secs: uint }
+caveat  = { op: tstr, val: any }
+right   = "read" / "write" / "alloc" / "exec" / "mount" / "spend" / "revoke"
+peer-id = bytes .size 32
+
+; Attenuation rule (enforced by the kernel, vertical 00):
+;   child.rights  is a subset   of parent.rights
+;   child.caveats is a superset of parent.caveats  (strictly narrower)
