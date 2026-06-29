@@ -1,5 +1,7 @@
 # Vertical 07 — Identity & Capability Lifecycle (NEW)
 
+> **Workstream B — Connectivity & Trust Fabric.** Tightly coupled to 00 via the cap_verify/is_revoked API + sys/revocations OR-set. Depends on: 00 (cap kernel), 02 (CRDT engine). Stub until integration: cap kernel, CRDT engine. See [docs/workstreams.md](../workstreams.md).
+
 > **Net-new vertical.** OCap ([00](00-ocap-security-kernel.md)) is only as strong as its issuance and revocation story. This vertical owns the *lifecycle*: bootstrap, mint, attenuate, delegate, rotate, revoke. Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## 1. Purpose & Responsibilities

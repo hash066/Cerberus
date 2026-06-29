@@ -1,5 +1,7 @@
 # Vertical 04 — 9P Peripheral Virtualization
 
+> **Workstream A — Core Compute & Cognition Plane.** Depends on: 00 (cap-gated walk/open), 05 (IPLD blockstore, shared). Stub until integration: transport/RDMA endpoints. See [docs/workstreams.md](../workstreams.md).
+
 > Owner archetype: **The Kernel Hacker.** Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## 1. Purpose & Responsibilities

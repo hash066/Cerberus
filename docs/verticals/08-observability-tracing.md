@@ -1,5 +1,7 @@
 # Vertical 08 — Observability & Distributed Tracing (NEW)
 
+> **Workstream B — Connectivity & Trust Fabric.** Depends on: 01 (Zenoh transport). Stub until integration: none (self-contained collector). See [docs/workstreams.md](../workstreams.md).
+
 > **Net-new vertical.** A zero-trust mesh you cannot trace is unauditable — fatal for the Sealed profile and painful for debugging the Open one. Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## 1. Purpose & Responsibilities

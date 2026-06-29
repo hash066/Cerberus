@@ -1,5 +1,7 @@
 # Vertical 10 — Desktop App Model (Daemon · CLI · Tray)
 
+> **Workstream C — Economy, Lifecycle & Surface.** Depends on: 00/03/06 (core via IPC), 08 (telemetry for tray). Stub until integration: stub core daemon. See [docs/workstreams.md](../workstreams.md).
+
 > Form-factor vertical. **Browser architectures are strictly forbidden.** Cerberus is a local desktop application: a headless daemon, a CLI, and a native System Tray UI. Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## 1. Purpose & Responsibilities

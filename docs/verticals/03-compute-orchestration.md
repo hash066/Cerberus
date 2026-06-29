@@ -1,5 +1,7 @@
 # Vertical 03 — Compute Orchestration (Sharding · WASM · Promise Pipelining)
 
+> **Workstream A — Core Compute & Cognition Plane.** Depends on: 00 (caps/WIT host), 04 (data-plane endpoints), 06 (placement). Stub until integration: data-plane transport, synthetic placement. See [docs/workstreams.md](../workstreams.md).
+
 > Owner archetype: **The AI Orchestrator.** Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## 1. Purpose & Responsibilities

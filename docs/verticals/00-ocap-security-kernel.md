@@ -1,5 +1,7 @@
 # Vertical 00 — OCap Security Kernel (The Spine)
 
+> **Workstream A — Core Compute & Cognition Plane.** Owns the capability mechanism + WIT host. Depends on: 02 (revocation OR-set), 07 (lifecycle/revocation API seam). Stub until integration: identity verifier, transport. See [docs/workstreams.md](../workstreams.md).
+
 > Owner archetype: **The Security Architect.** Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md). This is not a peripheral vertical — it is the **spine**: every other vertical holds, presents, attenuates, or revokes capabilities through this kernel. If you read one vertical doc, read this one.
 
 ## 1. Purpose & Responsibilities

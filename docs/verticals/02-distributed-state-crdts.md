@@ -1,5 +1,7 @@
 # Vertical 02 — Distributed State & Agent Memory (CRDTs)
 
+> **Workstream A — Core Compute & Cognition Plane.** Depends on: 00 (cap verify), 01 (delta transport). Stub until integration: transport loopback. See [docs/workstreams.md](../workstreams.md).
+
 > Owner archetype: **The Network/State Engineer** (with the AI Orchestrator). Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## 1. Purpose & Responsibilities

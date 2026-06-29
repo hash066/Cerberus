@@ -1,5 +1,7 @@
 # Vertical 05 — eUTXO Settlement & the Open Mesh Economy (Optional)
 
+> **Workstream C — Economy, Lifecycle & Surface.** Depends on: 00 (wallet caps), 03 (completed ComputeTask), 04 (IPLD blocks). Stub until integration: core/compute, wallet kernel. See [docs/workstreams.md](../workstreams.md).
+
 > Owner archetype: **The Cryptoeconomist.** Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md). **This vertical is profile-gated: ON in `OpenMesh`, entirely OFF in `Sealed`.** It is never load-bearing for the regulated verticals.
 
 ## 1. Purpose & Responsibilities

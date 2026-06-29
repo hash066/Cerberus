@@ -1,5 +1,7 @@
 # Vertical 01 — Mesh Fabric & Transport
 
+> **Workstream B — Connectivity & Trust Fabric.** Depends on: 00 (cap-gated topics). Stub until integration: capability mechanism. See [docs/workstreams.md](../workstreams.md).
+
 > Owner archetype: **The Network/State Engineer.** Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## 1. Purpose & Responsibilities

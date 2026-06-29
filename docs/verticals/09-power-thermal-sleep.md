@@ -1,5 +1,7 @@
 # Vertical 09 — Power, Thermal & Sleep Lifecycle (NEW)
 
+> **Workstream C — Economy, Lifecycle & Surface.** Depends on: 06 (scheduler hooks), 02 (CRDT checkpoint), 01 (supervisor). Stub until integration: scheduler, CRDT engine. See [docs/workstreams.md](../workstreams.md).
+
 > **Net-new vertical.** The target nodes are *laptops*: they throttle, sleep, and have their lids closed mid-pipeline. Volume I treated this as an edge case; Volume II makes node lifecycle a **first-class scheduler input**. Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## 1. Purpose & Responsibilities

@@ -1,5 +1,7 @@
 # Vertical 06 — Placement & Scheduling Brain (NEW)
 
+> **Workstream A — Core Compute & Cognition Plane.** Depends on: 08 (telemetry feed), 00 (caps), 01 (cluster events). Stub until integration: synthetic telemetry, transport. See [docs/workstreams.md](../workstreams.md).
+
 > **Net-new vertical** surfaced during the debate: the directive said *what* to pool but never *who decides placement*. This is the single hardest problem in the system. Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## 1. Purpose & Responsibilities

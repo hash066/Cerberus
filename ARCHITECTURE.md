@@ -119,6 +119,8 @@ Cerberus/
 
 ## 3. Canonical Schemas
 
+> 🔒 **This section is the FROZEN integration contract.** All implementation workstreams ([docs/workstreams.md](docs/workstreams.md)) code against it and stub whatever they consume from one another until integration. Changes require cross-team review + a version bump, never a local edit.
+
 All schemas are defined once here (and consolidated in [docs/schemas/schemas.md](docs/schemas/schemas.md)). Internal high-throughput payloads use **Protobuf** (compact, fast) or **CBOR/CDDL** (for capability tokens needing canonical bytes for signing). Component interfaces use **WIT**.
 
 ### 3.1 Capability Token / Handle (CDDL — canonical CBOR, signed)

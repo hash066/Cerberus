@@ -1,5 +1,7 @@
 # Cerberus — Consolidated Schema Reference
 
+> 🔒 **FROZEN INTEGRATION CONTRACT.** This file (with [ARCHITECTURE.md §3](../../ARCHITECTURE.md)) is the contract every implementation workstream codes against — see [docs/workstreams.md](../workstreams.md). Changes are a cross-team event: propose → review by all workstreams → version-bump → adopt. Do not edit locally to suit one workstream.
+
 > Single source of truth for every wire format, file format, and interface contract. Normative definitions also appear in [ARCHITECTURE.md §3](../../ARCHITECTURE.md); this file is the implementer's quick-reference and adds the WIT worlds, error codes, and verification pseudocode that the per-vertical docs cite.
 
 Encoding policy:
