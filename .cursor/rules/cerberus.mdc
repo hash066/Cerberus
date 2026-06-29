@@ -1,0 +1,13 @@
+---
+description: Cerberus monorepo build conventions and lane ownership for ws/fabric
+alwaysApply: true
+---
+
+# Cerberus Build Conventions
+
+- This is the Cerberus monorepo. Read `CLAUDE.md` and `CONTRACT.md` before editing.
+- NEVER edit `proto/`, `components/wit/`, `schemas/`, or `contract/`. They are frozen. Request changes instead.
+- Stay ONLY in: `daemon/mesh`, `daemon/telemetry`, `daemon/supervisor`, `core/identity`.
+- Build against `contract/go` types; stub other lanes via `contract/go/stub`. Don't call other lanes directly.
+- Must pass `go build ./...`, `go test ./...`, `cargo build`, `cargo test` before claiming done. Add ≥1 test per vertical.
+- Frontier features (zk-WASM, RDMA, host-TEE) stay documented stubs.

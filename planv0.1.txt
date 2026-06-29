@@ -1,0 +1,248 @@
+# Plan: Cerberus v0.1 — Four-Tool Agent-Swarm Build (≈24h to "5:10")
+
+## Context
+The repo is **docs-only** today (no code). The goal: go from spec → a **runnable v0.1** in ~24h by running a **4-tool agent swarm** in parallel on one laptop — Claude Code agents + Cursor (Pro) + Antigravity (Pro) + Codex (2.5k credits). Confirmed targets:
+- **Scope:** max breadth — all 11 verticals scaffolded, compiling, unit-tested, documented.
+- **Demo (acceptance test):** two `cerberusd` nodes discover each other and one runs a **capability-gated WASM task** on the other, result returned over the wire, driven from the `cerberus` CLI.
+- **Quality bar:** product-grade *for the slice covered* (clean interfaces, tests, CI green, tagged `v0.1.0`). Not a fully-featured hypervisor — many pieces stay documented stubs (zk-WASM, RDMA-over-TB, host-TEE = Frontier).
+
+> Honest note baked into the plan: agents generate code fast, but **integration + compile-fix + E2E wiring is serial**. The plan front-loads a shared frozen contract so parallel work doesn't collide, and reserves a large integration phase.
+
+## Orchestration model
+**Conductor = this Claude Code session.** Owns: the frozen contract, the `main` integration branch, CI, code review, FFI wiring, and the final demo. The four tools each own a **disjoint lane** on its **own git worktree + branch**, so no two ever edit the same file.
+
+| Lane | Tool | Owns (verticals) | Dirs it may touch | Language |
+|---|---|---|---|---|
+| **A — Core** | **Claude worktree-agents** (spawn ≤5, one per vertical) | 00 OCap, 02 CRDT, 03 Runtime, 04 9P, 06 Scheduler | `core/ocap`, `core/crdt`, `core/runtime`, `daemon/ninep`, `daemon/scheduler` | Rust + Go |
+| **B — Fabric** | **Cursor Pro** background agents | 01 Mesh, 07 Identity, 08 Observability | `daemon/mesh`, `core/identity`, `daemon/telemetry` | Go + Rust |
+| **C — Surface** | **Antigravity Pro** | 05 Economy, 09 Lifecycle, 10 Desktop | `core/economy`, `daemon/lifecycle`, `tray/`, `cmd/` | Rust + Go + Tauri |
+| **D — Platform** | **Codex** (many parallel tasks) | codegen, CI, test harness, E2E, examples, fixer-swarm | `proto/`, `components/`, `build/`, `.github/`, `test/` | polyglot |
+
+**Collision avoidance (hard rules):**
+- One repo; each lane runs in its own `git worktree` dir on branch `ws/core | ws/fabric | ws/surface | ws/platform`.
+- **The frozen contract** (`proto/`, `components/wit/`, `schemas/`) is generated in Phase 0, committed to `main`, and **nobody edits it unilaterally** — lanes consume generated bindings only.
+- Disjoint directory ownership (table above). Merge to `main` only when **standalone-green**; the conductor integrates.
+
+## Phase 0 — Foundation (serial, ~1–2h) — UNBLOCKS EVERYTHING
+Do this before any fan-out (conductor + Codex pair):
+1. **Monorepo skeleton:** `go.work` (Go workspace), root `Cargo.toml` (Rust workspace), `Taskfile.yml` (go-task), `.github/workflows/ci.yml`, `.editorconfig`, `LICENSE`.
+2. **`CLAUDE.md` + `CONTRACT.md`** — rules of engagement every tool (even non-Claude) follows: directory ownership, "don't touch `proto/`", interface conventions, test/lint commands. (Use `/init`.)
+3. **Contract-as-code:** ARCHITECTURE §3 → `proto/*.proto` (telemetry, crdt op, compute task), `components/wit/*.wit` (`caps` world), CDDL/CBOR for capability + settlement, JSON-schema for profile. Generate Go + Rust bindings (`buf generate`, `wit-bindgen`).
+4. **FFI keystone:** `core/cabi` C-ABI header + cgo skeleton so Go↔Rust links with opaque `u64` capability handles (keep the boundary tiny).
+5. **Worktrees + branches** created; per-lane brief = its vertical doc(s) + `CONTRACT.md` + generated bindings.
+
+## Phase 1 — Parallel build (~12–16h overlapping wall-clock)
+Each lane builds its verticals to **scaffolded + compiling + unit-tested**, stubbing cross-lane deps behind the contract. Foundations to clone/vendor (don't build from zero):
+
+**A — Core (Claude agents):**
+- `00 OCap` (Rust): capability CBOR (`ciborium`), Ed25519 (`ed25519-dalek`), mint/attenuate/verify, cap table, WIT host on **`bytecodealliance/wasmtime`** component model. CapTP-lite stub. Ref: wasmtime examples, `ocapn` spec.
+- `02 CRDT` (Rust): wrap **`automerge/automerge`** (or **`y-crdt/y-crdt`**); doc apply/merge, vector clock, domain reducers, belief-conflict flag.
+- `03 Runtime` (Rust): wasmtime component host; load+run component; `gpu` capability dispatch behind a trait (MLX/wgpu stub); promise-pipelining stub. Ref: `bytecodealliance/wit-bindgen`, `cargo-component`.
+- `04 9P` (Go): 9P2000.L server via **`hugelgupf/p9`**, mount via **`hanwen/go-fuse`** (+ **`winfsp/cgofuse`** on Win); cap-gated walk/open; ctl→endpoint.
+- `06 Scheduler` (Go): telemetry-driven greedy constrained bin-packer; re-route on event; hot standby.
+
+**B — Fabric (Cursor):**
+- `01 Mesh` (Go): **`eclipse-zenoh/zenoh`** (zenoh-go/c-binding) intra-site + **`libp2p/go-libp2p`** + `go-libp2p-pubsub` (gossipsub) + **`quic-go/quic-go`**; mDNS discovery; OTP supervision via **`thejerf/suture`**.
+- `07 Identity` (Rust): keygen, attestation envelope (TEE stub), revocation OR-set (reuses 02), `cap_verify`/`is_revoked` seam.
+- `08 Observability` (Go): **`open-telemetry/opentelemetry-go`** spans over Zenoh; telemetry publisher; trace-context in CapTP frames.
+
+**C — Surface (Antigravity):**
+- `05 Economy` (Rust): minimal eUTXO ledger, optimistic settlement + fraud-proof re-exec, wallet WIT resource, IPLD fetch via **`ipld/go-ipld-prime`**; erasure via **`klauspost/reedsolomon`**; zk-WASM = documented stub (ref **`DelphinusLab/zkWasm`**).
+- `09 Lifecycle` (Go): power/thermal/sleep via **`shirou/gopsutil`** + OS APIs; events, checkpoint hook, capability hand-back.
+- `10 Desktop` (Go+Tauri): **`tauri-apps/tauri`** v2 tray + **`spf13/cobra`** CLI (`cerberus`) + `cerberusd` skeleton + gRPC-over-UDS IPC + OpenAI-compatible gateway stub.
+
+**D — Platform (Codex):** proto/WIT codegen pipeline (**`bufbuild/buf`**), CI (build/test/`golangci-lint`/`clippy`, cross-compile matrix), **the E2E demo harness** (`test/e2e` spins 2 `cerberusd`, runs the WASM task, asserts result), example WASM components (`hello-shard`, toy matmul) via `wit-bindgen`, Dockerfile/devcontainer, packaging (**`goreleaser`**), and a **compile-error/test-failure fixer swarm** across all branches.
+
+## Phase 2 — Integration (conductor, ~4–6h)
+- Merge order: `ws/platform` → `main`, then `ws/core` → `ws/fabric` → `ws/surface`, each gated on standalone-green.
+- Wire real seams: **A↔B** (real Zenoh transport + real `cap_verify` + revocation), **A↔C** (real compute completion → settlement/lifecycle), **C↔core** (desktop → real daemon IPC). Resolve Go↔Rust FFI for real.
+- Run `/code-review` (optionally `/code-review ultra`) before each merge; `/security-review` on the OCap kernel + capability paths.
+
+## Phase 3 — Demo + harden + ship (~2–3h)
+- **Acceptance:** `task demo` → 2 `cerberusd` discover each other → `cerberus run hello-shard.wasm --on <peer>` → capability-gated remote execution → result returned. Scripted in `test/e2e`; confirm with `/run` + `/verify`.
+- Polish: README quickstart, `task demo` target, CI badge, tag `v0.1.0`. Push to a **branch** (not `main` directly — policy).
+
+## Skills to use (Claude side)
+`/init` (Phase 0 CLAUDE.md) · `engineering:testing-strategy` (per-lane test plans) · `engineering:architecture` (ADRs if drift) · `/code-review` + `/code-review ultra` (pre-merge) · `/security-review` (OCap) · `/run` + `/verify` (prove the demo) · worktree-isolated `Agent` spawns (the A-lane builders) · `/loop` (babysit long CI/agent cycles).
+
+## Per-tool paste-in briefs (created during execution)
+`docs/agent-briefs.md` — one ready-to-paste prompt per external tool (Cursor/Antigravity/Codex), each = its vertical doc(s) + `CONTRACT.md` + dir-ownership + "don't touch `proto/`" + the standalone test target from [docs/workstreams.md](../../E:/10w10p/Cerberus/docs/workstreams.md).
+
+## Risks & mitigations
+- **Go↔Rust FFI = #1 time sink** → cabi skeleton in Phase 0, opaque-handle boundary only.
+- **zenoh-go maturity** → fallback to libp2p-only intra-site for the demo (demo needs only discovery + one stream).
+- **Cross-tool interface drift** → frozen contract + generated bindings; nobody edits `proto/`.
+- **Agent file collisions** → worktrees + disjoint dirs (hard rule).
+- **wasmtime/component-model churn** → pin versions; start from a known-good component example.
+- **One-laptop build thrash** → stagger heavy Rust (clippy) vs Go builds; cap concurrent full builds.
+
+## Verification / Definition of Done
+- `task build` (all langs compile) · `task test` (unit green) · `task lint` clean · `task demo` (2-node remote WASM exec passes) · `/security-review` clean on OCap.
+- Checklist: 11 verticals compile + unit-tested + doc-linked; demo path runs; CI green; `v0.1.0` tagged; `docs/agent-briefs.md` present.
+
+---
+
+# (PRIOR) Plan: Cerberus Implementation Workstream Division
+
+## Context (current task)
+
+The Volume II architecture docs are complete and committed. The user now wants the *implementation work* divided into **three independent workstreams** that (a) each follow the single frozen schema contract, (b) can be built and tested standalone, (c) integrate cleanly at the end, and (d) club related verticals together. The split concentrates the most technically novel/interesting work in the first workstream.
+
+> Constraint: the relative sizing of the workstreams must **not** be stated as a ratio or percentage anywhere in the output docs or commit messages. Present the three workstreams neutrally as peers.
+
+### The integration contract (the thing that makes independence possible)
+[ARCHITECTURE.md §3](../../E:/10w10p/Cerberus/ARCHITECTURE.md) + [docs/schemas/schemas.md](../../E:/10w10p/Cerberus/docs/schemas/schemas.md) are declared **FROZEN**. Every workstream codes against these (capability CBOR/CDDL, telemetry proto3, CRDT op envelope, compute task + promise, 9P namespace + op→cap table, settlement CDDL, WIT worlds, IPC gRPC, error codes). Anything a workstream *consumes* from another is mocked/stubbed behind the schema until integration.
+
+### The three workstreams (vertical clubs)
+- **Workstream A — Core Compute & Cognition Plane** (the spine + brains + novel execution): `00` OCap kernel, `02` CRDT state, `03` compute orchestration (WASM/sharding/promise pipelining), `04` 9P peripheral virtualization, `06` placement & scheduling brain. Owns the capability mechanism and the WIT host. This is where the fascinating distributed-systems work lives.
+- **Workstream B — Connectivity & Trust Fabric**: `01` mesh fabric & transport (Zenoh+libp2p/QUIC/supervision), `07` identity & capability lifecycle (bootstrap/attestation/revocation), `08` observability & tracing. Theme: how nodes find each other, prove identity, and are observed.
+- **Workstream C — Economy, Lifecycle & Surface**: `05` eUTXO & Open Mesh economy (profile-gated/optional), `09` power-thermal-sleep lifecycle, `10` desktop app model (daemon/CLI/tray/gateway). Theme: the optional economy, the node's physical edge behavior, and the human/external surface.
+
+### Cross-workstream seams (interface stubs)
+| Workstream | Consumes (stub until integration) | From |
+|---|---|---|
+| A | live telemetry feed; real transport; identity/revocation verifier | B (`08`,`01`,`07`) |
+| B | `cap_verify`/`is_revoked`; CRDT engine for revocation OR-set | A (`00`,`02`) |
+| C | capability + `wallet` handles; completed `ComputeTask`; scheduler lifecycle hooks | A (`00`,`03`,`06`) |
+
+Note the tight coupling between `00` (capability *mechanism*, in A) and `07` (capability *lifecycle*, in B): the seam is the `cap_verify`/`is_revoked` API + the revocation OR-set CRDT doc (`sys/revocations`). Both are already in the frozen schema, so each side builds against it independently.
+
+## Deliverables
+1. **`docs/workstreams.md`** — master work-division doc: the frozen-contract declaration, the three workstreams (scope, owned verticals, headline stack, standalone build target, standalone test plan, consumed seams + stubs), the integration milestone ladder, and a suggested branch/worktree strategy. **No ratios/percentages.**
+2. **A one-line header banner** added to each of the 11 vertical docs: `> **Workstream:** <A|B|C — name> · Depends on: <list> · Stub until integration: <list>`. Helps a developer working a single vertical know their lane and seams.
+3. **A "🔒 Frozen Integration Contract" banner** added to the top of `docs/schemas.md` and a one-line note in `ARCHITECTURE.md §3`.
+
+## Standalone test strategy (per workstream, drawn from each vertical's §5/§9)
+- **A:** single-process multi-node *simulation* — mint caps, run a toy WASM component, shard a tiny model across simulated nodes, merge CRDT memory, schedule placement. Mocks: transport loopback, synthetic telemetry, always-valid cap verifier.
+- **B:** 2–3 real OS processes — Zenoh+libp2p discovery, attested admission, telemetry/trace collection, with stub workloads (no real compute). Mocks: stub cap mechanism.
+- **C:** standalone modules — settle mock tasks (eUTXO + optimistic proof), drive lifecycle from simulated power events, run daemon+CLI+tray against a stub core. Mocks: stub core/scheduler/wallet.
+
+## Integration milestone ladder (verification)
+1. **Contract freeze** (done — schemas locked).
+2. **Standalone green:** each workstream's own test suite passes against mocks; each ships a runnable standalone binary/lib.
+3. **Pairwise:** A↔B (real transport + real cap verify + real revocation), then A↔C (real compute completion → real settlement/lifecycle).
+4. **Full mesh E2E:** all three on one mesh; run the [ARCHITECTURE.md §4](../../E:/10w10p/Cerberus/ARCHITECTURE.md) walkthroughs — "2 GiB remote VRAM request," "lid-drop mid-pipeline," "Open Mesh cross-org trade" — as the acceptance tests.
+
+## Files touched
+- New: `E:\10w10p\Cerberus\docs\workstreams.md`
+- Edit (header banner only): `E:\10w10p\Cerberus\docs\verticals\00..10-*.md` (11 files)
+- Edit (frozen banner): `E:\10w10p\Cerberus\docs\schemas\schemas.md`, one note in `E:\10w10p\Cerberus\ARCHITECTURE.md`
+
+---
+
+# (PRIOR, COMPLETED) Plan: Cerberus Volume II — Full Architecture Documentation Set
+
+## Context
+
+The Cerberus repo holds `README.md` (V1 spec), `extra.md` (linked literature), `braindomp.md` (research dump). The user wants Cerberus pushed into a **zero-config distributed hypervisor for multi-agent orchestration**, synthesizing 9P + OCap + CRDTs + eUTXO + the "missing pieces" (zk-WASM, TEEs, vector clocks, IPLD) into one **Go/Rust** stack.
+
+This plan covers a **three-tier documentation set** (decided after a `/brainstorm` grilling session + a follow-up scope expansion):
+
+1. `ideadumpp2.md` — the five-agent debate / synthesis idea-dump (overview + GTM).
+2. **One master system-architecture doc** — the canonical spec others follow: repo structure, all schemas, final integration, master tech stack, and why it is superior.
+3. **One low-level design doc per vertical** — separate files, very detailed, each with its own tech stack.
+
+### Locked decisions (from the grilling session)
+
+| Fork | Decision |
+|---|---|
+| **Truth-bar** | **Hybrid** — bold synthesis, every vertical carries an explicit *Shippable-today vs Research-frontier* verdict. |
+| **Network fabric** | **Zenoh intra-site + libp2p inter-site** (braindomp shows exo killed libp2p's DHT on Wi-Fi; libp2p DCUtR/Gossipsub only to cross sites/NAT). |
+| **Crypto layer** | **Optional "Open Mesh" tier, profile-gated, off by default.** |
+| **GTM beachhead** | **Sovereign infra for agentic-AI startups** — pool office Macs/PCs into a local zero-trust mesh to escape cloud-monopoly burn; dev adoption bootstraps the Open Mesh eUTXO economy + OCap trust graph. Not generic SaaS. |
+
+**Asserted positions:** 9P = control plane only (data plane = QUIC zero-copy / RDMA-over-TB); OCap-on-Component-Model is the spine; CRDT conflict = per-domain reducers + LWW + human flag; TEEs = opportunistic (Secure Enclave for key custody only); Go orchestration daemon + Rust capability/runtime/crypto core; **two profiles, one codebase — Open Mesh (chain ON) vs Sealed (chain OFF, TEE-attested, compliance-gated).**
+
+> **Plan-mode note:** files cannot be written during plan mode. This plan specifies the full set for a one-pass build on approval.
+
+---
+
+## Deliverable file tree
+
+```
+Cerberus/
+├── ideadumpp2.md                         # (1) debate / synthesis idea-dump (root, beside README)
+├── ARCHITECTURE.md                       # (2) master system architecture — canonical spec
+└── docs/
+    ├── schemas/
+    │   └── schemas.md                    # consolidated schema reference (also inlined in ARCHITECTURE.md)
+    └── verticals/
+        ├── 00-ocap-security-kernel.md    # the spine (Security Architect)
+        ├── 01-mesh-fabric-transport.md   # Zenoh + libp2p (Network/State Engineer)
+        ├── 02-distributed-state-crdts.md # CRDTs + vector clocks
+        ├── 03-compute-orchestration.md   # tensor/pipeline sharding + WASM Component Model (AI Orchestrator)
+        ├── 04-9p-peripheral-virt.md      # 9P control plane + FUSE/WinFsp + IPLD FS + audio (Kernel Hacker)
+        ├── 05-eutxo-open-mesh-economy.md # eUTXO + zk-WASM + wallets + kill-switch (Cryptoeconomist)
+        ├── 06-placement-scheduling.md    # NEW — the scheduling brain
+        ├── 07-identity-cap-lifecycle.md  # NEW — capability issuance/attenuation/revocation
+        ├── 08-observability-tracing.md   # NEW — distributed tracing
+        ├── 09-power-thermal-sleep.md     # NEW — node lifecycle
+        └── 10-desktop-app-model.md       # daemon + CLI + tray UI (no browser)
+```
+
+Rationale for layout: `ideadumpp2.md` stays at root to match the existing idea-dump series; the canonical `ARCHITECTURE.md` sits at root for visibility; detailed per-vertical specs live under `docs/verticals/`. (Flat-in-root is the alternative if preferred.)
+
+---
+
+## (1) `ideadumpp2.md` — Debate / Synthesis Idea-Dump
+As specified previously: Preamble (structural-failure thesis: cloud monopolies bottlenecking agent swarms; rejects SaaS) → **Synthesis Record** (five-agent ledger: Demand→Resolution→Trade-off→Verdict) → high-level unified stack → the **Open Mesh vs Sealed** profile split → condensed tour of all 10 verticals → **GTM** (beachhead + Protocol Tax + Zero-Trust Enterprise Tiers) → literature links. Third-person, ASCII diagrams, links like `extra.md`. This is the *narrative/overview*; the depth lives in (2) and (3).
+
+## (2) `ARCHITECTURE.md` — Master System Architecture (canonical spec)
+The document everything else conforms to. Sections:
+- **System overview & design principles** (zero-trust, no ambient authority, control/data-plane separation, partition tolerance, capability-everywhere).
+- **Master architecture diagram** (ASCII): OCap spine under all verticals; control plane (9P/Zenoh) vs data plane (QUIC zero-copy/RDMA); the two profiles as a runtime switch.
+- **Repo / monorepo structure**: full directory layout (`/daemon` Go, `/core` Rust crates, `/wasm-components`, `/cli`, `/tray`, `/proto`, `/docs`), build tooling, Go↔Rust FFI boundary, WASM Component Model boundary.
+- **Canonical schemas** (the "schema and stuff to be followed by others") — all in Protobuf/WIT/CDDL as appropriate:
+  - Capability token / handle schema (unforgeable, attenuable).
+  - Node telemetry packet (Proto3) — extends README §4.1.
+  - CRDT op + vector-clock envelope.
+  - Compute task allocation payload + promise-pipeline reference.
+  - 9P namespace layout (`/cer/dev/gpu|vram|audio`, `/cer/fs`) + capability-gated `walk/open` semantics.
+  - eUTXO settlement transaction + zk-WASM proof envelope + kill-switch capability.
+  - Profile config schema (Open Mesh vs Sealed feature flags).
+  - IPC contract: daemon ↔ CLI ↔ tray.
+- **Final integration / data-flow walkthroughs**: end-to-end traces (e.g., "agent requests 2 GB remote VRAM" → cap check → 9P walk → QUIC/RDMA data plane → settlement (Open Mesh) ; "node lid-drops mid-pipeline" → supervision tree → CRDT checkpoint → scheduler re-route).
+- **Master tech stack table** (Go/Rust split, every library named) + version posture.
+- **Why this is superior** — head-to-head vs Kubernetes/Ray/Spark (homogeneous, central master), vs exo (AI-only, no security/economy), vs cloud (monopoly cost, no sovereignty): capability security, partition tolerance, heterogeneous hardware, zero-config, control/data-plane split.
+- **Cross-reference index** to every vertical doc + Shippable/Frontier maturity matrix.
+
+## (3) `docs/verticals/*.md` — Low-Level Per-Vertical Designs
+Each file follows a **common low-level template** so they're consistent and composable:
+1. **Purpose & responsibilities** + which debating agent owns it.
+2. **Position in the system** (control vs data plane; upstream/downstream verticals).
+3. **Detailed architecture** — submodules, internal components, ASCII diagrams.
+4. **Data structures / wire formats / protocol messages** (low level, with field tables).
+5. **Interfaces / APIs** — the exact contracts other verticals call (Go traits/interfaces, Rust crate APIs, WIT worlds).
+6. **Tech stack** — specific libraries/crates, language, versions, rationale.
+7. **Security model** — capabilities consumed/produced, attenuation, revocation, threat model.
+8. **Open Mesh vs Sealed** behavior differences.
+9. **Failure modes & mitigations.**
+10. **Verdict: Shippable / Frontier** + open questions.
+
+Per-file focus & headline stack:
+- **00 OCap Security Kernel (spine):** OCap/CapTP model in **Rust** on the **WASM Component Model**; typed resource handles = capabilities; attenuation/delegation/revocation; TEE key custody. *Stack: Rust, wasmtime, component-model, CapTP-style protocol.* Verdict: Shippable core / Frontier full-CapTP + host-TEE.
+- **01 Mesh Fabric & Transport:** Zenoh intra-site pub/sub + libp2p (DCUtR, Gossipsub v1.1) inter-site over QUIC/mTLS; OTP-style supervision trees. *Stack: Go, zenoh, go-libp2p, quic-go.* Verdict: Shippable.
+- **02 Distributed State & CRDTs:** Automerge/`yrs` docs, vector clocks, per-domain reducers + LWW + human-flag; partition merge. *Stack: Rust automerge/yrs ↔ Go FFI.* Verdict: merge Shippable / semantics Frontier.
+- **03 Compute Orchestration:** pipeline+tensor parallelism over QUIC; CapTP promise pipelining; WASM Component Model + WASI P2 workers; MLX / wgpu+tinygrad backends. *Stack: Rust wasmtime, MLX, wgpu, tinygrad.* Verdict: exec Shippable / real-time 70B-over-WiFi Frontier.
+- **04 9P Peripheral Virtualization:** 9P2000.L over QUIC control namespace; go-fuse / WinFsp+cgofuse; JuiceFS-style metadata/data split + Reed-Solomon + IPLD blocks; AES67/ROC audio; data plane = QUIC zero-copy / RDMA-over-TB. *Stack: Go, go-fuse, WinFsp, JuiceFS core, IPLD, ROC.* Verdict: 9P-control Shippable / VRAM-as-file excluded / RDMA-over-TB5 Shippable on Mac.
+- **05 eUTXO & Open Mesh Economy (optional):** eUTXO contracts, agent wallets, zk-WASM proofs, on-chain kill-switch, IPLD weight delivery; profile-gated. *Stack: eUTXO chain, zk-WASM (Delphinus-style), IPLD.* Verdict: IPLD Shippable / eUTXO Buildable / zk-WASM-inference Frontier.
+- **06 Placement & Scheduling Brain (NEW):** latency/thermal/capability-aware constraint solver over Zenoh telemetry. *Stack: Go scheduler + solver.* Verdict: core Shippable / optimality Frontier.
+- **07 Identity & Capability Lifecycle (NEW):** issuance/attenuation/delegation/revocation, key rotation, root-of-trust bootstrap. *Stack: Rust, CapTP, Secure Enclave custody.* Verdict: Shippable / distributed revocation hard.
+- **08 Observability & Tracing (NEW):** OTel-style spans over Zenoh; capability-flow + proof tracing; tray surfacing. *Stack: OpenTelemetry, Zenoh, Tauri.* Verdict: Shippable.
+- **09 Power, Thermal & Sleep Lifecycle (NEW):** sleep/wake/lid-drop/thermal as scheduling inputs; graceful capability hand-back; CRDT checkpoint before sleep. *Stack: OS power APIs + V2/V7 integration.* Verdict: Shippable.
+- **10 Desktop App Model:** `cerberusd` (Go daemon) + `cerberus` (CLI) + Tauri v2 **tray-first** UI (no browser); local IPC; OTP supervision. *Stack: Go, Tauri v2, native webview.* Verdict: Shippable.
+
+---
+
+## Conventions
+- Third-person POV; ASCII diagrams (README house style); fenced schema/code blocks; linked canonical citations (extra.md style); **Verdict** line + **Open Mesh vs Sealed** notes per vertical.
+- `ideadumpp2.md` and `ARCHITECTURE.md` at repo root; vertical specs under `docs/verticals/`.
+- All docs cross-link: ARCHITECTURE.md ↔ each vertical ↔ ideadumpp2.md.
+
+## Verification
+- All files created per the tree; valid GitHub Markdown (headings, tables, balanced fences); internal cross-links resolve.
+- `ideadumpp2.md`: debate + GTM (Protocol Tax + Zero-Trust Enterprise Tiers) present.
+- `ARCHITECTURE.md`: repo structure, all canonical schemas, integration walkthroughs, master tech-stack table, superiority section, maturity matrix.
+- Each vertical doc follows the 10-part low-level template with its own tech stack.
+- Coverage check: 9P, OCap/CapTP, zk-WASM, TEEs, CRDTs/vector clocks, IPLD all specified; four NEW verticals present; Zenoh+libp2p hybrid + Open Mesh/Sealed profiles + Go/Rust split reflected everywhere.
+- `git status` shows only new untracked files (`ideadumpp2.md`, `ARCHITECTURE.md`, `docs/**`).
