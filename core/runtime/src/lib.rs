@@ -27,7 +27,9 @@
 mod blockstore;
 pub use blockstore::{BlockStore, Cid};
 
+#[cfg(feature = "wasmtime")]
 pub mod wasmtime_exec;
+#[cfg(feature = "wasmtime")]
 pub use wasmtime_exec::{run_component, HostImport, WasmtimeExecutor};
 
 use std::collections::HashMap;

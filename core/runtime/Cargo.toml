@@ -13,7 +13,10 @@ wasmi = "1.1.0"
 # name for the production runtime (Component Model + WASI P2). Added *alongside*,
 # not replacing, the pure-Rust wasmi path so callers can choose a backend.
 # `component-model` enables the typed WIT-world path; `cranelift` JITs to host ISA.
-wasmtime = { version = "37", default-features = false, features = [
+# Optional so downstream crates that only need the wasmi path / blockstore (e.g.
+# core/cabi built as a windows-gnu staticlib for cgo, where wasmtime's transitive
+# windows-sys needs mingw `dlltool`) can opt out via default-features = false.
+wasmtime = { version = "37", optional = true, default-features = false, features = [
     "cranelift",
     "runtime",
     "component-model",
@@ -23,6 +26,12 @@ wasmtime = { version = "37", default-features = false, features = [
 # Already resolved at 0.10 in the workspace lockfile (transitive of ed25519-dalek),
 # so promoting it to a direct dep adds no new version.
 sha2 = "0.10"
+
+[features]
+# wasmtime on by default (normal builds/tests get the Component Model path);
+# disable with default-features = false to drop the heavy/gnu-unfriendly dep.
+default = ["wasmtime"]
+wasmtime = ["dep:wasmtime"]
 
 [dev-dependencies]
 wat = "1.252.0"

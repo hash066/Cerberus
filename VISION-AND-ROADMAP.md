@@ -49,8 +49,8 @@ Cerberus is specified as 11 interlocking "verticals." This is the complete visio
 | **00** | **OCap Security Kernel** | Every action in the system is gated by an unforgeable, attenuable, revocable Ed25519 capability — the "spine." No passwords, no roles, no ambient authority. | ✅ Real + now enforced into the Go daemon via cgo |
 | **01** | **Mesh Fabric & Transport** | Zero-config discovery; Zenoh intra-site + libp2p inter-site; resilient masterless transport over chaotic Wi-Fi and across sites; OTP-style supervision. | 🟡 libp2p/QUIC discovery + supervision + **PeerID-bound sessions + cap-gated topics** real; Zenoh + raw-transport mTLS pending |
 | **02** | **Distributed State & CRDTs** | Shared agent memory that merges across partitions with no master; contradictory beliefs flagged to humans, never silently resolved. | 🟡 LWW map + checkpoints + belief-conflict real; full Automerge/yrs merge pending |
-| **03** | **Compute Orchestration** | Portable WASM components (not native binaries) run anywhere; tensor/pipeline sharding; promise pipelining; GPU abstraction via wgpu/MLX. | 🟡 Real WASM exec (wazero/wasmi); Wasmtime component model + GPU pending |
-| **04** | **9P Peripheral Virtualization** | Remote GPU/VRAM/**audio (mic+speaker)**/storage as a capability-addressed file namespace mountable on Win/Mac/Linux; bytes flow over a separate fast data plane. | 🟡 Cap-gated namespace logic real (in-memory); device backends + mounts + data plane stub |
+| **03** | **Compute Orchestration** | Portable WASM components (not native binaries) run anywhere; tensor/pipeline sharding; promise pipelining; GPU abstraction via wgpu/MLX. | 🟡 Real WASM exec (wazero/wasmi) + **Wasmtime component model** + promise pipelining; WASI-P2 hook + GPU dispatch pending |
+| **04** | **9P Peripheral Virtualization** | Remote GPU/VRAM/**audio (mic+speaker)**/storage as a capability-addressed file namespace mountable on Win/Mac/Linux; bytes flow over a separate fast data plane. | 🟡 Cap-gated namespace + **9P2000.L wire server** + **QUIC data plane** + **network audio** all real & tested; FUSE/WinFsp mounts + OS audio capture + distributed FS pending |
 | **05** | **eUTXO & Open Mesh Economy** | Trustless cross-org compute trading; compute credits; optimistic/zk settlement so a provider can't bill for work it didn't do. | 🟡 Durable credit ledger real; advanced settlement (fraud/zk proofs) model-only |
 | **06** | **Placement & Scheduling Brain** | Telemetry-driven, multi-objective placement; shard pipelines across nodes; reroute to hot-standbys on failure. | ✅ Cost-model placement + reroute + multi-shard pipeline real (baseline) |
 | **07** | **Identity & Capability Lifecycle** | Issuance, attenuation, and *distributed revocation propagation*; key custody; attested admission of peers. | 🟡 Revocation OR-set + signed-challenge admission real (engine-side); Go-daemon bridge + real TEE attestation pending |
@@ -136,12 +136,13 @@ Each phase has a **goal**, concrete **deliverables**, a **Definition of Done (Do
 
 ### Phase F — Real Compute & Peripherals
 **Goal:** actually use a remote GPU and a remote microphone.
-- **F1** **Wasmtime** component model + WASI P2 host (replace/augment wazero for rich components).
-- **F2** **GPU dispatch** via wgpu (PC/Linux) / MLX (Mac): a `gpu` capability runs a real kernel; a small model layer executes remotely.
-- **F3** **QUIC zero-copy data plane** behind the 9P `ctl` endpoint (the unlock for all device sharing).
-- **F4** **9P wire server** (hugelgupf/p9) + **FUSE/WinFsp** mounts: a remote device appears as a local path.
-- **F5** **Audio sharing** — capture (CoreAudio/WASAPI/PipeWire) + **ROC/AES67** transport + delay-locked-loop clock sync: stream one machine's mic/speaker to another, capability-gated.
-- **DoD:** open a remote GPU and run a real (small) inference shard; stream a live mic across the mesh with no drift; mount a peer device in Explorer/Finder.
+- **F1** ✅ **Wasmtime** component-model executor (`core/runtime/wasmtime_exec`, optional `wasmtime` feature) alongside wasmi — runs a real component (fixture→1337). WASI-P2 = documented hook (needs a `cargo-component` fixture).
+- **F2** ⛔ **Deferred** — **GPU dispatch** via wgpu/MLX needs a real GPU to validate honestly; not faked. Next pass on real hardware.
+- **F3** ✅ **QUIC zero-copy data plane** (`daemon/dataplane`): capability + byte-quota-bound bulk transfer, enforced before *and* during the stream. The unlock for VRAM + audio sharing. *Remaining: PeerID-pin the data-plane TLS.*
+- **F4** ✅ **9P2000.L wire server** (`daemon/ninep`, hugelgupf/p9) over the cap-gated namespace; per-connection capability; `ctl`→endpoint invariant held. *FUSE/WinFsp mount = labelled stub (kernel-driver-bound).*
+- **F5** ✅ **Network audio** (`daemon/audio`): packetized sender/receiver, reordering jitter buffer, DLL drift control, gap-fill concealment. *OS capture (CoreAudio/WASAPI/PipeWire) = labelled stub.*
+- **Cross-cut wiring (next):** 9P `ctl` open → `dataplane.RegisterGrant` → return the real endpoint (ARCHITECTURE §4.1); audio rides the data plane; serve the 9P wire + data-plane listener under the daemon supervisor.
+- **DoD (remaining):** open a remote GPU and run a real (small) inference shard (F2, real hardware); mount a peer device in Explorer/Finder (FUSE/WinFsp); stream a live OS mic across the mesh.
 
 > ⭐ **Minimum Lovable Product (MLP) cut line — end of Phase F.**
 > *"A small cluster of your own machines that securely runs sandboxed jobs and shares a GPU/mic across the LAN, visible in a desktop app."* This is the first genuinely demoable, lovable product — before full economy and full hardening.

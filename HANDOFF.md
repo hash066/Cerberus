@@ -42,6 +42,11 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
 | OCap kernel in Rust — Ed25519 CBOR caps + attenuation chains (`core/ocap` SignedKernel) | ✅ REAL, tested — **now bound into the Go daemon** under `-tags ffi` |
 | Real Rust kernel via cgo (`daemon/ffi` `-tags ffi` → `core/cabi` → `SignedKernel`) | ✅ REAL, tested (Phase E item 1). Full `CapKernel` (mint/attenuate/verify/revoke) over cgo; `cerberusd -tags ffi` boots with `kernel=rust-signed-cabi`. Toolchain recipe in [docs/ffi.md](docs/ffi.md) (zig cc + `x86_64-pc-windows-gnu` + GOARCH=amd64). **Default** build is still the pure-Go stub on win/386 (no C toolchain needed). |
 | mTLS / PeerID on the wire | 🟡 PeerID-bound sessions now enforced on the libp2p/QUIC mesh path + cap-gated topics (Phase E3, `daemon/mesh`); full custom-cert mTLS over a raw (non-libp2p) data-plane transport still TODO; local RPC/API remain token-gated localhost |
+| Wasmtime component-model runtime (`core/runtime` `wasmtime_exec`, optional `wasmtime` feature) | ✅ REAL, tested (Phase F1) — alongside wasmi; runs a real component (fixture→1337). WASI-P2 = documented hook. Feature-gated so the cgo gnu staticlib opts out. |
+| QUIC zero-copy data plane (`daemon/dataplane`) | ✅ REAL, tested (Phase F3) — capability+quota-bound bulk transfer (rejects over-quota up-front and mid-stream). Data-plane PeerID-pin = stub. |
+| 9P2000.L wire server (`daemon/ninep` via hugelgupf/p9) | ✅ REAL, tested (Phase F4) — serves the cap-gated namespace; per-connection capability; `ctl`→endpoint invariant held. FUSE/WinFsp mount = labelled stub. |
+| Network audio transport — mic/speaker (`daemon/audio`) | ✅ REAL, tested (Phase F5) — packetized sender/receiver, reordering jitter buffer, DLL drift control, gap-fill. OS capture (CoreAudio/WASAPI/PipeWire) = labelled stub. |
+| GPU dispatch (wgpu/MLX) | ⛔ Phase F2 — deferred (needs real GPU hardware to validate; not faked). |
 | zk-WASM proof-of-inference, host-TEE memory shielding, RDMA-over-Thunderbolt | ⛔ FRONTIER (documented stubs by design; ~100× / hardware-limited) |
 | eUTXO advanced settlement (fraud proofs/zk) in `core/economy` (Rust) | ⚠️ model exists; daemon's live ledger is the Go `daemon/ledger` (durable) |
 | Tauri GUI rendering | ⛔ not verifiable headlessly; the preview of `tray/src/index.html` in a plain browser looks unstyled because CSS+Tauri runtime aren't loaded there — it is NOT the real app |
@@ -59,7 +64,14 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
     - **E4** ✅ (`core/crdt`,`core/identity`,`daemon/auth`): `sys/revocations` OR-set + **mesh gossip** (`RevocationGossip`, wired in `cerberusd`) so revoke-on-A denies-on-B; signed-challenge admission (TEE extension point).
     - **FFI engine bridges** ✅ (`core/cabi`,`daemon/ffi`): the Rust CID store + OR-set are reachable over cgo under `-tags ffi` (8/8 ffi tests).
     - **Track C** (`daemon/lifecycle`,`daemon/gateway`): event-driven lid-drop state machine + gateway input hardening; lid-drop wired in `cerberusd` to `scheduler.RerouteNode` (real OS power hooks still a stub).
-  - **Phase E essentially closed.** Next: Phase F (MLP) — Wasmtime component model + WASI P2, GPU dispatch, the QUIC zero-copy data plane, and the first peripheral demo (mic/speaker). Remaining E hardening: cross-kernel *signed* capability transfer on the wire (compute cap currently travels under a shared-kernel demo model), Zenoh intra-site, real OS power hooks.
+  - **Phase E essentially closed.** Remaining E hardening: cross-kernel *signed* capability transfer on the wire (compute cap currently travels under a shared-kernel demo model), Zenoh intra-site, real OS power hooks.
+- **Phase F (MLP) — landed via 4 parallel agents** (isolated worktrees, integrated on `integration`, all green + e2e + ffi):
+  - **F1** ✅ Wasmtime component-model executor (`core/runtime/wasmtime_exec`, optional feature) alongside wasmi; WASI-P2 = hook.
+  - **F3** ✅ Capability+quota-bound QUIC data plane (`daemon/dataplane`) — the bulk-byte path the 9P `ctl` open hands out.
+  - **F4** ✅ 9P2000.L wire server (`daemon/ninep`) over the cap-gated namespace; FUSE/WinFsp mount = stub.
+  - **F5** ✅ Network audio transport (`daemon/audio`) — the mic/speaker path; OS capture = stub.
+  - **F2 deferred:** GPU dispatch (needs real GPU hardware to validate honestly).
+  - **Next (cross-cut wiring):** 9P `ctl` open → `dataplane.RegisterGrant` → hand back the real endpoint (ARCHITECTURE §4.1); audio rides the data plane; serve the 9P wire server + a data-plane listener under the daemon supervisor. Then Phase F2 (GPU) on real hardware.
 
 ## Repo layout (key)
 ```

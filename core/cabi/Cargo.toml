@@ -12,6 +12,8 @@ crate-type = ["staticlib", "cdylib"]
 [dependencies]
 cerberus-contract = { path = "../../contract/rust" }
 cerberus-ocap = { path = "../ocap" }
-cerberus-runtime = { path = "../runtime" }
+# default-features = false drops wasmtime: the cgo staticlib only needs the
+# BlockStore, and wasmtime's windows-gnu build needs mingw `dlltool` (absent here).
+cerberus-runtime = { path = "../runtime", default-features = false }
 cerberus-crdt = { path = "../crdt" }
 serde_json = "1"
