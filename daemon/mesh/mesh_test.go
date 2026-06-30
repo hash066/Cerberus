@@ -103,6 +103,101 @@ func TestTwoNodeExchange(t *testing.T) {
 	}
 }
 
+// TestDialBindsAndRejectsPeerIDMismatch verifies the PeerID-binding enforcement
+// over the real libp2p/QUIC handshake:
+//   - dialing a peer by its true PeerID succeeds and the returned session is
+//     cryptographically bound to that authenticated identity;
+//   - dialing while claiming a *different* PeerID for the same address is
+//     rejected (the authenticated key cannot match a forged claim).
+func TestDialBindsAndRejectsPeerIDMismatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping networked mesh test in -short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	a, err := New(ctx, Config{Site: "test", Kernel: stub.NewCapKernel()})
+	if err != nil {
+		t.Fatalf("node A: %v", err)
+	}
+	defer a.Close()
+	b, err := New(ctx, Config{Site: "test", Kernel: stub.NewCapKernel()})
+	if err != nil {
+		t.Fatalf("node B: %v", err)
+	}
+	defer b.Close()
+
+	if err := a.Connect(ctx, b.AddrInfo()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	// (1) Dial B by its real PeerID: must succeed and bind to B's identity.
+	sess, err := a.Dial(b.PeerID())
+	if err != nil {
+		t.Fatalf("dial valid PeerID: %v", err)
+	}
+	ss, ok := sess.(*streamSession)
+	if !ok {
+		t.Fatalf("unexpected session type %T", sess)
+	}
+	rid, verified := ss.RemotePeerID()
+	if !verified || rid != b.PeerID() {
+		t.Fatalf("session not bound to B: verified=%v rid=%x want=%x", verified, rid, b.PeerID())
+	}
+	_ = sess.Close()
+
+	// (2) Dial the same address while claiming a PeerID we do NOT hold the key
+	// for. libp2p resolves the stream by the claimed peer.ID, so there is no
+	// route to an impostor and the dial fails — a session bound to a key that
+	// isn't the claimed PeerID is never returned.
+	_, forged := newPeer(t)
+	if _, err := a.Dial(forged); err == nil {
+		t.Fatal("dial with a forged claimed PeerID unexpectedly succeeded")
+	}
+}
+
+// TestPublishSubscribeCapGate proves topics are capability-gated: publish and
+// subscribe succeed with a valid topic cap, and are denied without one.
+func TestPublishSubscribeCapGate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping networked mesh test in -short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	k := stub.NewCapKernel()
+	f, err := New(ctx, Config{Site: "test", Kernel: k})
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	defer f.Close()
+
+	// No capability at all (zero handle is unknown to the kernel) -> DENIED.
+	if _, err := f.Subscribe(ctx, "cerberus/test/telemetry/**", contract.CapHandle(0)); err == nil {
+		t.Fatal("subscribe without a cap was allowed")
+	}
+	if err := f.Publish(ctx, "cerberus/test/telemetry/n1", []byte("x"), contract.CapHandle(0)); err == nil {
+		t.Fatal("publish without a cap was allowed")
+	}
+
+	// Valid topic cap -> allowed.
+	capH, _ := k.Mint(contract.ResourceRef{Kind: contract.KindTopic}, nil, nil)
+	if _, err := f.Subscribe(ctx, "cerberus/test/telemetry/**", capH); err != nil {
+		t.Fatalf("subscribe with valid cap denied: %v", err)
+	}
+	if err := f.Publish(ctx, "cerberus/test/telemetry/n1", []byte("x"), capH); err != nil {
+		t.Fatalf("publish with valid cap denied: %v", err)
+	}
+
+	// Revoked cap -> denied again (REVOKED).
+	if err := k.Revoke(capH); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if err := f.Publish(ctx, "cerberus/test/telemetry/n1", []byte("x"), capH); err == nil {
+		t.Fatal("publish with a revoked cap was allowed")
+	}
+}
+
 func publishUntilReceived(t *testing.T, ctx context.Context, pub *Fabric, ch <-chan contract.Sample, key string, payload []byte, capH contract.CapHandle) []byte {
 	t.Helper()
 	tick := time.NewTicker(250 * time.Millisecond)

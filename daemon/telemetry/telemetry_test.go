@@ -82,6 +82,86 @@ func TestPublisherEmitsTelemetryAndSpans(t *testing.T) {
 	}
 }
 
+// capFabric is a fabric fake that actually enforces the topic capability via a
+// CapKernel before accepting a publish. It proves telemetry flows through the
+// cap-gated Publish path (the seam the real mesh.Fabric implements), so a missing
+// or revoked cap is denied rather than silently published.
+type capFabric struct {
+	kernel contract.CapKernel
+	got    chan contract.Sample
+}
+
+func (c *capFabric) Publish(_ context.Context, key string, msg []byte, capH contract.CapHandle) error {
+	req := contract.Request{Op: "publish", Resource: contract.ResourceRef{Kind: contract.KindTopic, Path: key}}
+	if err := c.kernel.Verify(capH, req, time.Now().Unix()); err != nil {
+		return err
+	}
+	select {
+	case c.got <- contract.Sample{Key: key, Payload: msg}:
+	default:
+	}
+	return nil
+}
+
+func (c *capFabric) Subscribe(context.Context, string, contract.CapHandle) (<-chan contract.Sample, error) {
+	return nil, nil
+}
+func (c *capFabric) Dial(contract.PeerID) (contract.Session, error) { return nil, nil }
+func (c *capFabric) Peers() []contract.PeerInfo                     { return nil }
+
+// TestTelemetryGoesThroughCapGate verifies that telemetry is published only with
+// a valid topic capability: with a valid cap a sample is delivered; with no cap
+// the publisher's publish is denied and the sample is dropped (back-pressure
+// counter increments), never reaching the bus.
+func TestTelemetryGoesThroughCapGate(t *testing.T) {
+	kernel := stub.NewCapKernel()
+	var pid contract.PeerID
+	pid[0] = 0x7E
+	sampler := func() contract.NodeTelemetry { return contract.NodeTelemetry{PeerID: pid} }
+	tracer := sdktrace.NewTracerProvider().Tracer("cap-gate-test")
+
+	// (1) Valid cap: sample is delivered.
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		fab := &capFabric{kernel: kernel, got: make(chan contract.Sample, 4)}
+		capH, _ := kernel.Mint(contract.ResourceRef{Kind: contract.KindTopic}, nil, nil)
+		pub, err := New(Config{Fabric: fab, Cap: capH, Site: "local", PeerID: pid, Hz: 4, Sample: sampler, Tracer: tracer})
+		if err != nil {
+			t.Fatalf("new: %v", err)
+		}
+		go func() { _ = pub.Run(ctx) }()
+		select {
+		case <-fab.got:
+			// delivered through the cap gate — good.
+		case <-ctx.Done():
+			t.Fatal("telemetry not delivered with a valid cap")
+		}
+	}
+
+	// (2) No cap (zero handle is unknown to the kernel): every publish is denied,
+	// so nothing reaches the bus and the publisher counts drops.
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		fab := &capFabric{kernel: kernel, got: make(chan contract.Sample, 4)}
+		pub, err := New(Config{Fabric: fab, Cap: contract.CapHandle(0), Site: "local", PeerID: pid, Hz: 4, Sample: sampler, Tracer: tracer})
+		if err != nil {
+			t.Fatalf("new: %v", err)
+		}
+		go func() { _ = pub.Run(ctx) }()
+		<-ctx.Done()
+		if _, dropped := pub.Stats(); dropped == 0 {
+			t.Fatal("publish without a cap was not denied/dropped")
+		}
+		select {
+		case s := <-fab.got:
+			t.Fatalf("uncapped telemetry reached the bus: %q", s.Key)
+		default:
+		}
+	}
+}
+
 func TestRateClamped(t *testing.T) {
 	mk := func(hz float64) *Publisher {
 		p, err := New(Config{

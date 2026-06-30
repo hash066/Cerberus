@@ -96,11 +96,17 @@ func New(ctx context.Context, cfg Config) (*Fabric, error) {
 		return nil, fmt.Errorf("mesh: keygen: %w", err)
 	}
 
-	h, err := libp2p.New(
+	// The QUIC transport is encrypted and PeerID-authenticated by construction
+	// (TLS 1.3 inside QUIC, certificate bound to the Ed25519 host key). See
+	// security.go for the full posture; securityOptions is the single hook where
+	// extra security transports would be wired if a non-QUIC transport is added.
+	opts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.Transport(libp2pquic.NewTransport),
 		libp2p.ListenAddrStrings(listen...),
-	)
+	}
+	opts = append(opts, securityOptions()...)
+	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("mesh: libp2p host: %w", err)
 	}
@@ -234,16 +240,28 @@ func (f *Fabric) Subscribe(ctx context.Context, keyExpr string, capH contract.Ca
 	return s.ch, nil
 }
 
-// Dial opens a QUIC stream to a peer addressed by its Ed25519 PeerID. The peer's
-// multiaddrs must already be known (via discovery or Connect).
+// Dial opens a QUIC stream to a peer addressed by its Ed25519 PeerID and binds
+// the session to that identity. The peer's multiaddrs must already be known (via
+// discovery or Connect).
+//
+// Security: libp2p's QUIC/TLS handshake authenticates the remote's host key, so
+// NewStream to a given peer.ID already cannot connect to an impostor. We then
+// assert, belt-and-suspenders, that the key libp2p authenticated equals the
+// claimed PeerID; a session whose presented key != claimed PeerID is rejected
+// (ErrDenied) and the stream is reset. This is the explicit PeerID-binding
+// enforcement required by Vertical 01 §7 ("mTLS binds sessions to PeerIDs").
 func (f *Fabric) Dial(p contract.PeerID) (contract.Session, error) {
-	pid, err := libp2pID(p)
+	pid, err := toLibp2pID(p)
 	if err != nil {
 		return nil, err
 	}
 	s, err := f.host.NewStream(f.ctx, pid, sessionProto)
 	if err != nil {
 		return nil, contract.Errf(contract.ErrPartitioned, err.Error())
+	}
+	if err := verifyAuthenticatedPeer(p, s.Conn().RemotePublicKey()); err != nil {
+		_ = s.Reset()
+		return nil, err
 	}
 	return newStreamSession(s), nil
 }
@@ -267,9 +285,19 @@ func (f *Fabric) Peers() []contract.PeerInfo {
 	return out
 }
 
+// onStream is the accept side of Dial. libp2p only invokes a stream handler
+// after the QUIC/TLS handshake has authenticated the remote's PeerID, so the
+// inbound session's identity is already proven. We additionally reject any
+// stream that does not carry a valid Ed25519 identity (defense-in-depth: a
+// session whose presented key is not a usable PeerID is dropped).
 func (f *Fabric) onStream(s network.Stream) {
+	ss := newStreamSession(s)
+	if !ss.verified {
+		_ = s.Reset()
+		return
+	}
 	select {
-	case f.inbound <- newStreamSession(s):
+	case f.inbound <- ss:
 	default:
 		_ = s.Reset()
 	}
@@ -298,14 +326,6 @@ func (f *Fabric) Close() error {
 	f.sub.Cancel()
 	_ = f.topic.Close()
 	return f.host.Close()
-}
-
-func libp2pID(p contract.PeerID) (peer.ID, error) {
-	pub, err := crypto.UnmarshalEd25519PublicKey(p[:])
-	if err != nil {
-		return "", err
-	}
-	return peer.IDFromPublicKey(pub)
 }
 
 var _ contract.Fabric = (*Fabric)(nil)
