@@ -7,11 +7,13 @@ package system
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	"go.opentelemetry.io/otel/trace/noop"
 
 	contract "github.com/hash066/cerberus/contract/go"
+	"github.com/hash066/cerberus/daemon/dataplane"
 	"github.com/hash066/cerberus/daemon/mesh"
 	"github.com/hash066/cerberus/daemon/ninep"
 	"github.com/hash066/cerberus/daemon/scheduler"
@@ -30,7 +32,12 @@ type System struct {
 	Fabric    contract.Fabric
 	Scheduler *scheduler.Scheduler
 	Namespace *ninep.Server
-	tree      *supervisor.Tree
+	DataPlane *dataplane.Server
+	// NinePAddr is the 9P2000.L wire server's listen address (control plane).
+	NinePAddr string
+	// DataPlaneAddr is the QUIC data-plane receiver's listen address (bulk bytes).
+	DataPlaneAddr string
+	tree          *supervisor.Tree
 }
 
 // Compose wires every subsystem together against the frozen contract. The
@@ -65,11 +72,50 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 		return nil, fmt.Errorf("telemetry: %w", err)
 	}
 
+	// Data plane: the capability-bound QUIC receiver that bulk bytes (tensors,
+	// VRAM, audio, file content) actually flow over. It is physically separate
+	// from the control plane (ARCHITECTURE.md §4.1) — the 9P namespace only mints
+	// grants against it; payloads never traverse 9P.
+	dp := dataplane.NewServer(kernel, time.Now().Unix())
+	if err := dp.Listen("127.0.0.1:0"); err != nil {
+		return nil, fmt.Errorf("dataplane listen: %w", err)
+	}
+
 	// 9P capability namespace with a sample local VRAM device.
 	ns := ninep.New(kernel)
 	q := contract.Quota{Bytes: 2 * 1024 * 1024 * 1024}
 	ns.Register("/cer/dev/vram/local/0",
 		contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/local/0", Quota: &q})
+
+	// The cross-cut wiring (HANDOFF Phase F "next"): opening a device `.../ctl`
+	// allocates a real transfer on the data plane and hands back the endpoint the
+	// holder dials — the control plane mints the grant, the data plane moves the
+	// bytes. The capability that opened ctl is the same one the data-plane server
+	// will verify when the holder connects, so the grant is end-to-end authorized.
+	ns.SetGranter(func(cap contract.CapHandle, _ contract.ResourceRef, transferID uint64, quota contract.Quota) (ninep.DataEndpoint, error) {
+		ep := dp.RegisterGrant(transferID, cap, quota)
+		return ninep.DataEndpoint{
+			Kind:     ninep.EndpointKind(ep.Kind),
+			Endpoint: ep.Addr,
+			StreamID: ep.TransferID,
+			Quota:    ep.Quota,
+		}, nil
+	})
+
+	// A connection capability so the 9P wire server can serve the local namespace
+	// over 9P2000.L. Per-connection capability negotiation is the seam documented
+	// in daemon/ninep/wire.go; here the daemon serves its own local devices.
+	devCap, err := kernel.Mint(
+		contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/local/0"},
+		[]contract.Right{contract.RightRead, contract.RightAlloc}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("mint device cap: %w", err)
+	}
+	nineLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("9p listen: %w", err)
+	}
+	wire := ninep.NewWireServer(ns)
 
 	// Seed the scheduler with the local node so it can place work.
 	sched := scheduler.New(nil)
@@ -78,8 +124,31 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 	tree := supervisor.New("cerberusd")
 	tree.Supervise(supervisor.Permanent, runFunc(pub.Run))
 	tree.Supervise(supervisor.Permanent, runFunc(func(c context.Context) error { return schedulerLoop(c, sched) }))
+	// Serve the data-plane receiver. A nil sink drains each authorized transfer
+	// within its quota; the consumer of device bytes plugs in here.
+	tree.Supervise(supervisor.Permanent, runFunc(func(c context.Context) error {
+		return dp.Serve(c, nil)
+	}))
+	// Serve the 9P2000.L control-plane namespace over the wire, closing the
+	// listener on shutdown so Serve unblocks.
+	tree.Supervise(supervisor.Permanent, runFunc(func(c context.Context) error {
+		go func() { <-c.Done(); _ = nineLn.Close() }()
+		if err := wire.Serve(nineLn, devCap); err != nil && c.Err() == nil {
+			return err
+		}
+		return nil
+	}))
 
-	return &System{Kernel: kernel, Fabric: fab, Scheduler: sched, Namespace: ns, tree: tree}, nil
+	return &System{
+		Kernel:        kernel,
+		Fabric:        fab,
+		Scheduler:     sched,
+		Namespace:     ns,
+		DataPlane:     dp,
+		NinePAddr:     nineLn.Addr().String(),
+		DataPlaneAddr: dp.Addr(),
+		tree:          tree,
+	}, nil
 }
 
 // Serve runs the supervision tree until ctx is cancelled.

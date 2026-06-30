@@ -34,6 +34,18 @@ type DataEndpoint struct {
 	Quota    contract.Quota `json:"quota"`
 }
 
+// Granter allocates a real data-plane transfer for an opened device control file
+// and returns the endpoint a holder dials. The composition layer wires this to
+// the data plane (e.g. dataplane.Server.RegisterGrant); it is handed the
+// authorizing capability, the device resource, the stream/transfer id the
+// namespace assigned, and the device's byte quota.
+//
+// When no Granter is set (the standalone, in-memory case used by tests and the
+// v0.1 skeleton), Open returns a descriptor-only endpoint instead — so the
+// namespace stays usable without a data plane and existing callers are
+// unaffected. Bytes never traverse 9P either way (vertical 04 §3.5).
+type Granter func(cap contract.CapHandle, ref contract.ResourceRef, transferID uint64, quota contract.Quota) (DataEndpoint, error)
+
 // Server is an in-memory capability-gated 9P namespace.
 type Server struct {
 	mu         sync.Mutex
@@ -41,11 +53,21 @@ type Server struct {
 	devices    map[string]contract.ResourceRef // device dir path -> resource
 	now        int64
 	nextStream uint64
+	granter    Granter
 }
 
 // New builds a namespace server backed by a capability kernel.
 func New(kernel contract.CapKernel) *Server {
 	return &Server{kernel: kernel, devices: map[string]contract.ResourceRef{}}
+}
+
+// SetGranter installs the data-plane allocator Open uses to turn a `.../ctl`
+// open into a live, capability-bound transfer. Call it once at composition time
+// before the namespace is served.
+func (s *Server) SetGranter(g Granter) {
+	s.mu.Lock()
+	s.granter = g
+	s.mu.Unlock()
 }
 
 // Register mounts a device directory (e.g. /cer/dev/vram/<peer>/0) for a resource.
@@ -127,13 +149,37 @@ func (s *Server) Open(path string, cap contract.CapHandle) (DataEndpoint, error)
 		return DataEndpoint{}, err
 	}
 	s.nextStream++
+	var quota contract.Quota
+	if ref.Quota != nil {
+		quota = *ref.Quota
+	}
+
+	// If the composition layer wired a data plane, opening ctl allocates a real,
+	// capability-bound transfer there and returns the endpoint the holder dials
+	// (vertical 04 §4.1). Otherwise fall back to a descriptor-only placeholder so
+	// the namespace remains usable standalone.
+	if s.granter != nil {
+		ep, err := s.granter(cap, ref, s.nextStream, quota)
+		if err != nil {
+			return DataEndpoint{}, err
+		}
+		if ep.Kind == "" {
+			ep.Kind = EndpointQUIC
+		}
+		if ep.StreamID == 0 {
+			ep.StreamID = s.nextStream
+		}
+		if ep.Quota == (contract.Quota{}) {
+			ep.Quota = quota
+		}
+		return ep, nil
+	}
+
 	ep := DataEndpoint{
 		Kind:     EndpointQUIC,
 		Endpoint: "quic://" + strings.TrimPrefix(dir, "/cer/dev/"),
 		StreamID: s.nextStream,
-	}
-	if ref.Quota != nil {
-		ep.Quota = *ref.Quota
+		Quota:    quota,
 	}
 	return ep, nil
 }

@@ -172,6 +172,8 @@ func main() {
 		// standbys for this node's shards (ARCHITECTURE §4.2).
 		mon.SetCoordinator(lidDropCoordinator{sched: sys.Scheduler})
 		log.Println("cerberusd: composed system up (mesh + telemetry + scheduler + 9P under supervisor)")
+		log.Printf("cerberusd: 9P control plane on %s; QUIC data plane on %s (open .../ctl mints a data-plane grant)",
+			sys.NinePAddr, sys.DataPlaneAddr)
 		go func() {
 			if err := sys.Serve(ctx); err != nil && ctx.Err() == nil {
 				log.Printf("cerberusd: system exited: %v", err)

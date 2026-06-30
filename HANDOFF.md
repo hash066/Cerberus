@@ -3,7 +3,7 @@
 > Read this first in a new session. It is the single source of "where things actually stand" — what is real, what is stubbed, what is blocked, and exactly how to continue. Honest by design.
 
 ## What Cerberus is
-A zero-trust **distributed hypervisor for multi-agent orchestration**: bind heterogeneous machines (Macs/PCs/Linux) into a local, capability-secured mesh that runs autonomous agent swarms — escaping centralized cloud. **Desktop app** (headless daemon `cerberusd` + CLI `cerberus` + Tauri tray UI). Go = control plane; Rust = capability kernel / WASM / crypto / CRDT. Full vision in [ideadumpp2.md](ideadumpp2.md); canonical spec in [ARCHITECTURE.md](ARCHITECTURE.md); per-vertical designs in [docs/verticals/](docs/verticals/).
+A zero-trust **distributed hypervisor for multi-agent orchestration**: bind heterogeneous machines (Macs/PCs/Linux) into a local, capability-secured mesh that runs autonomous agent swarms — escaping centralized cloud. **Desktop app** (headless daemon `cerberusd` + CLI `cerberus` + Tauri tray UI). Go = control plane; Rust = capability kernel / WASM / crypto / CRDT. Full vision in [ideadumpp2.md](docs/research/ideadumpp2.md); canonical spec in [ARCHITECTURE.md](ARCHITECTURE.md); per-vertical designs in [docs/verticals/](docs/verticals/).
 
 ## Current state (truth)
 - Branch `main` (and `integration`) at the latest commit; everything below is committed + pushed to `github.com/hash066/Cerberus`.
@@ -32,7 +32,7 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
 | OCap capability tokens — Ed25519-signed, gateway+RPC+API gated, multi-user (`daemon/auth`) | ✅ REAL, tested |
 | Durable persistence — bbolt store; issuer key, revocations, eUTXO ledger, CRDT checkpoints survive restart (`daemon/store`,`daemon/ledger`,`daemon/state`,`daemon/auth`) | ✅ REAL, tested |
 | Status API + Tauri dashboard (`daemon/api`, `tray/`) | ✅ API REAL+tested; GUI real code, **not launched here** (needs Tauri toolchain) |
-| Composed daemon (OCap + mesh + telemetry + scheduler + 9P under OTP supervisor) (`daemon/system`) | ✅ REAL (composition); mesh = real libp2p/QUIC |
+| Composed daemon (OCap + mesh + telemetry + scheduler + 9P under OTP supervisor) (`daemon/system`) | ✅ REAL (composition); mesh = real libp2p/QUIC. **Cross-cut wiring done:** the 9P namespace is bridged to the QUIC data plane (`ninep.Server.SetGranter`) — opening `.../ctl` calls `dataplane.RegisterGrant` and returns the live endpoint; the 9P wire server + data-plane receiver both run under the supervisor (addrs in `System.NinePAddr`/`DataPlaneAddr`). Proven end-to-end by `daemon/ninep` `TestOpenCtlGrantsRealDataPlaneTransfer` (open ctl → real QUIC transfer within quota, rejected past it). |
 | Scheduler — cost-model placement, reroute/standby, **multi-shard pipeline placement**, **per-node reroute (lid-drop)** (`daemon/scheduler`) | ✅ REAL, tested |
 | CRDT belief-conflict flagging (`core/crdt`, `daemon/state`) | ✅ REAL, tested |
 | Distributed revocation — OR-set engine (`core/crdt`) + **mesh gossip propagation** (`daemon/auth` `RevocationGossip`, wired in `cerberusd`) + attested admission (`core/identity`) | ✅ REAL, tested (Phase E4): revoke on A → published over cap-gated `sys/revocations` topic → applied on B. Rust OR-set also reachable via cgo. |
@@ -71,7 +71,8 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
   - **F4** ✅ 9P2000.L wire server (`daemon/ninep`) over the cap-gated namespace; FUSE/WinFsp mount = stub.
   - **F5** ✅ Network audio transport (`daemon/audio`) — the mic/speaker path; OS capture = stub.
   - **F2 deferred:** GPU dispatch (needs real GPU hardware to validate honestly).
-  - **Next (cross-cut wiring):** 9P `ctl` open → `dataplane.RegisterGrant` → hand back the real endpoint (ARCHITECTURE §4.1); audio rides the data plane; serve the 9P wire server + a data-plane listener under the daemon supervisor. Then Phase F2 (GPU) on real hardware.
+  - **Cross-cut wiring** ✅ (`daemon/ninep`,`daemon/system`,`cmd/cerberusd`): 9P `ctl` open → `dataplane.RegisterGrant` → returns the real endpoint (ARCHITECTURE §4.1); the 9P2000.L wire server and the QUIC data-plane receiver are both supervised in `system.Compose` and their addresses logged at startup. `ninep.Server` gained an injectable `Granter` so the namespace stays decoupled from the data plane (no import cycle); falls back to the descriptor-only placeholder when unwired. Tested by `TestOpenCtlGrantsRealDataPlaneTransfer`.
+  - **Next:** audio rides the data plane (`daemon/audio` → `dataplane`); then Phase F2 (GPU) on real hardware.
 
 ## Repo layout (key)
 ```
