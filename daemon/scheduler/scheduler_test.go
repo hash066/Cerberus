@@ -69,6 +69,40 @@ func TestRereotePromotesStandby(t *testing.T) {
 	}
 }
 
+func TestPlacePipelineSpreadsShards(t *testing.T) {
+	s := New(nil)
+	s.UpdateNode(node(1, 8_000_000_000, false, true))
+	s.UpdateNode(node(2, 8_000_000_000, false, true))
+	s.UpdateNode(node(3, 8_000_000_000, false, true))
+
+	shards := []contract.Shard{
+		{Kind: contract.ShardPipeline, LayerLo: 0, LayerHi: 20},
+		{Kind: contract.ShardPipeline, LayerLo: 21, LayerHi: 40},
+		{Kind: contract.ShardPipeline, LayerLo: 41, LayerHi: 60},
+	}
+	plan, err := s.PlacePipeline([]byte{99}, shards)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Placements) != 3 {
+		t.Fatalf("expected 3 shard placements, got %d", len(plan.Placements))
+	}
+	seen := map[contract.PeerID]bool{}
+	for _, p := range plan.Placements {
+		seen[p.Node] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("shards should spread across 3 distinct nodes, got %d", len(seen))
+	}
+}
+
+func TestPlacePipelineNoNodes(t *testing.T) {
+	s := New(nil)
+	if _, err := s.PlacePipeline([]byte{1}, []contract.Shard{{}}); err == nil {
+		t.Fatal("expected error with no feasible nodes")
+	}
+}
+
 func TestMinVRAMConstraint(t *testing.T) {
 	s := New(DefaultCostModel{MinVRAM: 6_000_000_000})
 	s.UpdateNode(node(1, 4_000_000_000, false, true)) // below min -> infeasible

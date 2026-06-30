@@ -117,6 +117,31 @@ func (s *Scheduler) Place(t contract.ComputeTask) (contract.Plan, error) {
 	return plan, nil
 }
 
+// PlacePipeline spreads a multi-shard task (pipeline/tensor parallelism) across
+// distinct feasible nodes, round-robin over the ranked candidates, assigning a
+// hot standby per shard where capacity allows. This is the scale path: a model
+// too big for one node is split and placed across the mesh.
+func (s *Scheduler) PlacePipeline(taskID []byte, shards []contract.Shard) (contract.Plan, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ranked := s.rank(contract.ComputeTask{TaskID: taskID}, nil)
+	if len(ranked) == 0 {
+		return contract.Plan{}, contract.Errf(contract.ErrThermalShed, "no feasible node")
+	}
+	plan := contract.Plan{TaskID: taskID}
+	for i, sh := range shards {
+		primary := ranked[i%len(ranked)]
+		plan.Placements = append(plan.Placements, contract.Placement{Shard: sh, Node: primary})
+		if len(ranked) > 1 {
+			standby := ranked[(i+1)%len(ranked)]
+			plan.Standbys = append(plan.Standbys, contract.Placement{Shard: sh, Node: standby})
+		}
+	}
+	s.placements[hex.EncodeToString(taskID)] = plan
+	return plan, nil
+}
+
 // Reroute promotes the standby (or re-places excluding the lost node) when a node fails.
 func (s *Scheduler) Reroute(taskID []byte, lost contract.PeerID) (contract.Plan, error) {
 	s.mu.Lock()
