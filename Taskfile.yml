@@ -24,6 +24,16 @@ tasks:
     cmds:
       - cargo build
 
+  build:ffi:
+    desc: "Windows: build cerberusd with the real Rust OCap kernel via cgo (raw: pwsh build/ffi.ps1 -Action build). See docs/ffi.md."
+    cmds:
+      - pwsh -NoProfile -File build/ffi.ps1 -Action build
+
+  test:ffi:
+    desc: "Windows: test the cgo capability-kernel binding (raw: pwsh build/ffi.ps1 -Action test). See docs/ffi.md."
+    cmds:
+      - pwsh -NoProfile -File build/ffi.ps1 -Action test
+
   test:
     desc: Unit tests, Go + Rust (raw: `go test ./...` && `cargo test`)
     cmds:

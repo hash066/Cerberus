@@ -17,6 +17,9 @@ go test ./...               # all Go tests
 cargo build --workspace     # Rust core crates (tray + wasm examples are excluded)
 cargo test --workspace
 go run ./test/e2e           # the 2-node remote-WASM acceptance demo (prints 1337)
+# real Rust OCap kernel over cgo (Phase E item 1; needs zig + gnu target, see docs/ffi.md):
+pwsh build/ffi.ps1 -Action test   # → daemon/ffi tests pass against the Ed25519 SignedKernel
+pwsh build/ffi.ps1 -Action build  # → cerberusd-ffi.exe (boots with kernel=rust-signed-cabi)
 # desktop UI (needs Tauri toolchain + WebView2, NOT verified in this env):
 #   run cmd/cerberusd, then:  cd tray && cargo tauri dev
 ```
@@ -32,8 +35,8 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
 | Composed daemon (OCap + mesh + telemetry + scheduler + 9P under OTP supervisor) (`daemon/system`) | ✅ REAL (composition); mesh = real libp2p/QUIC |
 | Scheduler — cost-model placement, reroute/standby, **multi-shard pipeline placement** (`daemon/scheduler`) | ✅ REAL, tested |
 | CRDT belief-conflict flagging (`core/crdt`, `daemon/state`) | ✅ REAL, tested |
-| OCap kernel in Rust — Ed25519 CBOR caps + attenuation chains (`core/ocap` SignedKernel) | ✅ REAL, tested — **but NOT bound into the Go daemon** (see blocked) |
-| Real Rust kernel via cgo (`daemon/ffi` `-tags ffi` → `core/cabi`) | ⛔ BLOCKED: no C toolchain here (`CGO_ENABLED=0`). Default daemon uses a pure-Go stub kernel. Code path exists behind the `ffi` build tag. |
+| OCap kernel in Rust — Ed25519 CBOR caps + attenuation chains (`core/ocap` SignedKernel) | ✅ REAL, tested — **now bound into the Go daemon** under `-tags ffi` |
+| Real Rust kernel via cgo (`daemon/ffi` `-tags ffi` → `core/cabi` → `SignedKernel`) | ✅ REAL, tested (Phase E item 1). Full `CapKernel` (mint/attenuate/verify/revoke) over cgo; `cerberusd -tags ffi` boots with `kernel=rust-signed-cabi`. Toolchain recipe in [docs/ffi.md](docs/ffi.md) (zig cc + `x86_64-pc-windows-gnu` + GOARCH=amd64). **Default** build is still the pure-Go stub on win/386 (no C toolchain needed). |
 | mTLS / PeerID on the wire | ⛔ TODO (RPC/gateway are token-gated but plain TCP/localhost) |
 | zk-WASM proof-of-inference, host-TEE memory shielding, RDMA-over-Thunderbolt | ⛔ FRONTIER (documented stubs by design; ~100× / hardware-limited) |
 | eUTXO advanced settlement (fraud proofs/zk) in `core/economy` (Rust) | ⚠️ model exists; daemon's live ledger is the Go `daemon/ledger` (durable) |
@@ -44,7 +47,7 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
 - **Phase B — multi-user auth**: `daemon/auth` Ed25519 bearer capability tokens (mint/authorize/attenuate/revoke, expiry, scope, admin); enforced on gateway (`:8080`), RPC (`:9092`), status API (`:7777`); operator token written to OS config dir; CLI authenticates.
 - **Phase C — durability**: bbolt `daemon/store`; persisted issuer key + revocations; durable eUTXO `daemon/ledger`; durable CRDT `daemon/state` (LWW map + checkpoints + belief-conflict). All survive restart; wired into `cerberusd`.
 - **Phase D — desktop dashboard**: `daemon/api` token-gated status JSON; `cerberusd` serves live data on `:7777`; `tray/` real Tauri v2 dashboard (Rust does the authenticated fetch, webview renders — no browser).
-- **Phase E (started)**: multi-shard pipeline placement in the scheduler.
+- **Phase E (in progress)**: multi-shard pipeline placement in the scheduler; **item 1 done — real Rust OCap kernel bound via cgo** (`-tags ffi`): the expanded C-ABI in `core/cabi` now backs the full `contract.CapKernel` over the Ed25519 `SignedKernel`, so capabilities are cryptographically enforced at runtime end-to-end. Default build unchanged (pure-Go stub, win/386, no C toolchain). See [docs/ffi.md](docs/ffi.md).
 
 ## Repo layout (key)
 ```
@@ -61,14 +64,14 @@ docs/    ARCHITECTURE refs, verticals/, workstreams.md, agent-briefs.md
 **Frozen contract:** `contract/`, `proto/`, `components/wit/`, `schemas/` are the integration seam (see [CONTRACT.md](CONTRACT.md)). Change only via a deliberate contract change, not casually.
 
 ## Key decisions / constraints
-- **No cgo on this machine** (`CGO_ENABLED=0`, Go win/386, no C compiler) → the real Rust OCap kernel isn't bound; daemon uses the pure-Go stub kernel. Binding it (`-tags ffi`) is the #1 thing needing a dev box with gcc/clang.
+- **cgo path now works** (Phase E item 1): the default build is still pure-Go on win/386 (`CGO_ENABLED=0`, no C compiler needed), but `-tags ffi` binds the real Rust kernel using **zig cc** (GCC-compatible; cgo can't drive MSVC `cl.exe`), the Rust **`x86_64-pc-windows-gnu`** staticlib, and **GOARCH=amd64**. One quirk handled by `build/ffi.ps1`: strip the duplicate `__chkstk_ms` object (zig's `compiler_rt` vs Rust's `compiler_builtins`) and link `-lunwind`. Full recipe: [docs/ffi.md](docs/ffi.md).
 - **No browser**: UI is Tauri native webview; Rust performs network calls, webview only renders.
 - **Two profiles, one binary**: `open_mesh` (eUTXO economy ON) vs `sealed` (chain OFF, attestation ON). `cerberusd -profile=...`.
 - **Pure-Go choices to avoid toolchain blocks**: wazero (WASM), bbolt (KV), Ed25519 (stdlib).
 - Each increment is converted for real, verified green, and pushed; unverifiable parts are called out, not faked.
 
 ## Phase E roadmap (what's left — prioritized)
-1. **Bind real Rust OCap kernel via cgo** (`-tags ffi`) once a C toolchain is available — makes capabilities cryptographically enforced at runtime end-to-end.
+1. ✅ **DONE — Bind real Rust OCap kernel via cgo** (`-tags ffi`): capabilities are cryptographically enforced at runtime end-to-end (`core/cabi` → `SignedKernel`). Recipe + reproducible build in [docs/ffi.md](docs/ffi.md) / `build/ffi.ps1`. Remaining hardening: rotate the issuer key into custody (TPM/Secure Enclave) and expose it via the ABI; broaden caveats beyond `max_bytes`.
 2. **Real cross-node compute**: move the E2E demo transport from HTTP onto the composed mesh; resolve `ComputeTask.Component` CID → wasm bytes via IPLD; network promise pipelining.
 3. **Runtime scale**: wasmtime Component Model + WASI P2 (richer than wazero), `gpu` capability dispatch (MLX / wgpu), zero-copy/RDMA data plane.
 4. **Scheduler depth**: real telemetry-driven cost model in the live daemon; tensor sharding; multi-objective optimizer.

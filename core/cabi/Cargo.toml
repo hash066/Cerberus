@@ -12,3 +12,4 @@ crate-type = ["staticlib", "cdylib"]
 [dependencies]
 cerberus-contract = { path = "../../contract/rust" }
 cerberus-ocap = { path = "../ocap" }
+serde_json = "1"
