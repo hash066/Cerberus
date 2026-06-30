@@ -16,6 +16,7 @@ import (
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
+	"github.com/hash066/cerberus/daemon/api"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/ffi"
 	"github.com/hash066/cerberus/daemon/gateway"
@@ -135,9 +136,11 @@ func main() {
 
 	// Compose the real control plane: OCap kernel + libp2p/QUIC mesh + telemetry
 	// + scheduler + 9P namespace, under one supervision tree.
+	var fabric contract.Fabric
 	if sys, serr := system.Compose(ctx, k, "local"); serr != nil {
 		log.Printf("cerberusd: compose system failed: %v", serr)
 	} else {
+		fabric = sys.Fabric
 		log.Println("cerberusd: composed system up (mesh + telemetry + scheduler + 9P under supervisor)")
 		go func() {
 			if err := sys.Serve(ctx); err != nil && ctx.Err() == nil {
@@ -173,6 +176,40 @@ func main() {
 		}
 	}()
 
+	// Start the status API the desktop tray/dashboard consumes (token-gated).
+	started := time.Now()
+	apiSrv := api.New(issuer, func() api.Snapshot {
+		pw := mon.State()
+		peers := []string{}
+		if fabric != nil {
+			for _, p := range fabric.Peers() {
+				peers = append(peers, p.Addr)
+			}
+		}
+		bal, _ := lg.Balance("operator")
+		return api.Snapshot{
+			Version:         contract.ContractVersion,
+			Profile:         *profile,
+			Kernel:          ffi.Backend(),
+			UptimeSec:       int64(time.Since(started).Seconds()),
+			MeshUp:          fabric != nil,
+			Peers:           peers,
+			OperatorBalance: bal,
+			Power: api.PowerView{
+				Source:     powerSrc(pw.Src),
+				BatteryPct: pw.BatteryPct,
+				Lid:        lidStr(pw.Lid),
+				Hint:       hintStr(pw.Hint),
+			},
+		}
+	})
+	go func() {
+		log.Println("Starting status API on 127.0.0.1:7777 (Bearer token required)")
+		if err := apiSrv.Start("127.0.0.1:7777"); err != nil {
+			log.Printf("API error: %v", err)
+		}
+	}()
+
 	// Start RPC server (token-gated)
 	rpcService := &DaemonRPC{lifecycle: mon, authz: issuer}
 	rpc.Register(rpcService)
@@ -205,4 +242,29 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+func powerSrc(s contract.PowerSource) string {
+	if s == contract.PowerBattery {
+		return "battery"
+	}
+	return "AC"
+}
+
+func lidStr(l contract.LidState) string {
+	if l == contract.LidClosed {
+		return "closed"
+	}
+	return "open"
+}
+
+func hintStr(h contract.SleepHint) string {
+	switch h {
+	case contract.SleepImminent:
+		return "sleep_imminent"
+	case contract.SleepIdle:
+		return "idle"
+	default:
+		return "awake"
+	}
 }

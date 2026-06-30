@@ -2,38 +2,51 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
-    <script type="module" src="/main.js" defer></script>
+    <link rel="stylesheet" href="styles.css" />
+    <title>Cerberus</title>
+    <script src="main.js" defer></script>
   </head>
-
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
+    <header>
+      <div class="brand"><span class="logo">🐺</span> Cerberus</div>
+      <div class="conn"><span id="conn" class="dot"></span><span id="conn-text">connecting…</span></div>
+    </header>
 
-      <div class="row">
-        <a href="https://tauri.app" target="_blank">
-          <img src="/assets/tauri.svg" class="logo tauri" alt="Tauri logo" />
-        </a>
-        <a
-          href="https://developer.mozilla.org/en-US/docs/Web/JavaScript"
-          target="_blank"
-        >
-          <img
-            src="/assets/javascript.svg"
-            class="logo vanilla"
-            alt="JavaScript logo"
-          />
-        </a>
-      </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
+    <main class="grid">
+      <section class="card">
+        <h2>Daemon</h2>
+        <div class="kv"><span>Version</span><b id="version">—</b></div>
+        <div class="kv"><span>Profile</span><b id="profile">—</b></div>
+        <div class="kv"><span>Kernel</span><b id="kernel">—</b></div>
+        <div class="kv"><span>Uptime</span><b id="uptime">—</b></div>
+      </section>
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
+      <section class="card">
+        <h2>Mesh</h2>
+        <div class="kv"><span>Fabric</span><b id="mesh">—</b></div>
+        <div class="kv"><span>Peers</span><b id="peers">—</b></div>
+        <div class="peerlist" id="peerlist">—</div>
+      </section>
+
+      <section class="card">
+        <h2>Power &amp; Thermal</h2>
+        <div class="kv"><span>Source</span><b id="psource">—</b></div>
+        <div class="kv"><span>Battery</span><b id="battery">—</b></div>
+        <div class="kv"><span>Lid</span><b id="lid">—</b></div>
+        <div class="kv"><span>Sleep hint</span><b id="hint">—</b></div>
+      </section>
+
+      <section class="card">
+        <h2>Economy</h2>
+        <div class="kv"><span>Operator balance</span><b id="balance">—</b></div>
+        <div class="muted">compute credits (OpenMesh)</div>
+      </section>
     </main>
+
+    <footer>
+      <span id="err" class="err"></span>
+      <span class="muted">auth: operator capability token · status API :7777</span>
+    </footer>
   </body>
 </html>
