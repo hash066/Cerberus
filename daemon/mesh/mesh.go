@@ -24,8 +24,8 @@ import (
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	libp2p "github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -312,6 +312,23 @@ func (f *Fabric) PeerID() contract.PeerID { return f.peerID }
 // AddrInfo returns this node's dialable libp2p address info (for tests/bootstrap).
 func (f *Fabric) AddrInfo() peer.AddrInfo {
 	return peer.AddrInfo{ID: f.host.ID(), Addrs: f.host.Addrs()}
+}
+
+// DialableAddrs returns this node's listen addresses as full p2p multiaddr
+// strings (".../p2p/<peer-id>"), each of which round-trips through
+// peer.AddrInfoFromString. Unlike AddrInfo().String(), these are parseable wire
+// strings suitable for exchanging over an out-of-band bootstrap channel.
+func (f *Fabric) DialableAddrs() []string {
+	ai := f.AddrInfo()
+	maddrs, err := peer.AddrInfoToP2pAddrs(&ai)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(maddrs))
+	for _, m := range maddrs {
+		out = append(out, m.String())
+	}
+	return out
 }
 
 // Connect dials a peer by its libp2p address info (explicit bootstrap path used
