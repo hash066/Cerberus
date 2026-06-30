@@ -9,6 +9,7 @@ require (
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/libp2p/go-libp2p-pubsub v0.16.0
 	github.com/multiformats/go-multihash v0.2.3
+	github.com/quic-go/quic-go v0.60.0
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/tetratelabs/wazero v1.12.0
 	github.com/thejerf/suture/v4 v4.0.6
@@ -16,7 +17,6 @@ require (
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
-	google.golang.org/protobuf v1.36.6
 )
 
 require (
@@ -91,7 +91,6 @@ require (
 	github.com/prometheus/common v0.64.0 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.60.0 // indirect
 	github.com/quic-go/webtransport-go v0.10.0 // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
@@ -116,5 +115,6 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
+	google.golang.org/protobuf v1.36.6 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
