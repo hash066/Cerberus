@@ -19,7 +19,9 @@ import (
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/ffi"
 	"github.com/hash066/cerberus/daemon/gateway"
+	"github.com/hash066/cerberus/daemon/ledger"
 	"github.com/hash066/cerberus/daemon/lifecycle"
+	"github.com/hash066/cerberus/daemon/state"
 	"github.com/hash066/cerberus/daemon/store"
 	"github.com/hash066/cerberus/daemon/system"
 	"github.com/hash066/cerberus/daemon/wasm"
@@ -98,11 +100,37 @@ func main() {
 		contract.ContractVersion, *profile, ffi.Backend(), h)
 	fmt.Println("cerberusd: control plane up (v0.1 skeleton).")
 
-	// Start Lifecycle monitor with a nil CRDT seam until integration wires the real engine.
-	mon := lifecycle.NewMonitor(nil, []byte("daemon-doc"))
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Durable persistence: one embedded store holds the issuer key, revocations,
+	// the eUTXO ledger, and CRDT checkpoints — all survive restart.
+	cfgDir := filepath.Dir(auth.OperatorTokenPath())
+	db, derr := store.Open(filepath.Join(cfgDir, "cerberus.db"))
+	if derr != nil {
+		log.Fatalf("open store: %v", derr)
+	}
+	defer db.Close()
+
+	// Durable CRDT engine (agent memory + checkpoints) and eUTXO ledger.
+	crdtEngine, cerr := state.Open(db)
+	if cerr != nil {
+		log.Fatalf("open crdt store: %v", cerr)
+	}
+	lg, lerr := ledger.Open(db, *profile == "open_mesh")
+	if lerr != nil {
+		log.Fatalf("open ledger: %v", lerr)
+	}
+	genBal, _ := lg.Balance("operator")
+	if genBal == 0 && *profile == "open_mesh" {
+		if _, e := lg.Mint("operator", 1_000_000); e == nil {
+			genBal = 1_000_000 // genesis compute credits (durable)
+		}
+	}
+	log.Printf("cerberusd: ledger ready (operator balance=%d, profile=%s)", genBal, *profile)
+
+	// Lifecycle monitor with the real durable CRDT engine (checkpoints persist).
+	mon := lifecycle.NewMonitor(crdtEngine, []byte("daemon-doc"))
 	mon.Start(ctx)
 
 	// Compose the real control plane: OCap kernel + libp2p/QUIC mesh + telemetry
@@ -117,15 +145,6 @@ func main() {
 			}
 		}()
 	}
-
-	// Durable persistence: the issuer key and revocation set survive restarts, so
-	// previously issued tokens keep working and revocations stay in force.
-	cfgDir := filepath.Dir(auth.OperatorTokenPath())
-	db, derr := store.Open(filepath.Join(cfgDir, "cerberus.db"))
-	if derr != nil {
-		log.Fatalf("open store: %v", derr)
-	}
-	defer db.Close()
 
 	// Capability auth: a persisted Ed25519 key is the daemon root of trust.
 	seed, serr := auth.LoadOrCreateSeed(filepath.Join(cfgDir, "issuer.key"))
