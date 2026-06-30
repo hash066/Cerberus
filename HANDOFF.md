@@ -45,7 +45,7 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
 | Wasmtime component-model runtime (`core/runtime` `wasmtime_exec`, optional `wasmtime` feature) | ✅ REAL, tested (Phase F1) — alongside wasmi; runs a real component (fixture→1337). WASI-P2 = documented hook. Feature-gated so the cgo gnu staticlib opts out. |
 | QUIC zero-copy data plane (`daemon/dataplane`) | ✅ REAL, tested (Phase F3) — capability+quota-bound bulk transfer (rejects over-quota up-front and mid-stream). Data-plane PeerID-pin = stub. |
 | 9P2000.L wire server (`daemon/ninep` via hugelgupf/p9) | ✅ REAL, tested (Phase F4) — serves the cap-gated namespace; per-connection capability; `ctl`→endpoint invariant held. FUSE/WinFsp mount = labelled stub. |
-| Network audio transport — mic/speaker (`daemon/audio`) | ✅ REAL, tested (Phase F5) — packetized sender/receiver, reordering jitter buffer, DLL drift control, gap-fill. OS capture (CoreAudio/WASAPI/PipeWire) = labelled stub. |
+| Network audio transport — mic/speaker (`daemon/audio`) | ✅ REAL, tested (Phase F5) — packetized sender/receiver, reordering jitter buffer, DLL drift control, gap-fill. **Now rides the data plane:** `daemon/audiolink` carries an audio session as one capability/quota-bound QUIC transfer (packets length-framed by `audio.SendTransport`/`RecvTransport`); `audio` stays a leaf (depends only on its `Transport` interface). Proven end-to-end by `audiolink` `TestAudioRidesDataPlane` (SineSource → QUIC under a grant → reconstructed). OS capture (CoreAudio/WASAPI/PipeWire) = labelled stub. |
 | GPU dispatch (wgpu/MLX) | ⛔ Phase F2 — deferred (needs real GPU hardware to validate; not faked). |
 | zk-WASM proof-of-inference, host-TEE memory shielding, RDMA-over-Thunderbolt | ⛔ FRONTIER (documented stubs by design; ~100× / hardware-limited) |
 | eUTXO advanced settlement (fraud proofs/zk) in `core/economy` (Rust) | ⚠️ model exists; daemon's live ledger is the Go `daemon/ledger` (durable) |
@@ -72,7 +72,8 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
   - **F5** ✅ Network audio transport (`daemon/audio`) — the mic/speaker path; OS capture = stub.
   - **F2 deferred:** GPU dispatch (needs real GPU hardware to validate honestly).
   - **Cross-cut wiring** ✅ (`daemon/ninep`,`daemon/system`,`cmd/cerberusd`): 9P `ctl` open → `dataplane.RegisterGrant` → returns the real endpoint (ARCHITECTURE §4.1); the 9P2000.L wire server and the QUIC data-plane receiver are both supervised in `system.Compose` and their addresses logged at startup. `ninep.Server` gained an injectable `Granter` so the namespace stays decoupled from the data plane (no import cycle); falls back to the descriptor-only placeholder when unwired. Tested by `TestOpenCtlGrantsRealDataPlaneTransfer`.
-  - **Next:** audio rides the data plane (`daemon/audio` → `dataplane`); then Phase F2 (GPU) on real hardware.
+  - **Audio over the data plane** ✅ (`daemon/audiolink`, `daemon/audio`): an audio session rides one capability/quota-bound QUIC transfer; `audio.SendTransport`/`RecvTransport` length-frame packets onto the byte stream, `audio` stays a leaf, `audiolink` is the composition seam (audio ↔ dataplane). Tested end-to-end + race-clean.
+  - **Next:** Phase F2 (GPU dispatch) on real hardware; full mTLS/PeerID-pin on the data-plane transport; 9P `ctl`/audio activation in the live daemon once an OS capture source exists.
 
 ## Repo layout (key)
 ```
