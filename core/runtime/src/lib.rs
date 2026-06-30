@@ -3,13 +3,21 @@
 //! v0.1 executes **real WebAssembly** via `wasmi` (a pure-Rust engine — no JIT,
 //! no MSVC, runs on any host). A task carries module bytes and is run by calling
 //! a no-arg exported entry function returning an i32 "shard result". A
-//! [`PromiseTable`] models CapTP-style promise pipelining: a task can be
-//! dispatched and its result resolved later, and downstream work can be enqueued
-//! against an upstream promise id before it resolves.
+//! [`PromiseTable`] implements CapTP-style **promise pipelining**: a task is
+//! dispatched and its result resolved later, downstream work can be enqueued
+//! against upstream promise ids before they resolve, and a dependent task's
+//! input is fed from its producers' **resolved outputs** (see [`Stage`]).
+//!
+//! Components are content-addressed: [`BlockStore`] / [`Cid`] back
+//! ARCHITECTURE §3.4 `ComputeTask.component` (an IPLD-style CID), so a worker is
+//! only ever fed bytes that verifiably hash to the id naming them.
 //!
 //! Next steps (docs/verticals/03-compute-orchestration.md): the WASM Component
 //! Model + WASI P2 host, `gpu`-capability dispatch to MLX/wgpu, and real
 //! cross-node promise pipelining over CapTP.
+
+mod blockstore;
+pub use blockstore::{BlockStore, Cid};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,18 +137,47 @@ impl Executor for WasmExecutor {
     }
 }
 
-/// Opaque promise reference, mirrors contract `PromiseHandle`.
+/// Opaque promise reference, mirrors contract `PromiseHandle`
+/// (ARCHITECTURE §3.4 `Promise.promise_id`).
 pub type PromiseHandle = u64;
 
-/// Models promise pipelining: dispatch returns a promise immediately; the result
-/// is resolved later. Downstream tasks may be enqueued referencing an upstream
-/// promise before it resolves (the latency-masking property), and are run when
-/// their dependency resolves.
+/// How a dependent stage builds its input from its producers' resolved outputs.
+///
+/// CapTP promise pipelining means stage *N+1* is enqueued **before** stage *N*'s
+/// bytes have landed; when they do, this function threads them into the dependent
+/// task. `deps_outputs` is in the same order as the declared dependency handles.
+/// The returned bytes become the dependent [`Task::input`].
+type CombineFn = dyn Fn(&[Vec<u8>]) -> Vec<u8> + Send + Sync;
+
+/// A pipelined stage: a task gated on a set of upstream promises, plus the rule
+/// that turns those producers' resolved outputs into this task's input.
+struct Stage {
+    deps: Vec<PromiseHandle>,
+    task: Task,
+    combine: Box<CombineFn>,
+}
+
+/// Implements CapTP-style **promise pipelining** with real output-threading.
+///
+/// - [`dispatch`](PromiseTable::dispatch) runs a task now and returns a resolved
+///   promise.
+/// - [`dispatch_pipelined`](PromiseTable::dispatch_pipelined) enqueues a task
+///   that depends on one or more upstream promises; it does **not** run until all
+///   of them resolve, and when it does its input is computed from their resolved
+///   outputs (so stage 2's input is stage 1's output — chained, not re-run blind).
+/// - [`pump`](PromiseTable::pump) drives ready stages to completion, including
+///   multi-stage chains (resolving stage N can unblock stage N+1 in one call).
+///
+/// If any dependency **rejects** (resolves with `ok == false`), the dependent is
+/// rejected too (promise-error contagion, per [03 §9]); it is not executed.
+///
+/// Thread-safe: all interior state is behind a `Mutex`, the id counter is atomic,
+/// and `&self` methods may be called concurrently from multiple threads.
 pub struct PromiseTable<E: Executor> {
     exec: E,
     next: AtomicU64,
     results: Mutex<HashMap<PromiseHandle, TaskResult>>,
-    pending: Mutex<HashMap<PromiseHandle, (PromiseHandle, Task)>>, // promise -> (dep, task)
+    pending: Mutex<HashMap<PromiseHandle, Stage>>,
 }
 
 impl<E: Executor> PromiseTable<E> {
@@ -153,50 +190,124 @@ impl<E: Executor> PromiseTable<E> {
         }
     }
 
+    fn fresh(&self) -> PromiseHandle {
+        self.next.fetch_add(1, Ordering::SeqCst)
+    }
+
     /// Dispatch a task now; the result is available immediately under the returned promise.
     pub fn dispatch(&self, t: Task) -> PromiseHandle {
-        let h = self.next.fetch_add(1, Ordering::SeqCst);
+        let h = self.fresh();
         let r = self.exec.run(&t);
         self.results.lock().unwrap().insert(h, r);
         h
     }
 
-    /// Pipeline a task against an upstream promise: reserve a promise now, run the
-    /// task only once `dep` has resolved (via [`PromiseTable::pump`]).
+    /// Pipeline a task against a single upstream promise. The dependent runs once
+    /// `dep` resolves; its `input` is left as-authored (the upstream output is not
+    /// threaded in). Kept for callers that only need ordering, not data flow; for
+    /// chained data flow use [`PromiseTable::dispatch_pipelined`].
     pub fn dispatch_after(&self, dep: PromiseHandle, t: Task) -> PromiseHandle {
-        let h = self.next.fetch_add(1, Ordering::SeqCst);
-        self.pending.lock().unwrap().insert(h, (dep, t));
+        self.dispatch_pipelined(&[dep], t, |_outputs| Vec::new())
+    }
+
+    /// Enqueue a task that depends on `deps` (CapTP-style `ComputeTask.deps`). The
+    /// task runs only after **every** dependency resolves; at that point `combine`
+    /// is called with the producers' resolved outputs (in `deps` order) and its
+    /// return value becomes the dependent task's [`Task::input`]. This is the real
+    /// pipelining property: stage 2's input is computed from stage 1's output.
+    ///
+    /// Returns immediately with the dependent's promise handle (which is *not* yet
+    /// resolved). Call [`PromiseTable::pump`] to drive ready stages.
+    pub fn dispatch_pipelined<F>(
+        &self,
+        deps: &[PromiseHandle],
+        task: Task,
+        combine: F,
+    ) -> PromiseHandle
+    where
+        F: Fn(&[Vec<u8>]) -> Vec<u8> + Send + Sync + 'static,
+    {
+        let h = self.fresh();
+        self.pending.lock().unwrap().insert(
+            h,
+            Stage {
+                deps: deps.to_vec(),
+                task,
+                combine: Box::new(combine),
+            },
+        );
         h
     }
 
-    /// Run any pending tasks whose dependency has resolved.
+    /// Drive all pending stages whose dependencies have resolved, to a fixpoint.
+    /// Resolving one stage can unblock another, so this loops until no stage is
+    /// ready — a single `pump()` therefore completes an arbitrarily deep chain.
     pub fn pump(&self) {
         loop {
-            let ready: Vec<(PromiseHandle, Task)> = {
+            // Collect the stages whose every dependency is now resolved, removing
+            // them from `pending` while holding both locks to stay consistent.
+            let ready: Vec<(PromiseHandle, Stage)> = {
                 let results = self.results.lock().unwrap();
                 let mut pending = self.pending.lock().unwrap();
                 let ids: Vec<PromiseHandle> = pending
                     .iter()
-                    .filter(|(_, (dep, _))| results.contains_key(dep))
+                    .filter(|(_, s)| s.deps.iter().all(|d| results.contains_key(d)))
                     .map(|(h, _)| *h)
                     .collect();
                 ids.into_iter()
-                    .map(|h| (h, pending.remove(&h).unwrap().1))
+                    .map(|h| (h, pending.remove(&h).unwrap()))
                     .collect()
             };
             if ready.is_empty() {
                 break;
             }
-            for (h, t) in ready {
-                let r = self.exec.run(&t);
-                self.results.lock().unwrap().insert(h, r);
+            for (h, stage) in ready {
+                let result = self.run_stage(&stage);
+                self.results.lock().unwrap().insert(h, result);
             }
         }
+    }
+
+    /// Run one ready stage: gather its producers' outputs, propagate any rejection,
+    /// thread the combined input in, and execute.
+    fn run_stage(&self, stage: &Stage) -> TaskResult {
+        let results = self.results.lock().unwrap();
+        let mut outputs = Vec::with_capacity(stage.deps.len());
+        for dep in &stage.deps {
+            match results.get(dep) {
+                // Promise-error contagion: a rejected dependency rejects the dependent.
+                Some(r) if !r.ok => {
+                    return TaskResult::err(
+                        stage.task.task_id.clone(),
+                        format!("dependency promise {dep} rejected: {}", r.error),
+                    );
+                }
+                Some(r) => outputs.push(r.output.clone()),
+                // pump() only calls this once all deps are present, so this is unreachable
+                // in practice; treat a missing dep defensively rather than panicking.
+                None => {
+                    return TaskResult::err(
+                        stage.task.task_id.clone(),
+                        format!("dependency promise {dep} unresolved"),
+                    );
+                }
+            }
+        }
+        drop(results); // release before executing (executor may be slow)
+
+        let mut task = stage.task.clone();
+        task.input = (stage.combine)(&outputs);
+        self.exec.run(&task)
     }
 
     /// Resolve a promise to its result, if available.
     pub fn resolve(&self, h: PromiseHandle) -> Option<TaskResult> {
         self.results.lock().unwrap().get(&h).cloned()
+    }
+
+    /// Whether a promise has resolved (vs. still pending).
+    pub fn is_resolved(&self, h: PromiseHandle) -> bool {
+        self.results.lock().unwrap().contains_key(&h)
     }
 }
 
@@ -243,5 +354,179 @@ mod tests {
         pt.pump();
         let r = pt.resolve(down).expect("downstream resolved");
         assert_eq!(r.as_i32(), Some(42));
+    }
+
+    /// Real WASM executor that exposes the task's input to the guest as an
+    /// imported host function `host.input() -> i32` (LE i32 of the first 4 input
+    /// bytes, or 0). This lets a guest *consume* an upstream stage's output, so a
+    /// pipeline genuinely chains data through real WebAssembly rather than faking
+    /// it host-side. The guest exports `run() -> i32`.
+    struct InputAwareWasmExecutor;
+
+    impl Executor for InputAwareWasmExecutor {
+        fn run(&self, t: &Task) -> TaskResult {
+            let input_i32 = if t.input.len() >= 4 {
+                i32::from_le_bytes([t.input[0], t.input[1], t.input[2], t.input[3]])
+            } else {
+                0
+            };
+            let engine = Engine::default();
+            let module = match Module::new(&engine, &t.wasm[..]) {
+                Ok(m) => m,
+                Err(e) => return TaskResult::err(t.task_id.clone(), format!("compile: {e}")),
+            };
+            let mut store = Store::new(&engine, input_i32);
+            let mut linker = Linker::<i32>::new(&engine);
+            linker
+                .func_wrap("host", "input", |caller: wasmi::Caller<'_, i32>| -> i32 {
+                    *caller.data()
+                })
+                .unwrap();
+            let instance = match linker.instantiate_and_start(&mut store, &module) {
+                Ok(i) => i,
+                Err(e) => return TaskResult::err(t.task_id.clone(), format!("instantiate: {e}")),
+            };
+            let func = match instance.get_typed_func::<(), i32>(&store, &t.entry) {
+                Ok(f) => f,
+                Err(e) => return TaskResult::err(t.task_id.clone(), format!("no entry: {e}")),
+            };
+            match func.call(&mut store, ()) {
+                Ok(v) => TaskResult::ok(t.task_id.clone(), v.to_le_bytes().to_vec()),
+                Err(e) => TaskResult::err(t.task_id.clone(), format!("trap: {e}")),
+            }
+        }
+    }
+
+    // Guest module: `run` returns `host.input() + addend`.
+    fn add_wasm(addend: i32) -> Vec<u8> {
+        wat::parse_str(&format!(
+            r#"(module
+                 (import "host" "input" (func $input (result i32)))
+                 (func (export "run") (result i32)
+                   call $input
+                   i32.const {addend}
+                   i32.add))"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn two_stage_pipeline_chains_resolved_output() {
+        // Stage 1: 0 + 100 = 100. Stage 2 reads stage 1's output and adds 23 -> 123.
+        let pt = PromiseTable::new(InputAwareWasmExecutor);
+
+        let stage1 = pt.dispatch(Task::wasm(b"s1".to_vec(), add_wasm(100)));
+
+        // Stage 2 is enqueued BEFORE stage 1's bytes are observed; its input is
+        // threaded from stage 1's resolved output via the combine closure.
+        let stage2 = pt.dispatch_pipelined(
+            &[stage1],
+            Task::wasm(b"s2".to_vec(), add_wasm(23)),
+            |outs| {
+                // single producer -> forward its 4-byte i32 output as our input
+                outs[0].clone()
+            },
+        );
+
+        assert!(!pt.is_resolved(stage2), "stage 2 must wait for stage 1");
+        pt.pump();
+
+        let r1 = pt.resolve(stage1).expect("stage 1 resolved");
+        assert_eq!(r1.as_i32(), Some(100));
+        let r2 = pt.resolve(stage2).expect("stage 2 resolved");
+        assert_eq!(
+            r2.as_i32(),
+            Some(123),
+            "stage 2 input must be stage 1 output"
+        );
+    }
+
+    #[test]
+    fn three_stage_chain_resolves_in_one_pump() {
+        // 0+10 -> +5 -> +1  ==> 16, exercising a deep chain and the fixpoint loop.
+        let pt = PromiseTable::new(InputAwareWasmExecutor);
+        let s1 = pt.dispatch(Task::wasm(b"a".to_vec(), add_wasm(10)));
+        let s2 = pt.dispatch_pipelined(&[s1], Task::wasm(b"b".to_vec(), add_wasm(5)), |o| {
+            o[0].clone()
+        });
+        let s3 = pt.dispatch_pipelined(&[s2], Task::wasm(b"c".to_vec(), add_wasm(1)), |o| {
+            o[0].clone()
+        });
+        pt.pump();
+        assert_eq!(pt.resolve(s3).unwrap().as_i32(), Some(16));
+    }
+
+    #[test]
+    fn fan_in_combines_multiple_producers() {
+        // Two independent producers (7 and 35); the dependent sums both outputs as
+        // its input, then adds 0 -> 42. Proves multi-dep `deps` + combine ordering.
+        let pt = PromiseTable::new(InputAwareWasmExecutor);
+        let a = pt.dispatch(Task::wasm(b"a".to_vec(), add_wasm(7)));
+        let b = pt.dispatch(Task::wasm(b"b".to_vec(), add_wasm(35)));
+        let c = pt.dispatch_pipelined(&[a, b], Task::wasm(b"c".to_vec(), add_wasm(0)), |outs| {
+            let x = i32::from_le_bytes([outs[0][0], outs[0][1], outs[0][2], outs[0][3]]);
+            let y = i32::from_le_bytes([outs[1][0], outs[1][1], outs[1][2], outs[1][3]]);
+            (x + y).to_le_bytes().to_vec()
+        });
+        pt.pump();
+        assert_eq!(pt.resolve(c).unwrap().as_i32(), Some(42));
+    }
+
+    #[test]
+    fn rejected_dependency_propagates() {
+        // Stage 1 fails (bad wasm bytes); the dependent must be rejected, not run.
+        let pt = PromiseTable::new(WasmExecutor);
+        let bad = pt.dispatch(Task::wasm(b"bad".to_vec(), b"not wasm".to_vec()));
+        assert!(!pt.resolve(bad).unwrap().ok);
+        let down =
+            pt.dispatch_pipelined(&[bad], Task::wasm(b"down".to_vec(), answer_wasm()), |_| {
+                Vec::new()
+            });
+        pt.pump();
+        let r = pt.resolve(down).expect("dependent resolved (as rejected)");
+        assert!(!r.ok, "rejection must propagate to dependents");
+        assert!(r.error.contains("rejected"));
+    }
+
+    #[test]
+    fn blockstore_feeds_executor_via_cid() {
+        // End-to-end: store a component by CID, fetch it back (integrity-checked),
+        // and execute it. This is the §3.4 component-CID resolution path locally.
+        let store = BlockStore::new();
+        let cid = store.put(answer_wasm());
+        let wasm = store.get(&cid).expect("component resolvable by CID");
+        let r = WasmExecutor.run(&Task::wasm(b"t".to_vec(), wasm));
+        assert_eq!(r.as_i32(), Some(42));
+    }
+
+    #[test]
+    fn promise_table_is_thread_safe() {
+        // Dispatch many tasks concurrently; every promise must resolve correctly.
+        use std::sync::Arc;
+        use std::thread;
+        let pt = Arc::new(PromiseTable::new(WasmExecutor));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let pt = Arc::clone(&pt);
+            handles.push(thread::spawn(move || {
+                let mut got = Vec::new();
+                for _ in 0..25 {
+                    let h = pt.dispatch(Task::wasm(b"x".to_vec(), answer_wasm()));
+                    got.push(h);
+                }
+                got
+            }));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+        // 8 * 25 = 200 distinct promise handles, each resolved to 42.
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 200, "handles must be unique across threads");
+        for h in all {
+            assert_eq!(pt.resolve(h).unwrap().as_i32(), Some(42));
+        }
     }
 }

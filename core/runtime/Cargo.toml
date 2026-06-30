@@ -9,6 +9,10 @@ description = "Vertical 03 — WASM runtime (wasmi) + promise pipelining. Lane A
 cerberus-contract = { path = "../../contract/rust" }
 cerberus-ocap = { path = "../ocap" }
 wasmi = "1.1.0"
+# SHA-256 for content-addressed CIDs (ARCHITECTURE §3.4 ComputeTask.component).
+# Already resolved at 0.10 in the workspace lockfile (transitive of ed25519-dalek),
+# so promoting it to a direct dep adds no new version.
+sha2 = "0.10"
 
 [dev-dependencies]
 wat = "1.252.0"
