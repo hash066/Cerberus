@@ -8,9 +8,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"time"
-
-	"go.opentelemetry.io/otel/trace/noop"
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/dataplane"
@@ -38,6 +37,7 @@ type System struct {
 	// DataPlaneAddr is the QUIC data-plane receiver's listen address (bulk bytes).
 	DataPlaneAddr string
 	tree          *supervisor.Tree
+	traceShutdown func(context.Context) error
 }
 
 // Compose wires every subsystem together against the frozen contract. The
@@ -58,6 +58,10 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 		return nil, fmt.Errorf("mint topic cap: %w", err)
 	}
 
+	// Real OpenTelemetry tracing, opt-in via CERBERUS_TRACE so the default daemon
+	// stays quiet but operators get exported spans when they want them.
+	tracer, traceShutdown := telemetry.NewTracerProvider(os.Getenv("CERBERUS_TRACE") != "")
+
 	var self contract.PeerID
 	pub, err := telemetry.New(telemetry.Config{
 		Fabric: fab,
@@ -66,9 +70,10 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 		PeerID: self,
 		Hz:     2,
 		Sample: func() contract.NodeTelemetry { return localTelemetry(self) },
-		Tracer: noop.NewTracerProvider().Tracer("cerberusd"),
+		Tracer: tracer,
 	})
 	if err != nil {
+		_ = traceShutdown(context.Background())
 		return nil, fmt.Errorf("telemetry: %w", err)
 	}
 
@@ -148,11 +153,22 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 		NinePAddr:     nineLn.Addr().String(),
 		DataPlaneAddr: dp.Addr(),
 		tree:          tree,
+		traceShutdown: traceShutdown,
 	}, nil
 }
 
-// Serve runs the supervision tree until ctx is cancelled.
-func (s *System) Serve(ctx context.Context) error { return s.tree.Serve(ctx) }
+// Serve runs the supervision tree until ctx is cancelled, then flushes tracing.
+func (s *System) Serve(ctx context.Context) error {
+	err := s.tree.Serve(ctx)
+	if s.traceShutdown != nil {
+		// Flush exported spans on the way down; use a fresh context since ctx is
+		// already cancelled by the time Serve returns.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = s.traceShutdown(flushCtx)
+	}
+	return err
+}
 
 // schedulerLoop keeps the scheduler service alive and is where periodic
 // re-placement/telemetry consumption is wired in.
