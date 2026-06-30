@@ -17,12 +17,21 @@
 //! one without changing dispatch code:
 //! - [`WasmExecutor`] — **wasmi**, pure-Rust, no JIT/MSVC; the portable default.
 //! - [`WasmtimeExecutor`] — **Wasmtime + Cranelift** (ARCHITECTURE §5/§6), JITs to
-//!   the host ISA and carries the real **Component Model** path ([`run_component`]).
-//!   See [`wasmtime_exec`] for the WASI-P2 extension point.
+//!   the host ISA and carries the real **Component Model** path ([`run_component`])
+//!   and the real **WASI Preview 2** path ([`run_wasi_component`], which links a
+//!   `wasmtime_wasi::WasiCtx` so a component's `wasi:*` imports are satisfied).
+//!
+//! ## GPU dispatch
+//! [`GpuDispatch`] is the seam for offloading a compute kernel + input buffers to
+//! an accelerator (ARCHITECTURE §5 "AI accel"). [`SoftwareGpu`] is a real,
+//! headless-testable CPU backend; [`WgpuDispatch`] (behind the default-OFF `gpu`
+//! feature) is a real **wgpu** backend that runs a WGSL kernel on a physical GPU
+//! when one is present.
 //!
 //! Next steps (docs/verticals/03-compute-orchestration.md): wire the Wasmtime
-//! Component Model to the frozen `agent` WIT world + WASI P2 host, `gpu`-capability
-//! dispatch to MLX/wgpu, and real cross-node promise pipelining over CapTP.
+//! Component Model + WASI P2 host to the frozen `agent` WIT world, bind
+//! [`GpuDispatch`] to the WIT `gpu` capability, and real cross-node promise
+//! pipelining over CapTP.
 
 mod blockstore;
 pub use blockstore::{BlockStore, Cid};
@@ -30,7 +39,12 @@ pub use blockstore::{BlockStore, Cid};
 #[cfg(feature = "wasmtime")]
 pub mod wasmtime_exec;
 #[cfg(feature = "wasmtime")]
-pub use wasmtime_exec::{run_component, HostImport, WasmtimeExecutor};
+pub use wasmtime_exec::{run_component, run_wasi_component, HostImport, WasmtimeExecutor};
+
+pub mod gpu;
+#[cfg(feature = "gpu")]
+pub use gpu::WgpuDispatch;
+pub use gpu::{GpuDispatch, GpuError, KernelSource, SoftwareGpu};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -412,7 +426,7 @@ mod tests {
 
     // Guest module: `run` returns `host.input() + addend`.
     fn add_wasm(addend: i32) -> Vec<u8> {
-        wat::parse_str(&format!(
+        wat::parse_str(format!(
             r#"(module
                  (import "host" "input" (func $input (result i32)))
                  (func (export "run") (result i32)

@@ -1,0 +1,46 @@
+# Standalone WASI-Preview-2 component fixture for cerberus-runtime's WASI-P2 test.
+#
+# Built with `cargo-component` for the `wasm32-wasip2` target; the resulting
+# component is committed next to this manifest as `fixture.wasm` so the host test
+# is hermetic (no toolchain/network needed at `cargo test` time). To regenerate:
+#
+#   cd core/runtime/tests/fixtures/wasi-p2-fixture
+#   cargo component build --release
+#   cp target/wasm32-wasip2/release/wasi_p2_fixture.wasm ../fixture.wasm
+#
+# It carries its own empty `[workspace]` so it is NOT pulled into the repo's host
+# Cargo workspace (mirrors components/examples/*, which build with their own
+# toolchain). `cargo build --workspace` / `cargo test -p cerberus-runtime` never
+# compile this crate.
+[package]
+name = "wasi-p2-fixture"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "cerberus:wasi-fixture"
+
+[package.metadata.component.target]
+path = "wit/world.wit"
+world = "fixture"
+
+# This cargo-component (0.21) does not auto-scan `wit/deps/`; the WASI Preview 2
+# packages our world imports (and their transitive deps) are mapped explicitly.
+# The .wit trees under wit/deps/* are the canonical WASI 0.2.0 definitions.
+[package.metadata.component.target.dependencies]
+"wasi:random" = { path = "wit/deps/random" }
+"wasi:cli" = { path = "wit/deps/cli" }
+"wasi:io" = { path = "wit/deps/io" }
+"wasi:clocks" = { path = "wit/deps/clocks" }
+"wasi:filesystem" = { path = "wit/deps/filesystem" }
+"wasi:sockets" = { path = "wit/deps/sockets" }

@@ -22,16 +22,45 @@ wasmtime = { version = "37", optional = true, default-features = false, features
     "component-model",
     "std",
 ] }
+# WASI Preview 2 host: provides the `WasiCtx` + linker wiring that satisfies a
+# component's `wasi:*` imports (clocks/random/io/cli/...). Pinned to the same
+# major as wasmtime. Gated under the same `wasmtime` feature so cabi's
+# default-features = false staticlib never pulls it (keeps the cgo gnu build lean).
+wasmtime-wasi = { version = "37", optional = true, default-features = false }
 # SHA-256 for content-addressed CIDs (ARCHITECTURE §3.4 ComputeTask.component).
 # Already resolved at 0.10 in the workspace lockfile (transitive of ed25519-dalek),
 # so promoting it to a direct dep adds no new version.
 sha2 = "0.10"
+# Real GPU dispatch backend (ARCHITECTURE §5 "AI accel via wgpu+tinygrad").
+# Behind the OPTIONAL, default-OFF `gpu` feature: it compiles a real compute
+# pipeline but may find no adapter on headless/GPU-less hosts (clearly labelled
+# at the call site). OFF by default so cabi/default builds never pull wgpu.
+# default-features = false drops the WASM/WebGPU path; we enable the native
+# backends explicitly so a real adapter is found on Vulkan/DX12/Metal/GLES hosts.
+# `wgsl` is required to compile our WGSL kernels. Without a backend feature, wgpu
+# panics at Instance::new ("no backend enabled") rather than reporting NoAdapter,
+# so these are not optional for a working native build.
+wgpu = { version = "27", optional = true, default-features = false, features = [
+    "std",
+    "wgsl",
+    "vulkan",
+    "dx12",
+    "metal",
+    "gles",
+] }
+# wgpu's async surface (request_adapter/map_async) is driven with a tiny blocking
+# executor; pollster is the minimal, dependency-light choice.
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 [features]
 # wasmtime on by default (normal builds/tests get the Component Model path);
 # disable with default-features = false to drop the heavy/gnu-unfriendly dep.
+# `gpu` is OFF by default: the software GpuDispatch backend is always built and
+# tested; the real wgpu backend is opt-in (needs a GPU/driver to actually run).
 default = ["wasmtime"]
-wasmtime = ["dep:wasmtime"]
+wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dev-dependencies]
 wat = "1.252.0"

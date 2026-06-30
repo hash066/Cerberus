@@ -1,0 +1,5 @@
+# Build artifacts of the WASI-P2 fixture crate. The *built* component is committed
+# one level up as ../wasi_p2_fixture.wasm; this crate is only compiled by hand
+# (cargo-component) to regenerate it, never by the host workspace build.
+/target
+Cargo.lock

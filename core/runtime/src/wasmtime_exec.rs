@@ -23,17 +23,22 @@
 //!   The unit tests build the component from hand-written component-model text, so
 //!   this exercises the genuine component path with no external toolchain.
 //!
-//! ## Labeled extension point — WASI P2 (NOT yet wired)
-//! [`run_component`] instantiates components that import **nothing** (or only
-//! host funcs we define). A component compiled against `wasi:cli`/`wasi:io`
-//! (WASI Preview 2) additionally needs a `wasmtime_wasi::WasiCtx` in the store and
-//! `wasmtime_wasi::add_to_linker_sync(&mut linker)` to satisfy those imports. That
-//! requires the `wasmtime-wasi` crate and a WASI-P2 component fixture, which is
-//! produced by the `cargo-component` toolchain (see `components/examples/`, the
-//! frozen `agent` world) — building one would mean emitting an artifact into
-//! `components/`, out of this lane. The hook is [`wasi_p2_extension_point`], which
-//! documents the exact wiring and is deliberately inert. This is a documented
-//! stub, not a faked capability (CLAUDE.md "maturity honesty").
+//! ## WASI Preview 2 — now a real, tested call ([`run_wasi_component`])
+//! A component compiled against `wasi:cli`/`wasi:random`/`wasi:io` (WASI Preview
+//! 2) imports the WASI-P2 world and **cannot** be instantiated by the import-free
+//! [`run_component`] path: it needs a `wasmtime_wasi::WasiCtx` in the store and
+//! `wasmtime_wasi::p2::add_to_linker_sync(&mut linker)` to satisfy those imports.
+//! [`run_wasi_component`] does exactly that. It is exercised by
+//! `tests/wasi_p2.rs` against a committed WASI-P2 component fixture
+//! (`tests/fixtures/wasi_p2_fixture.wasm`, built with `cargo-component` for the
+//! `wasm32-wasip2` target): the guest draws `wasi:random` bytes, writes a line to
+//! `wasi:cli/stdout`, and returns `1337`, which the host asserts. This turns the
+//! previously-documented WASI-P2 hook into a genuine call.
+//!
+//! [`wasi_p2_extension_point`] remains as the doc-only worked example of the exact
+//! wiring (kept for reference; the live implementation is [`run_wasi_component`]).
+//! The WASI path is gated behind the `wasmtime` feature (it pulls `wasmtime-wasi`),
+//! so the cabi `default-features = false` staticlib never compiles it.
 
 use wasmtime::{Engine, Linker, Module, Store};
 
@@ -161,7 +166,82 @@ pub fn run_component(bytes: &[u8], name: &str) -> Result<u32, String> {
     Ok(result)
 }
 
-/// **Labeled extension point — WASI Preview 2 (intentionally not implemented).**
+/// Host state for the WASI Preview 2 store: the WASI context plus the resource
+/// table the WASI host implementations use to track open streams/handles.
+///
+/// `cfg`-gated on the `wasmtime` feature (which now enables `wasmtime-wasi`).
+struct WasiHost {
+    ctx: wasmtime_wasi::WasiCtx,
+    table: wasmtime::component::ResourceTable,
+}
+
+impl wasmtime_wasi::WasiView for WasiHost {
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
+    }
+}
+
+/// Run a **WASI Preview 2 component** through Wasmtime and call a no-arg
+/// `name -> u32` typed export, returning its value.
+///
+/// Unlike [`run_component`] (which only links the host funcs we define and so can
+/// only run components that import nothing/`host.*`), this puts a real
+/// `wasmtime_wasi::WasiCtx` in the store and calls
+/// `wasmtime_wasi::p2::add_to_linker_sync` so the component's `wasi:*` imports
+/// (random, clocks, io, cli/stdout, …) are satisfied by the host. That is the
+/// production WASI-P2 wiring ARCHITECTURE §5/§6 calls for, made real.
+///
+/// `bytes` must be a *component* (not a core module). Guest stdout/stderr are
+/// inherited so a fixture writing to `wasi:cli/stdout` is visible under
+/// `cargo test -- --nocapture`. Any failure (not a component / missing export /
+/// unsatisfied import / trap) is returned as `Err(String)` — never a panic.
+pub fn run_wasi_component(bytes: &[u8], name: &str) -> Result<u32, String> {
+    use wasmtime::component::{Component, Linker};
+    use wasmtime_wasi::{WasiCtxBuilder, WasiView};
+
+    let engine = Engine::default();
+    let component =
+        Component::new(&engine, bytes).map_err(|e| format!("component compile: {e}"))?;
+
+    // Link the full WASI-P2 host surface into the component linker. This is the
+    // step the import-free `run_component` path deliberately omits.
+    let mut linker = Linker::<WasiHost>::new(&engine);
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+        .map_err(|e| format!("add wasi to linker: {e}"))?;
+
+    let host = WasiHost {
+        ctx: WasiCtxBuilder::new()
+            .inherit_stdout()
+            .inherit_stderr()
+            .build(),
+        table: wasmtime::component::ResourceTable::new(),
+    };
+    let mut store = Store::new(&engine, host);
+
+    let instance = linker
+        .instantiate(&mut store, &component)
+        .map_err(|e| format!("wasi component instantiate: {e}"))?;
+    let func = instance
+        .get_typed_func::<(), (u32,)>(&mut store, name)
+        .map_err(|e| format!("no component export {name:?}: {e}"))?;
+    let (result,) = func
+        .call(&mut store, ())
+        .map_err(|e| format!("component trap: {e}"))?;
+    func.post_return(&mut store)
+        .map_err(|e| format!("post_return: {e}"))?;
+    // touch WasiView so the import stays used even if the trait method is only
+    // reached through the linker (keeps `-D warnings` happy without an allow).
+    let _ = store.data_mut().ctx();
+    Ok(result)
+}
+
+/// **Doc-only worked example — WASI Preview 2 wiring.**
+///
+/// The live, tested implementation is [`run_wasi_component`]; this remains as a
+/// compact reference for the exact production wiring.
 ///
 /// A component compiled against `wasi:cli`/`wasi:io` imports the WASI-P2 world.
 /// To run it, the production wiring is:
@@ -170,29 +250,33 @@ pub fn run_component(bytes: &[u8], name: &str) -> Result<u32, String> {
 /// // Cargo.toml: wasmtime-wasi = "37"   (matches the pinned wasmtime)
 /// use wasmtime::{Engine, Store};
 /// use wasmtime::component::{Component, Linker};
-/// use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView, ResourceTable};
+/// use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+/// use wasmtime::component::ResourceTable;
 ///
-/// struct Host { table: ResourceTable, wasi: WasiCtx }
-/// impl WasiView for Host { /* table() + ctx() */ }
+/// struct Host { ctx: WasiCtx, table: ResourceTable }
+/// impl WasiView for Host {
+///     fn ctx(&mut self) -> WasiCtxView<'_> {
+///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
+///     }
+/// }
 ///
 /// let engine = Engine::default();
 /// let mut linker = Linker::<Host>::new(&engine);
-/// wasmtime_wasi::add_to_linker_sync(&mut linker)?;          // satisfies wasi:* imports
+/// wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;       // satisfies wasi:* imports
 /// let host = Host { table: ResourceTable::new(),
-///                   wasi: WasiCtxBuilder::new().inherit_stdio().build() };
+///                   ctx: WasiCtxBuilder::new().inherit_stdio().build() };
 /// let mut store = Store::new(&engine, host);
 /// let component = Component::new(&engine, wasi_p2_component_bytes)?;
 /// let instance = linker.instantiate(&mut store, &component)?;
 /// // …call the world's `run` export…
 /// ```
 ///
-/// It is inert here because a WASI-P2 component fixture must be produced by
-/// `cargo-component` against the frozen `agent` world and emitted into
-/// `components/` — outside this lane. Implemented for real elsewhere; declared,
-/// not faked, here (CLAUDE.md "maturity honesty").
+/// This is the same wiring [`run_wasi_component`] performs for real; it is kept
+/// as a one-glance reference. Not faked — the live path is exercised by
+/// `tests/wasi_p2.rs` (CLAUDE.md "maturity honesty").
 #[doc(hidden)]
 pub fn wasi_p2_extension_point() {
-    // Intentionally empty: see the doc comment for the exact wiring.
+    // Intentionally empty: see [`run_wasi_component`] for the live implementation.
 }
 
 #[cfg(test)]
@@ -206,7 +290,7 @@ mod tests {
 
     // A core module whose `run` returns `host.input() + addend`.
     fn add_wasm(addend: i32) -> Vec<u8> {
-        wat::parse_str(&format!(
+        wat::parse_str(format!(
             r#"(module
                  (import "host" "input" (func $input (result i32)))
                  (func (export "run") (result i32)
