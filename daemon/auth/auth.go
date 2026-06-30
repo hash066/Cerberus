@@ -212,7 +212,7 @@ func BearerToken(header string) string {
 	return ""
 }
 
-func encode(b []byte) string      { return base64.RawURLEncoding.EncodeToString(b) }
+func encode(b []byte) string          { return base64.RawURLEncoding.EncodeToString(b) }
 func decode(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
 
 var _ Authorizer = (*Issuer)(nil)
