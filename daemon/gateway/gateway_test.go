@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,13 +27,29 @@ func (m *mockExecutor) Resolve(ctx context.Context, p contract.PromiseHandle) (c
 
 const body = `{"model": "gpt", "messages": [{"role": "user", "content": "hi"}]}`
 
-func newReq(token string) *http.Request {
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+func newReqBody(token, b string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(b))
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	return req
+}
+
+func newReq(token string) *http.Request { return newReqBody(token, body) }
+
+// execToken mints a fresh issuer + an exec-capable token for the happy path.
+func execToken(t *testing.T) (*auth.Issuer, string) {
+	t.Helper()
+	iss, err := auth.NewIssuer()
+	if err != nil {
+		t.Fatalf("new issuer: %v", err)
+	}
+	tok, err := iss.Mint("alice", []string{"exec"}, "", time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	return iss, tok
 }
 
 func TestGatewayRejectsUnauthenticated(t *testing.T) {
@@ -58,10 +75,23 @@ func TestGatewayRejectsInsufficientRight(t *testing.T) {
 	}
 }
 
-func TestGatewayAcceptsValidToken(t *testing.T) {
+func TestGatewayRejectsBadSignature(t *testing.T) {
+	// A token minted by a different issuer must not verify.
 	iss, _ := auth.NewIssuer()
 	gw := gateway.NewGateway(&mockExecutor{}, iss)
-	tok, _ := iss.Mint("alice", []string{"exec"}, "", time.Hour)
+	other, _ := auth.NewIssuer()
+	forged, _ := other.Mint("mallory", []string{"exec"}, "", time.Hour)
+
+	w := httptest.NewRecorder()
+	gw.HandleChatCompletions(w, newReq(forged))
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for foreign-signed token, got %d", w.Result().StatusCode)
+	}
+}
+
+func TestGatewayAcceptsValidToken(t *testing.T) {
+	iss, tok := execToken(t)
+	gw := gateway.NewGateway(&mockExecutor{}, iss)
 
 	w := httptest.NewRecorder()
 	gw.HandleChatCompletions(w, newReq(tok))
@@ -75,5 +105,71 @@ func TestGatewayAcceptsValidToken(t *testing.T) {
 	}
 	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content != "AI response" {
 		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
+func TestGatewayRejectsWrongMethod(t *testing.T) {
+	iss, _ := auth.NewIssuer()
+	gw := gateway.NewGateway(&mockExecutor{}, iss)
+	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+
+	w := httptest.NewRecorder()
+	gw.HandleChatCompletions(w, req)
+	if w.Result().StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET, got %d", w.Result().StatusCode)
+	}
+}
+
+func TestGatewayInputValidation(t *testing.T) {
+	iss, tok := execToken(t)
+	gw := gateway.NewGateway(&mockExecutor{}, iss)
+
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"missing model", `{"messages":[{"role":"user","content":"hi"}]}`, http.StatusBadRequest},
+		{"empty messages", `{"model":"gpt","messages":[]}`, http.StatusBadRequest},
+		{"missing content", `{"model":"gpt","messages":[{"role":"user"}]}`, http.StatusBadRequest},
+		{"missing role", `{"model":"gpt","messages":[{"content":"hi"}]}`, http.StatusBadRequest},
+		{"malformed json", `{"model":`, http.StatusBadRequest},
+		{"unknown field", `{"model":"gpt","messages":[{"role":"user","content":"hi"}],"x":1}`, http.StatusBadRequest},
+		{"trailing data", `{"model":"gpt","messages":[{"role":"user","content":"hi"}]}{}`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			gw.HandleChatCompletions(w, newReqBody(tok, tc.body))
+			if w.Result().StatusCode != tc.want {
+				t.Fatalf("body %q: expected %d, got %d", tc.body, tc.want, w.Result().StatusCode)
+			}
+		})
+	}
+}
+
+func TestGatewayRejectsOversizedBody(t *testing.T) {
+	iss, tok := execToken(t)
+	gw := gateway.NewGateway(&mockExecutor{}, iss)
+
+	// > 1 MiB body should be rejected by MaxBytesReader before dispatch.
+	huge := `{"model":"gpt","messages":[{"role":"user","content":"` +
+		strings.Repeat("A", 2<<20) + `"}]}`
+	w := httptest.NewRecorder()
+	gw.HandleChatCompletions(w, newReqBody(tok, huge))
+	if w.Result().StatusCode == http.StatusOK {
+		t.Fatalf("expected oversized body to be rejected, got 200")
+	}
+}
+
+func TestGatewayValidationRunsAfterAuth(t *testing.T) {
+	// An invalid body with NO token must still 401 (auth before parsing), so we
+	// never spend parsing effort on unauthenticated input.
+	iss, _ := auth.NewIssuer()
+	gw := gateway.NewGateway(&mockExecutor{}, iss)
+	w := httptest.NewRecorder()
+	gw.HandleChatCompletions(w, newReqBody("", `{garbage`))
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 (auth first), got %d", w.Result().StatusCode)
 	}
 }
