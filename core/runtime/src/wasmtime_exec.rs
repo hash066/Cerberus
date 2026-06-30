@@ -1,0 +1,310 @@
+//! Wasmtime + Cranelift execution path (Phase F1).
+//!
+//! ARCHITECTURE §5/§6 and [03-compute-orchestration §6] name **Wasmtime +
+//! Cranelift, Component Model, WASI P2** as the production runtime: it JITs to the
+//! host ISA, sandboxes the guest, and lets typed values (records, lists, strings)
+//! cross node boundaries through WIT interfaces. This module adds that engine
+//! **alongside** the existing pure-Rust `wasmi` path in [`crate`] — it does not
+//! replace it. A caller chooses a backend by picking an [`Executor`] impl:
+//! [`crate::WasmExecutor`] (wasmi) or [`WasmtimeExecutor`] (this).
+//!
+//! ## What is real here (tested)
+//! - [`WasmtimeExecutor`] runs a **core WASM module**: compiles with Cranelift,
+//!   instantiates, calls a no-arg `entry -> i32` export, and returns the result
+//!   little-endian — exactly the shard-result convention the wasmi path uses, so
+//!   the two are drop-in interchangeable behind [`Executor`].
+//! - **Host-provided imports**: in [`HostImport::Input`] mode the guest may import
+//!   `host.input() -> i32` (the task input's first 4 bytes as an LE i32), the same
+//!   import the wasmi `InputAwareWasmExecutor` test uses. This proves real
+//!   host↔guest calls over Wasmtime, which is what the `gpu`/`topic`/`memory`
+//!   capabilities will ride on once wired to the WIT world.
+//! - **Component Model**: [`run_component`] instantiates a real WASM **component**
+//!   (not a core module) via Wasmtime's component API and calls a typed export.
+//!   The unit tests build the component from hand-written component-model text, so
+//!   this exercises the genuine component path with no external toolchain.
+//!
+//! ## Labeled extension point — WASI P2 (NOT yet wired)
+//! [`run_component`] instantiates components that import **nothing** (or only
+//! host funcs we define). A component compiled against `wasi:cli`/`wasi:io`
+//! (WASI Preview 2) additionally needs a `wasmtime_wasi::WasiCtx` in the store and
+//! `wasmtime_wasi::add_to_linker_sync(&mut linker)` to satisfy those imports. That
+//! requires the `wasmtime-wasi` crate and a WASI-P2 component fixture, which is
+//! produced by the `cargo-component` toolchain (see `components/examples/`, the
+//! frozen `agent` world) — building one would mean emitting an artifact into
+//! `components/`, out of this lane. The hook is [`wasi_p2_extension_point`], which
+//! documents the exact wiring and is deliberately inert. This is a documented
+//! stub, not a faked capability (CLAUDE.md "maturity honesty").
+
+use wasmtime::{Engine, Linker, Module, Store};
+
+use crate::{Executor, Task, TaskResult};
+
+/// Which host imports the Wasmtime executor exposes to the guest core module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HostImport {
+    /// No imports: the module must be self-contained (calls only its own funcs).
+    #[default]
+    None,
+    /// Expose `host.input() -> i32`: the task input's first 4 bytes as an LE i32
+    /// (0 if shorter). Lets a guest *consume* an upstream stage's resolved output,
+    /// so a Wasmtime worker can sit in the same promise pipeline as a wasmi one.
+    Input,
+}
+
+/// Real WebAssembly executor backed by **Wasmtime + Cranelift**.
+///
+/// Shaped to mirror [`crate::WasmExecutor`] so the two are interchangeable behind
+/// [`Executor`]: same `Task` in, same `TaskResult` out, same "no-arg `entry`
+/// returning i32, encoded little-endian" convention. The only knob is which host
+/// imports the guest may use ([`HostImport`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WasmtimeExecutor {
+    imports: HostImport,
+}
+
+impl WasmtimeExecutor {
+    /// Executor for self-contained modules (no host imports).
+    pub fn new() -> Self {
+        Self {
+            imports: HostImport::None,
+        }
+    }
+
+    /// Executor that also provides `host.input() -> i32` to the guest.
+    pub fn with_input_import() -> Self {
+        Self {
+            imports: HostImport::Input,
+        }
+    }
+
+    /// Compile + instantiate + call the entry, returning the i32 shard result.
+    ///
+    /// Store data is the LE-i32 view of `t.input`, which the `host.input` import
+    /// reads. Errors (compile/instantiate/missing-entry/trap) are returned as
+    /// `Err(String)` so a bad task is a rejected promise, never a panic — matching
+    /// the wasmi path's failure semantics.
+    fn execute(&self, t: &Task) -> Result<i32, String> {
+        let input_i32 = le_i32_prefix(&t.input);
+
+        let engine = Engine::default();
+        let module = Module::new(&engine, &t.wasm[..]).map_err(|e| format!("compile: {e}"))?;
+        let mut store = Store::new(&engine, input_i32);
+        let mut linker = Linker::<i32>::new(&engine);
+
+        if self.imports == HostImport::Input {
+            linker
+                .func_wrap("host", "input", |caller: wasmtime::Caller<'_, i32>| {
+                    *caller.data()
+                })
+                .map_err(|e| format!("link host.input: {e}"))?;
+        }
+
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|e| format!("instantiate: {e}"))?;
+        let func = instance
+            .get_typed_func::<(), i32>(&mut store, &t.entry)
+            .map_err(|e| format!("no entry {:?}: {e}", t.entry))?;
+        func.call(&mut store, ()).map_err(|e| format!("trap: {e}"))
+    }
+}
+
+impl Executor for WasmtimeExecutor {
+    fn run(&self, t: &Task) -> TaskResult {
+        match self.execute(t) {
+            Ok(v) => TaskResult::ok(t.task_id.clone(), v.to_le_bytes().to_vec()),
+            Err(e) => TaskResult::err(t.task_id.clone(), e),
+        }
+    }
+}
+
+/// First 4 bytes of `input` as a little-endian i32, or 0 if shorter. The shard
+/// I/O convention shared with the wasmi path ([`TaskResult::as_i32`]).
+fn le_i32_prefix(input: &[u8]) -> i32 {
+    if input.len() >= 4 {
+        i32::from_le_bytes([input[0], input[1], input[2], input[3]])
+    } else {
+        0
+    }
+}
+
+/// Run a WASM **component** (Component Model) through Wasmtime and call a no-arg
+/// `name -> u32` typed export, returning its value.
+///
+/// This is the real component path ARCHITECTURE §6 calls for: `bytes` must be a
+/// *component* (not a core module), instantiated via [`wasmtime::component`]. The
+/// component here imports nothing; the WASI-P2 import set is the labeled extension
+/// point documented in [`wasi_p2_extension_point`].
+///
+/// Returns `Err(String)` on any failure (not a component / missing export / wrong
+/// signature / trap) so callers get a clean rejection instead of a panic.
+pub fn run_component(bytes: &[u8], name: &str) -> Result<u32, String> {
+    use wasmtime::component::{Component, Linker};
+
+    let engine = Engine::default();
+    let component =
+        Component::new(&engine, bytes).map_err(|e| format!("component compile: {e}"))?;
+    let linker = Linker::<()>::new(&engine);
+    let mut store = Store::new(&engine, ());
+    let instance = linker
+        .instantiate(&mut store, &component)
+        .map_err(|e| format!("component instantiate: {e}"))?;
+    let func = instance
+        .get_typed_func::<(), (u32,)>(&mut store, name)
+        .map_err(|e| format!("no component export {name:?}: {e}"))?;
+    let (result,) = func
+        .call(&mut store, ())
+        .map_err(|e| format!("component trap: {e}"))?;
+    // Component calls must run post-return before the next call / store reuse.
+    func.post_return(&mut store)
+        .map_err(|e| format!("post_return: {e}"))?;
+    Ok(result)
+}
+
+/// **Labeled extension point — WASI Preview 2 (intentionally not implemented).**
+///
+/// A component compiled against `wasi:cli`/`wasi:io` imports the WASI-P2 world.
+/// To run it, the production wiring is:
+///
+/// ```ignore
+/// // Cargo.toml: wasmtime-wasi = "37"   (matches the pinned wasmtime)
+/// use wasmtime::{Engine, Store};
+/// use wasmtime::component::{Component, Linker};
+/// use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView, ResourceTable};
+///
+/// struct Host { table: ResourceTable, wasi: WasiCtx }
+/// impl WasiView for Host { /* table() + ctx() */ }
+///
+/// let engine = Engine::default();
+/// let mut linker = Linker::<Host>::new(&engine);
+/// wasmtime_wasi::add_to_linker_sync(&mut linker)?;          // satisfies wasi:* imports
+/// let host = Host { table: ResourceTable::new(),
+///                   wasi: WasiCtxBuilder::new().inherit_stdio().build() };
+/// let mut store = Store::new(&engine, host);
+/// let component = Component::new(&engine, wasi_p2_component_bytes)?;
+/// let instance = linker.instantiate(&mut store, &component)?;
+/// // …call the world's `run` export…
+/// ```
+///
+/// It is inert here because a WASI-P2 component fixture must be produced by
+/// `cargo-component` against the frozen `agent` world and emitted into
+/// `components/` — outside this lane. Implemented for real elsewhere; declared,
+/// not faked, here (CLAUDE.md "maturity honesty").
+#[doc(hidden)]
+pub fn wasi_p2_extension_point() {
+    // Intentionally empty: see the doc comment for the exact wiring.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A core module exporting `run` -> i32 returning 42.
+    fn answer_wasm() -> Vec<u8> {
+        wat::parse_str(r#"(module (func (export "run") (result i32) i32.const 42))"#).unwrap()
+    }
+
+    // A core module whose `run` returns `host.input() + addend`.
+    fn add_wasm(addend: i32) -> Vec<u8> {
+        wat::parse_str(&format!(
+            r#"(module
+                 (import "host" "input" (func $input (result i32)))
+                 (func (export "run") (result i32)
+                   call $input
+                   i32.const {addend}
+                   i32.add))"#
+        ))
+        .unwrap()
+    }
+
+    // A WASM *component* (not a core module) exporting `answer: func() -> u32`.
+    // Hand-written component-model text: a core module supplies the function, and
+    // the component canon-lifts it to the component-level export. `wat` parses the
+    // `(component …)` form into a real component binary — no external toolchain.
+    fn answer_component() -> Vec<u8> {
+        wat::parse_str(
+            r#"(component
+                 (core module $m
+                   (func (export "answer") (result i32) i32.const 1337))
+                 (core instance $i (instantiate $m))
+                 (func $a (result u32) (canon lift (core func $i "answer")))
+                 (export "answer" (func $a)))"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wasmtime_executes_core_module() {
+        let r = WasmtimeExecutor::new().run(&Task::wasm(vec![1], answer_wasm()));
+        assert!(r.ok, "error: {}", r.error);
+        assert_eq!(r.as_i32(), Some(42));
+    }
+
+    #[test]
+    fn wasmtime_missing_entry_is_error_not_panic() {
+        let mut t = Task::wasm(vec![2], answer_wasm());
+        t.entry = "nope".into();
+        let r = WasmtimeExecutor::new().run(&t);
+        assert!(!r.ok, "missing entry must reject, not panic");
+    }
+
+    #[test]
+    fn wasmtime_rejects_bad_bytes() {
+        let r = WasmtimeExecutor::new().run(&Task::wasm(vec![3], b"not wasm".to_vec()));
+        assert!(!r.ok);
+        assert!(r.error.contains("compile"), "got: {}", r.error);
+    }
+
+    #[test]
+    fn wasmtime_host_import_threads_input() {
+        // host.input() == 100, guest adds 23 -> 123. Proves a real host-provided
+        // import over Wasmtime, and that a Wasmtime worker consumes upstream output
+        // exactly like the wasmi InputAwareWasmExecutor.
+        let mut t = Task::wasm(b"add".to_vec(), add_wasm(23));
+        t.input = 100i32.to_le_bytes().to_vec();
+        let r = WasmtimeExecutor::with_input_import().run(&t);
+        assert!(r.ok, "error: {}", r.error);
+        assert_eq!(r.as_i32(), Some(123));
+    }
+
+    #[test]
+    fn wasmtime_host_import_absent_input_defaults_zero() {
+        // No input bytes -> host.input() == 0, guest adds 7 -> 7.
+        let r = WasmtimeExecutor::with_input_import().run(&Task::wasm(b"z".to_vec(), add_wasm(7)));
+        assert!(r.ok, "error: {}", r.error);
+        assert_eq!(r.as_i32(), Some(7));
+    }
+
+    #[test]
+    fn wasmtime_executor_is_drop_in_for_promise_table() {
+        // The whole point: a Wasmtime executor plugs into the existing PromiseTable
+        // unchanged, so the Component-Model engine sits in the same CapTP pipeline.
+        use crate::PromiseTable;
+        let pt = PromiseTable::new(WasmtimeExecutor::new());
+        let h = pt.dispatch(Task::wasm(b"p".to_vec(), answer_wasm()));
+        assert_eq!(pt.resolve(h).unwrap().as_i32(), Some(42));
+    }
+
+    #[test]
+    fn wasmtime_runs_real_component() {
+        // Real Component-Model path: instantiate a component (not a core module)
+        // and call its component-level export.
+        let comp = answer_component();
+        let v = run_component(&comp, "answer").expect("component runs");
+        assert_eq!(v, 1337);
+    }
+
+    #[test]
+    fn run_component_rejects_core_module() {
+        // A core module is NOT a component; the component loader must reject it
+        // cleanly rather than mis-running it.
+        let core = answer_wasm();
+        assert!(run_component(&core, "answer").is_err());
+    }
+
+    #[test]
+    fn run_component_missing_export_is_error() {
+        let comp = answer_component();
+        assert!(run_component(&comp, "nope").is_err());
+    }
+}
