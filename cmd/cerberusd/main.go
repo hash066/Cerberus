@@ -22,6 +22,7 @@ import (
 	"github.com/hash066/cerberus/daemon/gateway"
 	"github.com/hash066/cerberus/daemon/ledger"
 	"github.com/hash066/cerberus/daemon/lifecycle"
+	"github.com/hash066/cerberus/daemon/metrics"
 	"github.com/hash066/cerberus/daemon/state"
 	"github.com/hash066/cerberus/daemon/store"
 	"github.com/hash066/cerberus/daemon/system"
@@ -262,6 +263,36 @@ func main() {
 			log.Printf("API error: %v", err)
 		}
 	}()
+
+	// Observability: Prometheus /metrics (token-gated) + /healthz + /readyz.
+	met := metrics.NewMetrics()
+	go func() {
+		ms := metrics.New(met.Registry, issuer, func() (bool, string) {
+			if fabric == nil {
+				return false, "mesh down"
+			}
+			return true, ""
+		})
+		log.Println("Starting metrics on 127.0.0.1:7779 (/metrics token-gated; /healthz /readyz open)")
+		if err := ms.Start("127.0.0.1:7779"); err != nil {
+			log.Printf("metrics error: %v", err)
+		}
+	}()
+	// Keep the peer gauge live from the real fabric.
+	if fabric != nil {
+		go func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					met.Peers.Set(float64(len(fabric.Peers())))
+				}
+			}
+		}()
+	}
 
 	// Start RPC server (token-gated)
 	rpcService := &DaemonRPC{lifecycle: mon, authz: issuer}
