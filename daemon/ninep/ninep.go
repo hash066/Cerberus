@@ -55,6 +55,29 @@ func (s *Server) Register(dir string, ref contract.ResourceRef) {
 	s.devices[strings.TrimRight(dir, "/")] = ref
 }
 
+// IsAncestorDir reports whether path is a structural ancestor directory of some
+// registered device (e.g. "/cer" or "/cer/dev/vram" when a device lives at
+// "/cer/dev/vram/AA/0"). Such ancestors carry no resource of their own, so they
+// are walkable without a capability check — but the capability check still
+// fires at the registered-device boundary (Walk/Open below). This lets a 9P
+// client traverse intermediate path components down to a device it is entitled
+// to, without exposing any resource. It is read-only and does not grant access
+// to bytes or endpoints.
+func (s *Server) IsAncestorDir(path string) bool {
+	path = strings.TrimRight(path, "/")
+	if path == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for dir := range s.devices {
+		if strings.HasPrefix(dir, path+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // deviceFor returns the registered device whose dir is a prefix of path (longest match).
 func (s *Server) deviceFor(path string) (string, contract.ResourceRef, bool) {
 	best := ""

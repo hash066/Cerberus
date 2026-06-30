@@ -3,6 +3,7 @@ module github.com/hash066/cerberus
 go 1.25.7
 
 require (
+	github.com/hugelgupf/p9 v0.4.1
 	github.com/ipfs/go-cid v0.6.1
 	github.com/ipld/go-ipld-prime v0.24.0
 	github.com/klauspost/reedsolomon v1.14.1
@@ -96,6 +97,7 @@ require (
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
+	github.com/u-root/uio v0.0.0-20230305220412-3e8cd9d6bf63 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
