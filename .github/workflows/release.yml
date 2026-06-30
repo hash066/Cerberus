@@ -1,0 +1,182 @@
+name: release
+
+# Tag-triggered release. Pushing a semver tag (v1.2.3) cross-builds cerberusd +
+# cerberus for {linux,darwin,windows} x {amd64,arm64}, packages per-OS archives
+# + checksums + an auto-update manifest, and publishes a DRAFT GitHub Release.
+#
+# REAL vs SCAFFOLD (maturity honesty — see CLAUDE.md):
+#   REAL    : cross-compile (pure-Go, CGO_ENABLED=0), archive+checksum, artifact
+#             upload, draft Release creation, auto-update manifest generation.
+#   SCAFFOLD: code-signing (Windows Authenticode), macOS codesign + notarytool,
+#             auto-update publication. These steps are CLEARLY LABELLED, run only
+#             when their secrets are present, and DO NOTHING when secrets are
+#             absent (they are NOT faked). Where a real cert/secret plugs in is
+#             documented inline.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.1.0). Used for manual runs."
+        required: true
+        type: string
+
+permissions:
+  contents: write # needed to create the GitHub Release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------- cross-compile matrix
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cross-compile + package (build/release.sh)
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          chmod +x build/release.sh
+          # Single OS/arch per matrix leg; the script honors GOOS/GOARCH.
+          ./build/release.sh --version "$VERSION" --os "$GOOS" --arch "$GOARCH"
+
+      # ------------------------------------------------------------ SCAFFOLD: Windows code-signing
+      # Real signing plugs in here. Provide repo secrets:
+      #   WINDOWS_CERT_BASE64  (base64 of a .pfx Authenticode cert)
+      #   WINDOWS_CERT_PASSWORD
+      # then sign each .exe with signtool/osslsigncode. This step is a no-op
+      # (skipped) until those secrets exist — it is NOT faked.
+      - name: "SCAFFOLD: sign Windows binaries (skipped unless secrets set)"
+        if: ${{ matrix.goos == 'windows' && env.WINDOWS_CERT_BASE64 != '' }}
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        shell: bash
+        run: |
+          echo "::notice::[SCAFFOLD] Windows Authenticode signing would run here."
+          echo "Install osslsigncode, decode \$WINDOWS_CERT_BASE64 to cert.pfx,"
+          echo "and sign build/dist/*/*.exe before archiving."
+          # osslsigncode sign -pkcs12 cert.pfx -pass "$WINDOWS_CERT_PASSWORD" \
+          #   -n "Cerberus" -t http://timestamp.digicert.com -in app.exe -out app-signed.exe
+
+      # ------------------------------------------------------------ SCAFFOLD: macOS codesign + notarize
+      # Real signing/notarization plugs in here. Provide repo secrets:
+      #   MACOS_CERT_BASE64, MACOS_CERT_PASSWORD (Developer ID Application .p12),
+      #   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD (app-specific pw for notarytool).
+      # Then: import cert to a temp keychain, `codesign --options runtime`, zip,
+      # `xcrun notarytool submit --wait`, `xcrun stapler staple`. Skipped (no-op)
+      # until secrets exist — NOT faked. (macOS signing requires a macos runner;
+      # wire a separate macos-latest job when certs are available.)
+      - name: "SCAFFOLD: codesign + notarize macOS binaries (skipped unless secrets set)"
+        if: ${{ matrix.goos == 'darwin' && env.MACOS_CERT_BASE64 != '' }}
+        env:
+          MACOS_CERT_BASE64: ${{ secrets.MACOS_CERT_BASE64 }}
+        shell: bash
+        run: |
+          echo "::notice::[SCAFFOLD] macOS codesign + notarytool would run here (needs a macos runner)."
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cerberus-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: build/dist/**
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------- aggregate + publish
+  release:
+    name: publish draft release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: build/dist
+          merge-multiple: true
+
+      - name: Aggregate checksums + auto-update manifest
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          chmod +x build/release.sh
+          # --manifest-only re-uses the already-built dist/ tree to emit a single
+          # checksums.txt + update-manifest.json across every OS/arch.
+          ./build/release.sh --version "$VERSION" --manifest-only
+          ls -la build/dist
+
+      # ------------------------------------------------------------ SCAFFOLD: auto-update publication
+      # The auto-update manifest (build/dist/update-manifest.json) is REAL and
+      # generated above. PUBLISHING it to an update channel (e.g. an S3/R2 bucket
+      # or a Tauri updater endpoint) is the scaffold: wire your channel + signing
+      # key here. Tauri's updater additionally requires a minisign signature
+      # (TAURI_SIGNING_PRIVATE_KEY) — that plugs in here. No-op until configured.
+      - name: "SCAFFOLD: publish auto-update manifest (skipped unless channel set)"
+        if: ${{ env.UPDATE_CHANNEL_URL != '' }}
+        env:
+          UPDATE_CHANNEL_URL: ${{ secrets.UPDATE_CHANNEL_URL }}
+        shell: bash
+        run: |
+          echo "::notice::[SCAFFOLD] would upload build/dist/update-manifest.json to \$UPDATE_CHANNEL_URL"
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          draft: true # human reviews + flips signing on before publishing
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            build/dist/*.tar.gz
+            build/dist/*.zip
+            build/dist/checksums.txt
+            build/dist/update-manifest.json
