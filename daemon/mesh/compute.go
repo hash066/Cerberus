@@ -121,7 +121,7 @@ func (f *Fabric) handleComputeStream(s network.Stream, h ComputeHandler) {
 // authorizing capability over a QUIC stream, and returns the worker's result.
 // The worker authorizes the capability before running anything.
 func (f *Fabric) RequestCompute(ctx context.Context, worker contract.PeerID, task contract.ComputeTask, capH contract.CapHandle) (contract.ComputeResult, error) {
-	pid, err := libp2pID(worker)
+	pid, err := toLibp2pID(worker)
 	if err != nil {
 		return contract.ComputeResult{}, err
 	}

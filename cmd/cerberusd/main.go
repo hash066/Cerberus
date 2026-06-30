@@ -187,6 +187,27 @@ func main() {
 	issuer := auth.FromSeed(seed)
 	issuer.UseRevocationBackend(storeRevocations{db})
 
+	// Revocation gossip (Phase E4): a revoke here is published over the cap-gated
+	// sys/revocations topic, and revocations heard from peers are applied locally —
+	// so a token revoked on one node becomes a deny mesh-wide. Only when the real
+	// fabric composed; the topic cap is minted from the same kernel the mesh checks.
+	if fabric != nil {
+		if revCap, e := k.Mint(
+			contract.ResourceRef{Kind: contract.KindTopic, Path: auth.DefaultRevocationTopic},
+			[]contract.Right{contract.RightRead, contract.RightWrite}, nil); e == nil {
+			gossip := auth.NewRevocationGossip(fabric, auth.DefaultRevocationTopic, revCap)
+			gossip.HookPublish(issuer)
+			go func() {
+				if rerr := gossip.Run(ctx, issuer); rerr != nil && ctx.Err() == nil {
+					log.Printf("cerberusd: revocation gossip exited: %v", rerr)
+				}
+			}()
+			log.Println("cerberusd: revocation gossip active (sys/revocations topic)")
+		} else {
+			log.Printf("cerberusd: revocation gossip disabled (mint topic cap: %v)", e)
+		}
+	}
+
 	operatorToken, err := issuer.Mint("operator", []string{"admin"}, "", 24*time.Hour)
 	if err != nil {
 		log.Fatalf("mint operator token: %v", err)

@@ -126,10 +126,12 @@ Each phase has a **goal**, concrete **deliverables**, a **Definition of Done (Do
 ### Phase E — Real Distributed Substrate *(in progress)*
 **Goal:** two *separate machines* securely run a capability-gated job over the real mesh.
 - **E1** ✅ Bind the real Rust OCap kernel via cgo (`-tags ffi`). *Done.*
-- **E2** 🟡 `core/runtime`: content-addressed `CID → wasm` store + promise pipelining **done (engine-side)**. Remaining: FFI-bridge into the Go control plane and run it over the mesh transport in the e2e (currently local HTTP).
-- **E3** ✅ PeerID-bound sessions (libp2p/QUIC TLS, enforced) + capability-gated pub/sub topics, used by the composed daemon. Remaining: full custom-cert mTLS over the future raw data-plane transport.
-- **E4** 🟡 `sys/revocations` OR-set (converges, sticky) + signed-challenge admission **done (engine-side)**. Remaining: bridge the OR-set into Go `daemon/auth` so a revoke on node A denies on node B.
+- **E2** ✅ The e2e remote WASM exec now runs **over the mesh by CID** (`daemon/mesh/compute.go` + `daemon/wasm` content store), HTTP exec path removed, still returns 1337. Rust `core/runtime` CID store + promise pipelining also reachable via cgo. *Remaining hardening: cross-kernel signed-capability transfer on the wire; peer-to-peer IPLD fetch.*
+- **E3** ✅ PeerID-bound sessions (libp2p/QUIC TLS, enforced) + capability-gated pub/sub topics, used by the composed daemon. *Remaining: full custom-cert mTLS over the future raw data-plane transport.*
+- **E4** ✅ `sys/revocations` OR-set + **mesh gossip** (`daemon/auth.RevocationGossip`, wired in `cerberusd`): revoke on node A → cap-gated topic → denied on node B. Signed-challenge admission + cgo-reachable OR-set too.
 - **E+** ✅ Lid-drop wired: `daemon/lifecycle` SLEEP_IMMINENT → checkpoint → `scheduler.RerouteNode` standby promotion (real OS power hooks still stubbed).
+
+> **Phase E is essentially closed.** The remaining items above are hardening (signed cap transfer, Zenoh, OS power hooks), not blockers — the next focus is **Phase F (the MLP)**.
 - **DoD:** reproduce ARCHITECTURE **§4.1 ("agent requests 2 GiB remote VRAM")** across two physical machines: cap-checked walk → attenuated endpoint → result returns; revoked cap is rejected mesh-wide.
 
 ### Phase F — Real Compute & Peripherals

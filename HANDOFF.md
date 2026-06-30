@@ -35,8 +35,9 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
 | Composed daemon (OCap + mesh + telemetry + scheduler + 9P under OTP supervisor) (`daemon/system`) | ✅ REAL (composition); mesh = real libp2p/QUIC |
 | Scheduler — cost-model placement, reroute/standby, **multi-shard pipeline placement**, **per-node reroute (lid-drop)** (`daemon/scheduler`) | ✅ REAL, tested |
 | CRDT belief-conflict flagging (`core/crdt`, `daemon/state`) | ✅ REAL, tested |
-| Distributed revocation OR-set + attested admission (`core/crdt`, `core/identity`) | ✅ REAL, tested (Phase E4) — engine-side (Rust); FFI bridge into Go `daemon/auth` is the next step |
-| Content-addressed component store (CID→wasm) + promise pipelining (`core/runtime`) | ✅ REAL, tested (Phase E2) — engine-side (Rust); not yet driven from the Go control plane |
+| Distributed revocation — OR-set engine (`core/crdt`) + **mesh gossip propagation** (`daemon/auth` `RevocationGossip`, wired in `cerberusd`) + attested admission (`core/identity`) | ✅ REAL, tested (Phase E4): revoke on A → published over cap-gated `sys/revocations` topic → applied on B. Rust OR-set also reachable via cgo. |
+| Content-addressed component store (CID→wasm) — Go side (`daemon/wasm`) + Rust engine (`core/runtime`) + promise pipelining | ✅ REAL, tested (Phase E2). The e2e dispatches by CID over the mesh; Rust CID store + promises reachable via cgo. |
+| Real cross-node compute over the mesh (`daemon/mesh` `compute.go`) | ✅ REAL, tested (Phase E2): the e2e remote WASM exec runs over a capability-gated libp2p/QUIC stream (HTTP exec path removed); `go run ./test/e2e` → 1337 over mesh. |
 | Lid-drop lifecycle (`daemon/lifecycle`) → scheduler standby promotion, wired in `cerberusd` | ✅ REAL state machine + wiring, tested; real OS power/thermal hooks are a labelled stub |
 | OCap kernel in Rust — Ed25519 CBOR caps + attenuation chains (`core/ocap` SignedKernel) | ✅ REAL, tested — **now bound into the Go daemon** under `-tags ffi` |
 | Real Rust kernel via cgo (`daemon/ffi` `-tags ffi` → `core/cabi` → `SignedKernel`) | ✅ REAL, tested (Phase E item 1). Full `CapKernel` (mint/attenuate/verify/revoke) over cgo; `cerberusd -tags ffi` boots with `kernel=rust-signed-cabi`. Toolchain recipe in [docs/ffi.md](docs/ffi.md) (zig cc + `x86_64-pc-windows-gnu` + GOARCH=amd64). **Default** build is still the pure-Go stub on win/386 (no C toolchain needed). |
@@ -53,11 +54,12 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
 - **Phase E (in progress)**: multi-shard pipeline placement in the scheduler.
   - **E1 done — real Rust OCap kernel bound via cgo** (`-tags ffi`): the expanded C-ABI in `core/cabi` backs the full `contract.CapKernel` over the Ed25519 `SignedKernel`; capabilities are cryptographically enforced end-to-end. Default build unchanged (pure-Go stub, win/386). See [docs/ffi.md](docs/ffi.md).
   - **E2/E3/E4 + Track C landed via 4 parallel agents** (isolated worktrees, integrated on `integration`, all green + e2e=1337):
-    - **E2** (`core/runtime`): SHA-256 CIDv1 content store (integrity-checked) + CapTP promise pipelining. *Engine-side; Go/mesh bridge pending.*
-    - **E3** (`daemon/mesh`,`daemon/telemetry`): PeerID-bound sessions + capability-gated pub/sub topics, used by the composed daemon.
-    - **E4** (`core/crdt`,`core/identity`): `sys/revocations` OR-set (converges, sticky) + signed-challenge admission (TEE extension point). *Engine-side; Go `daemon/auth` bridge pending.*
+    - **E2** ✅: SHA-256 CIDv1 content store + CapTP promise pipelining (`core/runtime`); the e2e now dispatches the remote WASM exec **over the mesh by CID** (`daemon/mesh/compute.go`, `daemon/wasm/cidstore.go`) — HTTP exec path removed, still returns 1337.
+    - **E3** ✅ (`daemon/mesh`,`daemon/telemetry`): PeerID-bound sessions + capability-gated pub/sub topics, used by the composed daemon.
+    - **E4** ✅ (`core/crdt`,`core/identity`,`daemon/auth`): `sys/revocations` OR-set + **mesh gossip** (`RevocationGossip`, wired in `cerberusd`) so revoke-on-A denies-on-B; signed-challenge admission (TEE extension point).
+    - **FFI engine bridges** ✅ (`core/cabi`,`daemon/ffi`): the Rust CID store + OR-set are reachable over cgo under `-tags ffi` (8/8 ffi tests).
     - **Track C** (`daemon/lifecycle`,`daemon/gateway`): event-driven lid-drop state machine + gateway input hardening; lid-drop wired in `cerberusd` to `scheduler.RerouteNode` (real OS power hooks still a stub).
-  - **Remaining Phase E (next):** FFI-bridge the Rust E2/E4 engine work into the Go control plane (like E1 did for the kernel); run real cross-node compute over the mesh transport in the e2e.
+  - **Phase E essentially closed.** Next: Phase F (MLP) — Wasmtime component model + WASI P2, GPU dispatch, the QUIC zero-copy data plane, and the first peripheral demo (mic/speaker). Remaining E hardening: cross-kernel *signed* capability transfer on the wire (compute cap currently travels under a shared-kernel demo model), Zenoh intra-site, real OS power hooks.
 
 ## Repo layout (key)
 ```
