@@ -34,7 +34,9 @@ name = "cerberus-cabi"
 version = "0.1.0"
 dependencies = [
  "cerberus-contract",
+ "cerberus-crdt",
  "cerberus-ocap",
+ "cerberus-runtime",
  "serde_json",
 ]
 
