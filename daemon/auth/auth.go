@@ -95,6 +95,7 @@ type Issuer struct {
 	mu         sync.Mutex
 	revoked    map[string]bool
 	revBackend RevocationBackend
+	onRevoke   []func(id string)
 }
 
 // UseRevocationBackend swaps the in-memory revocation set for a durable backend.
@@ -103,6 +104,44 @@ func (i *Issuer) UseRevocationBackend(b RevocationBackend) {
 	i.mu.Lock()
 	i.revBackend = b
 	i.mu.Unlock()
+}
+
+// OnRevoke registers a callback fired (outside the issuer lock) whenever a token
+// id is revoked *locally* via Revoke. It is the hook RevocationGossip uses to
+// publish a revocation onto the fabric. Callbacks are NOT fired for revocations
+// applied from the fabric via ApplyRevocation, so propagation cannot loop.
+// Register before serving requests; callbacks run synchronously on the revoker.
+func (i *Issuer) OnRevoke(fn func(id string)) {
+	if fn == nil {
+		return
+	}
+	i.mu.Lock()
+	i.onRevoke = append(i.onRevoke, fn)
+	i.mu.Unlock()
+}
+
+// markRevoked records a token id in the active revocation store (durable backend
+// if configured, else the in-memory set). It is idempotent and monotone: an id
+// once revoked never becomes un-revoked. Caller must not hold i.mu.
+func (i *Issuer) markRevoked(id string) error {
+	if i.revBackend != nil {
+		return i.revBackend.Add(id)
+	}
+	i.mu.Lock()
+	i.revoked[id] = true
+	i.mu.Unlock()
+	return nil
+}
+
+// isRevoked reports whether a token id is in the active revocation store.
+func (i *Issuer) isRevoked(id string) bool {
+	if i.revBackend != nil {
+		return i.revBackend.Revoked(id)
+	}
+	i.mu.Lock()
+	r := i.revoked[id]
+	i.mu.Unlock()
+	return r
 }
 
 // LoadOrCreateSeed returns a persisted 32-byte Ed25519 seed, generating and
@@ -196,16 +235,35 @@ func (i *Issuer) Authorize(token, right, resource string) (Claims, error) {
 	return c, nil
 }
 
-// Revoke invalidates a token by id (durably, if a backend is configured).
+// Revoke invalidates a token by id (durably, if a backend is configured) and
+// notifies any OnRevoke hooks so the revocation can be gossiped to other nodes.
+// This is the *local-origin* path: an operator/agent on this node revokes.
 func (i *Issuer) Revoke(id string) error {
-	if i.revBackend != nil {
-		return i.revBackend.Add(id)
+	if err := i.markRevoked(id); err != nil {
+		return err
 	}
 	i.mu.Lock()
-	i.revoked[id] = true
+	hooks := append([]func(string){}, i.onRevoke...)
 	i.mu.Unlock()
+	for _, fn := range hooks {
+		fn(id)
+	}
 	return nil
 }
+
+// ApplyRevocation records a revocation that arrived from another node (via the
+// fabric). It is identical to Revoke except it does NOT fire the OnRevoke hooks,
+// so applying a received revocation never re-publishes it (no gossip loops). It
+// is idempotent and monotone — applying the same id repeatedly is a no-op, and a
+// revoked id is never un-applied. This is what makes a token revoked on node A
+// subsequently denied on node B.
+func (i *Issuer) ApplyRevocation(id string) error {
+	return i.markRevoked(id)
+}
+
+// IsRevoked reports whether a token id is currently revoked on this node. It
+// reflects both local revocations and any applied from the fabric.
+func (i *Issuer) IsRevoked(id string) bool { return i.isRevoked(id) }
 
 func (i *Issuer) verify(token string) (Claims, error) {
 	parts := strings.SplitN(token, ".", 2)
@@ -234,15 +292,7 @@ func (i *Issuer) verify(token string) (Claims, error) {
 	if c.Expiry != 0 && now >= c.Expiry {
 		return Claims{}, errors.New("token expired")
 	}
-	var revoked bool
-	if i.revBackend != nil {
-		revoked = i.revBackend.Revoked(c.ID)
-	} else {
-		i.mu.Lock()
-		revoked = i.revoked[c.ID]
-		i.mu.Unlock()
-	}
-	if revoked {
+	if i.isRevoked(c.ID) {
 		return Claims{}, errors.New("token revoked")
 	}
 	return c, nil
