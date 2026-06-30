@@ -96,11 +96,11 @@ The foundation — and notably the *hardest, most novel* part (capability securi
 Honest list of the missing/partial pieces, grouped by theme. Each maps to a roadmap phase in §5.
 
 **A. Make the mesh genuinely distributed & secure**
-- 🟡 Move real cross-node compute **onto the mesh** (today's E2E uses local HTTP between processes).
-- 🧪 Resolve `ComputeTask.Component` **CID → wasm bytes via IPLD** (content-addressed delivery).
-- ⛔ **mTLS + PeerID** on the wire (RPC/gateway are token-gated but plaintext today).
-- 🧪 **Zenoh** intra-site fabric (only libp2p path exists today).
-- 🧪 Cross-node **revocation propagation** (`sys/revocations` OR-set) + attested peer admission (07).
+- ✅ Real cross-node compute **runs over the mesh** — the E2E exec moved off local HTTP onto a capability-gated libp2p/QUIC stream (still returns `1337`).
+- ✅ `ComputeTask.Component` **CID → wasm bytes** dispatched content-addressed over the mesh — *peer-to-peer IPLD fetch of missing blocks is still 🧪.*
+- 🟡 **mTLS + PeerID** — PeerID-bound sessions are enforced on the libp2p/QUIC mesh; full custom-cert mTLS on the raw data-plane transport is still ⛔, and local RPC/gateway stay token-gated on localhost.
+- 🧪 **Zenoh** intra-site fabric (only the libp2p path exists today).
+- ✅ Cross-node **revocation propagation** (`sys/revocations` OR-set + mesh gossip) + signed-challenge admission — revoke on A denies on B. *(TEE-quote admission still 🔭.)*
 
 **B. Make compute & peripherals real**
 - ✅ **Wasmtime component model** (`core/runtime`, optional feature) — WASI-P2 still a documented hook (needs a `cargo-component` fixture).
@@ -113,7 +113,7 @@ Honest list of the missing/partial pieces, grouped by theme. Each maps to a road
 **C. Make memory, economy & lifecycle production-shaped**
 - 🟡 Full **CRDT memory** (Automerge/yrs) merge across real partitions + the belief-conflict human-flag UX.
 - 🟡 **eUTXO settlement** live with optimistic **fraud proofs** (OpenMesh cross-org trade).
-- 🧪 **Power/thermal/sleep** OS hooks (09) → checkpoint + capability hand-back + standby promotion (the "lid-drop").
+- 🟡 **Lid-drop** lifecycle wired (SLEEP_IMMINENT → checkpoint → scheduler standby promotion); the real **OS power/thermal/sleep** hooks (09) are still ⛔ a labelled stub.
 
 **D. Make it a product (the unglamorous, essential layer)**
 - ⛔ **Hardening:** key custody (TPM/Secure Enclave), rate limits/quotas on the data plane (byte-quota exists; per-principal rate limits don't), security audit + fuzzing, a written threat model.
