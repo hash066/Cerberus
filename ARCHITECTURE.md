@@ -1,6 +1,6 @@
 # Cerberus — Master System Architecture (Canonical Specification)
 
-> **Authority:** This is the canonical specification. All vertical designs under [docs/verticals/](docs/verticals/) conform to it. The narrative/rationale lives in [ideadumpp2.md](ideadumpp2.md). Where this document and any vertical doc disagree, **this document wins** and the vertical doc is a bug.
+> **Authority:** This is the canonical specification. All vertical designs under [docs/verticals/](docs/verticals/) conform to it. The narrative/rationale lives in [ideadumpp2.md](docs/research/ideadumpp2.md). Where this document and any vertical doc disagree, **this document wins** and the vertical doc is a bug.
 >
 > **Audience:** engineers implementing Cerberus. Third-person, normative ("MUST/SHOULD/MAY" per RFC 2119 sense).
 
@@ -67,9 +67,10 @@ A single monorepo. Go owns the orchestration/control plane; Rust owns the securi
 ```
 Cerberus/
 ├── README.md                 # Volume I (P2P hyper-computer)
-├── ideadumpp2.md             # Volume II narrative / debate
 ├── ARCHITECTURE.md           # ← this file (canonical)
-├── extra.md  braindomp.md    # research provenance
+├── docs/research/            # narrative + research provenance
+│   ├── ideadumpp2.md         #   Volume II narrative / debate
+│   └── extra.md  braindomp.md  #   research provenance
 │
 ├── cmd/
 │   ├── cerberusd/            # Go: the headless daemon entrypoint

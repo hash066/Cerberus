@@ -14,7 +14,7 @@
 - Upstream of: everything (it is the transport). Downstream of: OCap (01 topics are capability-gated).
 
 ## 3. Detailed Architecture — the hybrid fabric
-The defining decision of Volume II: **Zenoh intra-site, libp2p inter-site.** Rationale recorded in [ideadumpp2.md §2](../../ideadumpp2.md) — `braindomp.md` shows `exo` removed libp2p because its Kademlia DHT melted on local Wi-Fi; Zenoh's data-centric pub/sub (≈4-byte overhead, automatic mesh routing) is the right intra-site fabric. libp2p is retained only for what it is genuinely best at: NAT traversal and relay upgrade across sites.
+The defining decision of Volume II: **Zenoh intra-site, libp2p inter-site.** Rationale recorded in [ideadumpp2.md §2](../research/ideadumpp2.md) — `braindomp.md` shows `exo` removed libp2p because its Kademlia DHT melted on local Wi-Fi; Zenoh's data-centric pub/sub (≈4-byte overhead, automatic mesh routing) is the right intra-site fabric. libp2p is retained only for what it is genuinely best at: NAT traversal and relay upgrade across sites.
 
 ```
    ┌──────────────────────── SITE A (LAN) ────────────────────────┐

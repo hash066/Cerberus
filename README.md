@@ -1,6 +1,6 @@
 # Cerberus
 
-> **Volume II (latest):** The hardened, zero-trust production spec is [ARCHITECTURE.md](ARCHITECTURE.md) (canonical). Start with [ideadumpp2.md](ideadumpp2.md) for the narrative debate and Go-To-Market; deep dives per-vertical under [docs/verticals/](docs/verticals/). Below is **Volume I** (the original P2P hyper-computer spec).
+> **Volume II (latest):** The hardened, zero-trust production spec is [ARCHITECTURE.md](ARCHITECTURE.md) (canonical). Start with [ideadumpp2.md](docs/research/ideadumpp2.md) for the narrative debate and Go-To-Market; deep dives per-vertical under [docs/verticals/](docs/verticals/). Below is **Volume I** (the original P2P hyper-computer spec).
 
 # Project Cerberus (Voltron): Production-Grade Architecture & Technical Specification
 
