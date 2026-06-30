@@ -60,6 +60,142 @@ impl VectorClock {
             .iter()
             .all(|(k, v)| other.0.get(k).copied().unwrap_or(0) >= *v)
     }
+
+    /// Counter for `actor` (0 if unseen).
+    pub fn get(&self, actor: &str) -> u64 {
+        self.0.get(actor).copied().unwrap_or(0)
+    }
+
+    /// Strict causal ordering: `self` happened strictly before `other`
+    /// (dominated pointwise **and** not equal). Used to decide whether one write
+    /// causally supersedes another (the loser is dropped) vs. is concurrent (both
+    /// kept).
+    pub fn happens_before(&self, other: &VectorClock) -> bool {
+        self.dominated_by(other) && self != other
+    }
+
+    /// Concurrent (causally incomparable): neither happened-before the other.
+    /// This is the predicate that separates a genuine *contradiction* (two
+    /// concurrent writes) from a causal *update* (a later write that supersedes).
+    pub fn concurrent_with(&self, other: &VectorClock) -> bool {
+        !self.dominated_by(other) && !other.dominated_by(self)
+    }
+}
+
+/// One causally-stamped write: the value plus the vector clock that was current
+/// when its author produced it. The clock is the causal context required to
+/// decide supersession vs. concurrency on merge (ARCHITECTURE.md §3.3 — every op
+/// carries its `VectorClock`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dot {
+    /// The actor (peer id) that authored the write.
+    pub actor: String,
+    /// The value asserted.
+    pub value: String,
+    /// Causal context at authoring time.
+    pub clock: VectorClock,
+}
+
+/// A **multi-value register** with causal context. Unlike an [`LwwRegister`] it
+/// never silently discards a concurrent write: on merge, a strictly-later write
+/// supersedes an earlier one, but two *concurrent* (vector-clock-incomparable)
+/// writes are both retained. A register holding >1 value after merge is in
+/// conflict — the caller decides whether that is benign (some domains collapse
+/// it with a deterministic tiebreak) or must be surfaced (`agent.belief`).
+///
+/// This is the building block that lets concurrent edits across a partition
+/// converge **deterministically** (the retained set is a pure function of the
+/// ops seen, independent of merge order) while still distinguishing "newer
+/// fact" from "contradictory facts".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MvRegister {
+    /// Active writes. Maintained as an antichain: no element happens-before
+    /// another. Sorted (by actor, value) for deterministic iteration.
+    dots: Vec<Dot>,
+}
+
+impl MvRegister {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert/replace `dot`, keeping only the causal frontier: drop any existing
+    /// dot that `dot` strictly dominates, and skip `dot` if an existing dot
+    /// already dominates it (a stale/duplicate write). Concurrent dots coexist.
+    fn absorb(&mut self, dot: Dot) {
+        // Stale: someone already wrote causally at-or-after this. (Equal clock +
+        // equal value is a duplicate; equal clock + different value from a
+        // different actor is genuinely concurrent and handled below.)
+        for existing in &self.dots {
+            if dot.clock.happens_before(&existing.clock) {
+                return;
+            }
+            if dot.clock == existing.clock
+                && dot.actor == existing.actor
+                && dot.value == existing.value
+            {
+                return; // exact duplicate
+            }
+        }
+        // Drop everything this write strictly supersedes.
+        self.dots
+            .retain(|existing| !existing.clock.happens_before(&dot.clock));
+        // Avoid duplicating an identical (actor, value, clock) entry.
+        if !self.dots.iter().any(|e| e == &dot) {
+            self.dots.push(dot);
+        }
+        self.dots
+            .sort_by(|a, b| (&a.actor, &a.value).cmp(&(&b.actor, &b.value)));
+    }
+
+    /// Author a new write at `clock` (already including this actor's tick).
+    pub fn write(&mut self, actor: &str, value: &str, clock: VectorClock) {
+        self.absorb(Dot {
+            actor: actor.to_string(),
+            value: value.to_string(),
+            clock,
+        });
+    }
+
+    /// Convergent merge: absorb every remote dot. Commutative/associative/
+    /// idempotent because `absorb` keeps the causal antichain, which is a pure
+    /// function of the union of dots seen.
+    pub fn merge(&mut self, other: &MvRegister) {
+        for d in &other.dots {
+            self.absorb(d.clone());
+        }
+    }
+
+    /// The distinct values currently retained, in deterministic order.
+    pub fn values(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.dots.iter().map(|d| d.value.clone()).collect();
+        v.dedup();
+        v
+    }
+
+    /// The retained dots (value + author + causal clock).
+    pub fn dots(&self) -> &[Dot] {
+        &self.dots
+    }
+
+    /// True if more than one distinct value is live (a conflict frontier).
+    pub fn is_conflicted(&self) -> bool {
+        self.values().len() > 1
+    }
+
+    /// Deterministic single value when the caller wants LWW-style collapse:
+    /// the max by (clock-of-actor, value). Only meaningful for domains where a
+    /// concurrent tiebreak is acceptable (NOT `agent.belief`).
+    pub fn lww_value(&self) -> Option<&str> {
+        self.dots
+            .iter()
+            .max_by(|a, b| {
+                let at = a.clock.get(&a.actor);
+                let bt = b.clock.get(&b.actor);
+                (at, &a.value).cmp(&(bt, &b.value))
+            })
+            .map(|d| d.value.as_str())
+    }
 }
 
 /// Last-writer-wins register. Ties broken deterministically by (timestamp, value).
@@ -220,57 +356,92 @@ impl RevocationSet {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeliefConflict {
     pub subject: String,
-    /// (actor, asserted value) for each distinct claim.
+    /// (actor, asserted value) for each concurrent (causally-incomparable)
+    /// claim. A causally-later assertion is *not* a candidate — it superseded
+    /// its predecessor and is the lone surviving belief.
     pub candidates: Vec<(String, String)>,
 }
 
-/// Agent-belief document. Each subject maps to each actor's asserted value.
-/// Convergence is guaranteed (the map merges), but a subject with more than one
-/// distinct value is a [`BeliefConflict`] — flagged, not silently merged.
+/// Agent-belief document. Each subject holds a causally-tracked
+/// [`MvRegister`]: a write that strictly happened-after an earlier one
+/// supersedes it (revising your own belief is not a conflict), but two
+/// *concurrent* writes asserting different values are both retained and surface
+/// as a [`BeliefConflict`]. Convergence is guaranteed (the register merge is a
+/// pure function of the dots seen) yet contradictions are never silently
+/// LWW-collapsed — exactly the "convergence is not correctness" policy
+/// (docs/verticals/02 §1, ARCHITECTURE.md §1 principle 4).
 #[derive(Clone, Debug, Default)]
 pub struct BeliefDoc {
-    // subject -> (actor -> value)
-    claims: BTreeMap<String, BTreeMap<String, String>>,
+    // subject -> causal multi-value register of asserted values
+    claims: BTreeMap<String, MvRegister>,
+    // per-actor causal clock so each new assertion carries proper context.
+    clock: VectorClock,
 }
 
 impl BeliefDoc {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Assert `value` about `subject` as `actor`. The actor's clock is ticked so
+    /// the new assertion causally dominates everything this replica had already
+    /// observed for this subject — i.e. an actor revising its own belief
+    /// supersedes, it does not conflict with itself.
     pub fn assert(&mut self, actor: &str, subject: &str, value: &str) {
+        // Tick this actor; the resulting clock is the causal context. To make a
+        // local re-assertion dominate concurrent claims this replica has already
+        // merged in, fold the subject's current frontier into the context.
+        self.clock.tick(actor);
+        let mut ctx = self.clock.clone();
+        if let Some(reg) = self.claims.get(subject) {
+            for d in reg.dots() {
+                ctx.merge(&d.clock);
+            }
+        }
+        // Re-tick so the folded context is strictly dominated (happens-after).
+        ctx.tick(actor);
+        self.clock.merge(&ctx);
         self.claims
             .entry(subject.to_string())
             .or_default()
-            .insert(actor.to_string(), value.to_string());
+            .write(actor, value, ctx);
     }
+
     pub fn merge(&mut self, other: &BeliefDoc) {
-        for (subject, actors) in &other.claims {
-            let entry = self.claims.entry(subject.clone()).or_default();
-            for (actor, value) in actors {
-                entry.insert(actor.clone(), value.clone());
-            }
+        self.clock.merge(&other.clock);
+        for (subject, reg) in &other.claims {
+            self.claims.entry(subject.clone()).or_default().merge(reg);
         }
     }
-    /// The consensus value for a subject, only if all actors agree.
+
+    /// The consensus value for a subject: `Some` only when a single value
+    /// survives the causal frontier (everyone agrees, or one assertion
+    /// causally superseded the rest). `None` when concurrent claims disagree.
     pub fn consensus(&self, subject: &str) -> Option<&str> {
-        let actors = self.claims.get(subject)?;
-        let mut iter = actors.values();
-        let first = iter.next()?;
-        if iter.all(|v| v == first) {
-            Some(first.as_str())
+        let reg = self.claims.get(subject)?;
+        let dots = reg.dots();
+        let first = dots.first()?;
+        if dots.iter().all(|d| d.value == first.value) {
+            Some(first.value.as_str())
         } else {
             None
         }
     }
-    /// All subjects with contradictory claims (never auto-resolved).
+
+    /// All subjects whose causal frontier still holds >1 distinct value — a live
+    /// contradiction (never auto-resolved). Resolving means writing a new
+    /// assertion that causally dominates the frontier (see [`Self::assert`]).
     pub fn conflicts(&self) -> Vec<BeliefConflict> {
         let mut out = Vec::new();
-        for (subject, actors) in &self.claims {
-            let distinct: BTreeSet<&String> = actors.values().collect();
-            if distinct.len() > 1 {
+        for (subject, reg) in &self.claims {
+            if reg.is_conflicted() {
                 out.push(BeliefConflict {
                     subject: subject.clone(),
-                    candidates: actors.iter().map(|(a, v)| (a.clone(), v.clone())).collect(),
+                    candidates: reg
+                        .dots()
+                        .iter()
+                        .map(|d| (d.actor.clone(), d.value.clone()))
+                        .collect(),
                 });
             }
         }
@@ -278,11 +449,19 @@ impl BeliefDoc {
     }
 }
 
-/// Minimal LWW-register KV document keyed by string (domain "kv").
+/// LWW-register KV document keyed by string (domain "kv"). Each key carries the
+/// vector clock current at its last write, so merge uses **causal context**, not
+/// a bare counter: a write that causally happened-after another wins outright,
+/// and only genuinely *concurrent* writes fall through to a deterministic
+/// tiebreak (by per-actor counter then value). For `kv` a concurrent tiebreak is
+/// acceptable — agreed-on by every replica, so they converge to the same value
+/// regardless of merge order. (`agent.belief` instead surfaces concurrency as a
+/// conflict; see [`BeliefDoc`].)
 #[derive(Clone, Debug, Default)]
 pub struct KvDoc {
     pub clock: VectorClock,
-    values: HashMap<String, (u64, String)>,
+    // key -> (author, causal clock at write, value)
+    values: HashMap<String, (String, VectorClock, String)>,
 }
 
 impl KvDoc {
@@ -290,19 +469,43 @@ impl KvDoc {
         Self::default()
     }
     pub fn set(&mut self, actor: &str, key: &str, value: &str) {
-        let ts = self.clock.tick(actor);
-        self.values.insert(key.to_string(), (ts, value.to_string()));
+        self.clock.tick(actor);
+        // The write's causal context is the doc clock (which now dominates every
+        // prior write this replica has seen, including the key's own history).
+        self.values.insert(
+            key.to_string(),
+            (actor.to_string(), self.clock.clone(), value.to_string()),
+        );
     }
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.values.get(key).map(|(_, v)| v.as_str())
+        self.values.get(key).map(|(_, _, v)| v.as_str())
     }
     pub fn merge(&mut self, other: &KvDoc) {
         self.clock.merge(&other.clock);
-        for (k, (ts, v)) in &other.values {
+        for (k, (oactor, oclock, ov)) in &other.values {
             match self.values.get(k) {
-                Some((mine, mv)) if (*mine, mv) >= (*ts, v) => {}
-                _ => {
-                    self.values.insert(k.clone(), (*ts, v.clone()));
+                Some((mactor, mclock, mv)) => {
+                    if mclock.happens_before(oclock) {
+                        // remote strictly newer → take it
+                        self.values
+                            .insert(k.clone(), (oactor.clone(), oclock.clone(), ov.clone()));
+                    } else if oclock.happens_before(mclock) {
+                        // local strictly newer → keep
+                    } else {
+                        // concurrent: deterministic tiebreak by
+                        // (this-actor counter, value, actor) so every replica picks
+                        // the identical winner.
+                        let mk = (mclock.get(mactor), mv.as_str(), mactor.as_str());
+                        let ok = (oclock.get(oactor), ov.as_str(), oactor.as_str());
+                        if ok > mk {
+                            self.values
+                                .insert(k.clone(), (oactor.clone(), oclock.clone(), ov.clone()));
+                        }
+                    }
+                }
+                None => {
+                    self.values
+                        .insert(k.clone(), (oactor.clone(), oclock.clone(), ov.clone()));
                 }
             }
         }
@@ -438,5 +641,157 @@ mod tests {
         a.merge(&b);
         assert_eq!(a.0.get("a"), Some(&2));
         assert_eq!(a.0.get("b"), Some(&1));
+    }
+
+    #[test]
+    fn vector_clock_causality_predicates() {
+        let mut earlier = VectorClock::default();
+        earlier.tick("a"); // {a:1}
+        let mut later = earlier.clone();
+        later.tick("a"); // {a:2}
+        assert!(earlier.happens_before(&later));
+        assert!(!later.happens_before(&earlier));
+        assert!(!earlier.concurrent_with(&later));
+
+        let mut other = VectorClock::default();
+        other.tick("b"); // {b:1} — concurrent with {a:1}
+        assert!(earlier.concurrent_with(&other));
+        assert!(!earlier.happens_before(&other));
+    }
+
+    // A helper clock {actor: n}.
+    fn clk(actor: &str, n: u64) -> VectorClock {
+        let mut c = VectorClock::default();
+        c.0.insert(actor.to_string(), n);
+        c
+    }
+
+    #[test]
+    fn mv_register_later_write_supersedes() {
+        // a writes v1 at {a:1}; a then writes v2 at {a:2} (causally after).
+        let mut r = MvRegister::new();
+        r.write("a", "v1", clk("a", 1));
+        r.write("a", "v2", clk("a", 2));
+        assert_eq!(r.values(), vec!["v2".to_string()]);
+        assert!(!r.is_conflicted());
+    }
+
+    #[test]
+    fn mv_register_concurrent_writes_both_kept() {
+        // a@{a:1}=v1 and b@{b:1}=v2 are concurrent — neither dominates.
+        let mut r = MvRegister::new();
+        r.write("a", "v1", clk("a", 1));
+        r.write("b", "v2", clk("b", 1));
+        assert!(r.is_conflicted());
+        assert_eq!(r.values(), vec!["v1".to_string(), "v2".to_string()]);
+    }
+
+    #[test]
+    fn mv_register_merge_is_order_independent() {
+        // Same three writes absorbed in two different orders must converge.
+        let w = [
+            ("a", "v1", clk("a", 1)),
+            ("b", "v2", clk("b", 1)),
+            // a later observes b and overwrites with the join {a:2,b:1}
+            ("a", "v3", {
+                let mut c = clk("a", 2);
+                c.0.insert("b".into(), 1);
+                c
+            }),
+        ];
+        let mut left = MvRegister::new();
+        for (ac, v, c) in &w {
+            left.write(ac, v, c.clone());
+        }
+        let mut right = MvRegister::new();
+        for (ac, v, c) in w.iter().rev() {
+            right.write(ac, v, c.clone());
+        }
+        assert_eq!(left, right, "absorb order must not change the frontier");
+        // v3's clock dominates both v1 (a:1) and v2 (b:1) → it supersedes both.
+        assert_eq!(left.values(), vec!["v3".to_string()]);
+    }
+
+    #[test]
+    fn belief_self_revision_is_not_a_conflict() {
+        // One actor changing its mind on a single replica is a causal update,
+        // not a contradiction — must NOT flag.
+        let mut d = BeliefDoc::new();
+        d.assert("a", "door", "open");
+        d.assert("a", "door", "locked"); // a revises its own belief
+        assert!(d.conflicts().is_empty(), "self-revision must not conflict");
+        assert_eq!(d.consensus("door"), Some("locked"));
+    }
+
+    #[test]
+    fn belief_concurrent_partition_writes_flagged_and_converge() {
+        // Two replicas diverge during a partition: each asserts a different value
+        // about the same subject, having never seen the other.
+        let mut a = BeliefDoc::new();
+        let mut b = BeliefDoc::new();
+        a.assert("a", "sky", "blue");
+        b.assert("b", "sky", "green");
+
+        // Partition heals: exchange and merge both ways.
+        let (asnap, bsnap) = (a.clone(), b.clone());
+        a.merge(&bsnap);
+        b.merge(&asnap);
+
+        // Converged: identical conflict frontier on both replicas.
+        let ca = a.conflicts();
+        let cb = b.conflicts();
+        assert_eq!(ca, cb, "replicas must converge to the same conflict set");
+        assert_eq!(ca.len(), 1);
+        assert_eq!(ca[0].subject, "sky");
+        assert_eq!(ca[0].candidates.len(), 2);
+        assert_eq!(a.consensus("sky"), None);
+        assert_eq!(b.consensus("sky"), None);
+    }
+
+    #[test]
+    fn belief_resolution_supersedes_conflict() {
+        // A human/over-agent resolves the conflict by asserting a winning value
+        // that causally dominates the frontier — the contradiction clears.
+        let mut a = BeliefDoc::new();
+        let mut b = BeliefDoc::new();
+        a.assert("a", "sky", "blue");
+        b.assert("b", "sky", "green");
+        a.merge(&b.clone());
+        assert_eq!(a.conflicts().len(), 1);
+
+        // Resolver writes after observing both claims.
+        a.assert("human", "sky", "blue");
+        assert!(
+            a.conflicts().is_empty(),
+            "a causally-dominating assertion must clear the conflict"
+        );
+        assert_eq!(a.consensus("sky"), Some("blue"));
+    }
+
+    #[test]
+    fn kv_concurrent_same_key_converges_deterministically() {
+        // Both replicas write the SAME key concurrently across a partition.
+        let mut a = KvDoc::new();
+        let mut b = KvDoc::new();
+        a.set("a", "k", "from-a");
+        b.set("b", "k", "from-b");
+        let (asnap, bsnap) = (a.clone(), b.clone());
+        a.merge(&bsnap);
+        b.merge(&asnap);
+        // Deterministic tiebreak → both replicas land on the identical value.
+        assert_eq!(a.get("k"), b.get("k"));
+    }
+
+    #[test]
+    fn kv_causal_update_beats_stale_concurrent() {
+        // a writes k=1, b merges it, then b writes k=2 (causally after a's write).
+        let mut a = KvDoc::new();
+        a.set("a", "k", "1");
+        let mut b = KvDoc::new();
+        b.merge(&a); // b now causally observes a's write
+        b.set("b", "k", "2"); // strictly newer
+                              // Re-merge a's stale view: must not clobber b's newer value.
+        b.merge(&a);
+        assert_eq!(b.get("k"), Some("2"), "stale concurrent write must not win");
     }
 }
