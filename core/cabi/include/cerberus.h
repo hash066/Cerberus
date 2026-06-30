@@ -65,6 +65,54 @@ int cerberus_cap_revoke(uint64_t handle);
 /* 1 = revoked or unknown, 0 = live. */
 int cerberus_cap_is_revoked(uint64_t handle);
 
+/* ── Content-addressed block store (Phase E2, core/runtime BlockStore) ──────────
+ * SHA-256 content addressing with re-hash-on-get integrity. The CID crosses the
+ * boundary as its 36-byte self-describing binary form; block bytes are copied
+ * into caller-provided out-buffers (memory stays Rust-side). `get` is a two-call
+ * size-then-copy: cerberus_blockstore_get_len, then cerberus_blockstore_get. */
+#define CER_CID_LEN    36u
+#define CER_CAP_ID_LEN 16u
+
+/* Store len bytes at data; write the 36-byte CID into cid_out[36].
+ * 0 = ok, 1 = a required pointer was null. */
+int cerberus_blockstore_put(const uint8_t *data, size_t len, uint8_t *cid_out);
+
+/* Byte length of the block named by cid[36], or -1 if the CID is malformed,
+ * absent, or fails the store's integrity re-check. */
+intptr_t cerberus_blockstore_get_len(const uint8_t *cid);
+
+/* Copy the block named by cid[36] into out (capacity cap). Returns bytes written
+ * (>=0), or -1 if the CID is malformed/absent/fails integrity or out is too
+ * small/null. Bytes are returned only if they re-hash to the requested CID. */
+intptr_t cerberus_blockstore_get(const uint8_t *cid, uint8_t *out, size_t cap);
+
+/* 1 = the store holds a block for cid[36], 0 = absent or malformed CID. */
+int cerberus_blockstore_has(const uint8_t *cid);
+
+/* ── sys/revocations OR-set (Phase E4, core/crdt RevocationSet) ─────────────────
+ * Grow-only convergent set of revoked 16-byte capability ids. The merge/export
+ * wire format is defined by THIS ABI (core/crdt exposes no serializer): a flat
+ * concatenation of 16-byte cap ids in deterministic order. */
+
+/* Revoke the 16-byte cap id at cap_id (monotone; re-revoking is a no-op).
+ * 0 = ok, 1 = cap_id null. */
+int cerberus_revoke(const uint8_t *cap_id);
+
+/* 1 = the 16-byte cap id at cap_id is revoked, 0 = live (or cap_id null). */
+int cerberus_is_revoked(const uint8_t *cap_id);
+
+/* Fold a peer's serialized set (len bytes = N*16 concatenated cap ids) into the
+ * local set. Returns ids merged (>=0), or -1 if data is null or len is not a
+ * whole number of cap ids. Convergent + idempotent. */
+intptr_t cerberus_revocations_merge(const uint8_t *data, size_t len);
+
+/* Bytes the local set serializes to (16 * count), for sizing an export buffer. */
+size_t cerberus_revocations_export_len(void);
+
+/* Serialize the local set into out (capacity cap) as concatenated 16-byte cap
+ * ids. Returns bytes written (>=0), or -1 if out is null or too small. */
+intptr_t cerberus_revocations_export(uint8_t *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif
