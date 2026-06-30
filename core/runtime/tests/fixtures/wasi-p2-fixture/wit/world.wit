@@ -1,0 +1,18 @@
+// WASI-Preview-2 fixture world for the cerberus-runtime WASI-P2 test.
+//
+// This world deliberately *imports WASI Preview 2 interfaces* (random + stdout):
+// a component compiled against it cannot be instantiated without a real
+// `wasmtime_wasi::WasiCtx` in the store and `wasmtime_wasi::add_to_linker_sync`
+// to satisfy those imports. That is exactly what turns the documented WASI-P2
+// hook in `wasmtime_exec.rs` into a real, exercised call.
+//
+// It exports `run: func() -> u32` returning a fixed shard result (1337) so the
+// host test can assert an exact value while still proving the WASI plumbing is
+// live (the guest also draws a random byte and writes a line to stdout).
+package cerberus:wasi-fixture@0.1.0;
+
+world fixture {
+  import wasi:random/random@0.2.0;
+  import wasi:cli/stdout@0.2.0;
+  export run: func() -> u32;
+}
