@@ -13,6 +13,28 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use cerberus_contract::CapId;
+
+/// Domain names carried on the `CrdtOp.domain` field (ARCHITECTURE.md §3.3). The
+/// `domain` string selects which reducer resolves a merge, so every replica
+/// agrees on the merge semantics for a document. Keeping the wire names in one
+/// place prevents two nodes from dispatching different reducers for the same op.
+pub mod domain {
+    /// LWW-register key/value document. Reducer: [`super::KvDoc`].
+    pub const KV: &str = "kv";
+    /// PN-counter. Reducer: [`super::PnCounter`].
+    pub const COUNTER: &str = "counter";
+    /// Add-wins observed-remove set. Reducer: [`super::OrSet`].
+    pub const SET: &str = "set";
+    /// Agent-belief blackboard (contradiction-flagging). Reducer: [`super::BeliefDoc`].
+    pub const AGENT_BELIEF: &str = "agent.belief";
+    /// System revocation registry: a gossiped, monotone OR-set of revoked
+    /// capability ids. Reducer: [`super::RevocationSet`]. See
+    /// docs/verticals/07-identity-cap-lifecycle.md §3 — this is how a revoke on
+    /// node A propagates to node B and converges across a partition.
+    pub const SYS_REVOCATIONS: &str = "sys/revocations";
+}
+
 /// Logical causality clock: actor -> counter.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VectorClock(pub HashMap<String, u64>);
@@ -131,6 +153,66 @@ impl OrSet {
                 .or_default()
                 .extend(tags.iter().copied());
         }
+    }
+}
+
+/// The `sys/revocations` reducer: a grow-only OR-set of revoked capability ids
+/// (`CapId`, 16 bytes), gossiped on the `sys/revocations` document
+/// ([`domain::SYS_REVOCATIONS`]).
+///
+/// This is the distributed-revocation primitive from
+/// docs/verticals/07-identity-cap-lifecycle.md §3: a revoke on node A is an
+/// *add* into this set; merging two replicas takes the **union**, so the
+/// revocation propagates to node B and both converge regardless of message
+/// order or duplication. The set is **monotone (add-only)** — there is no
+/// `un-revoke`. That makes revocation **sticky**: once a cap id is in the set it
+/// stays revoked across every subsequent merge, which is exactly the fail-closed
+/// property a revocation registry needs (you can never accidentally resurrect a
+/// revoked capability by merging in an older replica).
+///
+/// A generic [`OrSet`] supports removal (add-wins) and so is the wrong shape for
+/// revocations; this type deliberately drops `remove` to guarantee monotonicity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RevocationSet {
+    revoked: BTreeSet<CapId>,
+}
+
+impl RevocationSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Revoke a capability id. Monotone: adding the same id again is a no-op, and
+    /// there is no inverse operation.
+    pub fn revoke(&mut self, id: CapId) {
+        self.revoked.insert(id);
+    }
+
+    /// Whether `id` is in the merged revocation set. Consulted by the identity
+    /// `cap_verify`/`is_revoked` seam (core/identity) on every capability use.
+    pub fn is_revoked(&self, id: &CapId) -> bool {
+        self.revoked.contains(id)
+    }
+
+    /// Every revoked id, in deterministic order.
+    pub fn elements(&self) -> Vec<CapId> {
+        self.revoked.iter().copied().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.revoked.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.revoked.is_empty()
+    }
+
+    /// Convergent merge: set union. Commutative, associative, and idempotent, so
+    /// replicas converge under any partition/reorder/redelivery. Because the set
+    /// only grows, the merged result is a superset of both inputs — revocation is
+    /// sticky.
+    pub fn merge(&mut self, other: &RevocationSet) {
+        self.revoked.extend(other.revoked.iter().copied());
     }
 }
 
@@ -290,6 +372,60 @@ mod tests {
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].subject, "door");
         assert_eq!(conflicts[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn revocation_set_two_replica_merge_converges() {
+        // Node A and node B each revoke a different capability while partitioned.
+        let cap_a: CapId = [0xAA; 16];
+        let cap_b: CapId = [0xBB; 16];
+        let mut a = RevocationSet::new();
+        let mut b = RevocationSet::new();
+        a.revoke(cap_a);
+        b.revoke(cap_b);
+
+        // Partition heals: exchange and merge in both directions.
+        let (a_snap, b_snap) = (a.clone(), b.clone());
+        a.merge(&b_snap);
+        b.merge(&a_snap);
+
+        // Both replicas now reflect the union — a revoke on A propagated to B.
+        assert!(a.is_revoked(&cap_a) && a.is_revoked(&cap_b));
+        assert!(b.is_revoked(&cap_a) && b.is_revoked(&cap_b));
+        assert_eq!(a, b, "replicas converge to the same state");
+        assert_eq!(a.elements(), b.elements());
+    }
+
+    #[test]
+    fn revocation_is_sticky_and_merge_is_idempotent() {
+        let cap: CapId = [7u8; 16];
+        let mut a = RevocationSet::new();
+        a.revoke(cap);
+        assert!(a.is_revoked(&cap));
+
+        // Merging an *older* replica that never saw the revoke cannot un-revoke it
+        // (the set is grow-only / monotone).
+        let stale = RevocationSet::new();
+        a.merge(&stale);
+        assert!(
+            a.is_revoked(&cap),
+            "revocation must stay revoked across merges"
+        );
+
+        // Idempotent: re-merging A's own snapshot changes nothing.
+        let snap = a.clone();
+        a.merge(&snap);
+        assert_eq!(a.len(), 1);
+        assert!(a.is_revoked(&cap));
+    }
+
+    #[test]
+    fn domain_names_are_stable() {
+        // Wire names other replicas dispatch on — pin them so a rename is a
+        // deliberate, test-breaking change.
+        assert_eq!(domain::SYS_REVOCATIONS, "sys/revocations");
+        assert_eq!(domain::AGENT_BELIEF, "agent.belief");
+        assert_eq!(domain::KV, "kv");
     }
 
     #[test]
