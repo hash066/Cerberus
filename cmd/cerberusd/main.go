@@ -12,8 +12,10 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
+	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/ffi"
 	"github.com/hash066/cerberus/daemon/gateway"
 	"github.com/hash066/cerberus/daemon/lifecycle"
@@ -22,19 +24,27 @@ import (
 	e2enode "github.com/hash066/cerberus/test/e2e/node"
 )
 
-// DaemonRPC is the RPC service exposed to the CLI and tray
+// DaemonRPC is the RPC service exposed to the CLI and tray. Every method
+// requires a capability token, so the control socket is not an open backdoor.
 type DaemonRPC struct {
 	lifecycle *lifecycle.Monitor
+	authz     auth.Authorizer
 }
 
-type StatusRequest struct{}
+type StatusRequest struct{ Token string }
 type StatusResponse struct {
 	Version string
 	State   string
+	Subject string
 }
 
 func (d *DaemonRPC) Status(req *StatusRequest, resp *StatusResponse) error {
+	claims, err := d.authz.Authorize(req.Token, "read", "")
+	if err != nil {
+		return fmt.Errorf("unauthorized: %w", err)
+	}
 	resp.Version = contract.ContractVersion
+	resp.Subject = claims.Subject
 	st := d.lifecycle.State()
 	resp.State = fmt.Sprintf("Running (Power: %v, Battery: %.1f%%)", st.Src, st.BatteryPct)
 	return nil
@@ -97,17 +107,33 @@ func main() {
 		}()
 	}
 
-	// Start Gateway with the real wazero-backed executor (no mock).
-	gw := gateway.NewGateway(wasm.NewExecutor(e2enode.HelloShardWASM()))
+	// Capability auth: mint a root operator token and write it where the CLI/tray
+	// can read it. Every gateway/RPC request must present a valid token.
+	issuer, err := auth.NewIssuer()
+	if err != nil {
+		log.Fatalf("auth init: %v", err)
+	}
+	operatorToken, err := issuer.Mint("operator", []string{"admin"}, "", 24*time.Hour)
+	if err != nil {
+		log.Fatalf("mint operator token: %v", err)
+	}
+	tokenPath := auth.OperatorTokenPath()
+	if werr := os.WriteFile(tokenPath, []byte(operatorToken), 0o600); werr != nil {
+		log.Printf("warning: could not write operator token: %v", werr)
+	}
+	log.Printf("operator token written to %s (CLI reads it; or set CERBERUS_TOKEN)", tokenPath)
+
+	// Start Gateway with the real wazero-backed executor (no mock), auth-gated.
+	gw := gateway.NewGateway(wasm.NewExecutor(e2enode.HelloShardWASM()), issuer)
 	go func() {
-		log.Println("Starting Gateway on :8080")
+		log.Println("Starting Gateway on :8080 (Bearer token required)")
 		if err := gw.Start(":8080"); err != nil {
 			log.Printf("Gateway error: %v", err)
 		}
 	}()
 
-	// Start RPC server
-	rpcService := &DaemonRPC{lifecycle: mon}
+	// Start RPC server (token-gated)
+	rpcService := &DaemonRPC{lifecycle: mon, authz: issuer}
 	rpc.Register(rpcService)
 	l, err := net.Listen("tcp", "127.0.0.1:9092") // TCP instead of UDS for Windows simplicity in skeleton
 	if err != nil {

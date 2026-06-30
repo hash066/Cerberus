@@ -1,19 +1,23 @@
 package gateway
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 
 	contract "github.com/hash066/cerberus/contract/go"
+	"github.com/hash066/cerberus/daemon/auth"
 )
 
+// Gateway is the OpenAI-compatible HTTP front door. Every request must present a
+// capability token (Authorization: Bearer <token>) granting "exec" — there is no
+// unauthenticated access, so multiple users/agents can share a daemon safely.
 type Gateway struct {
 	executor contract.Executor
+	authz    auth.Authorizer
 }
 
-func NewGateway(executor contract.Executor) *Gateway {
-	return &Gateway{executor: executor}
+func NewGateway(executor contract.Executor, authz auth.Authorizer) *Gateway {
+	return &Gateway{executor: executor, authz: authz}
 }
 
 type ChatRequest struct {
@@ -43,38 +47,42 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Capability auth: the caller must present a Bearer token granting "exec".
+	tok := auth.BearerToken(r.Header.Get("Authorization"))
+	if tok == "" {
+		http.Error(w, "missing bearer token", http.StatusUnauthorized)
+		return
+	}
+	claims, err := g.authz.Authorize(tok, "exec", "")
+	if err != nil {
+		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	var req ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Map OpenAI request to a Cerberus ComputeTask (stub logic)
+	// Map the request to a Cerberus ComputeTask scoped to the caller's subject.
 	task := contract.ComputeTask{
-		TaskID:    []byte("task-123"),
+		TaskID:    []byte(claims.Subject + ":" + req.Model),
 		Component: []byte("llm-component-cid"),
 	}
 
-	// Dispatch the task via the executor (contract seam)
-	promise, err := g.executor.Dispatch(context.Background(), task)
+	promise, err := g.executor.Dispatch(r.Context(), task)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	result, err := g.executor.Resolve(r.Context(), promise)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Wait for resolution
-	result, err := g.executor.Resolve(context.Background(), promise)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Mocking response back to OpenAI format
-	resp := ChatResponse{
-		ID:      "chatcmpl-123",
-		Object:  "chat.completion",
-		Created: 1677652288,
-	}
+	resp := ChatResponse{ID: "chatcmpl-cerberus", Object: "chat.completion", Created: 1677652288}
 	resp.Choices = append(resp.Choices, struct {
 		Index   int `json:"index"`
 		Message struct {
@@ -86,15 +94,11 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		Message: struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`
-		}{
-			Role: "assistant",
-			// Pretend result contains the string
-			Content: string(result.Output),
-		},
+		}{Role: "assistant", Content: string(result.Output)},
 	})
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (g *Gateway) Start(addr string) error {
