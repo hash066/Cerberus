@@ -78,15 +78,51 @@ type Authorizer interface {
 	Authorize(token, right, resource string) (Claims, error)
 }
 
+// RevocationBackend persists revoked token ids so revocations survive a restart.
+// nil means revocations are kept in-memory only.
+type RevocationBackend interface {
+	Revoked(id string) bool
+	Add(id string) error
+}
+
 // Issuer mints and verifies tokens against a single Ed25519 key (the daemon root
 // of trust).
 type Issuer struct {
 	priv ed25519.PrivateKey
 	pub  ed25519.PublicKey
 
-	next    uint64
-	mu      sync.Mutex
-	revoked map[string]bool
+	next       uint64
+	mu         sync.Mutex
+	revoked    map[string]bool
+	revBackend RevocationBackend
+}
+
+// UseRevocationBackend swaps the in-memory revocation set for a durable backend.
+// Call once at startup before serving requests.
+func (i *Issuer) UseRevocationBackend(b RevocationBackend) {
+	i.mu.Lock()
+	i.revBackend = b
+	i.mu.Unlock()
+}
+
+// LoadOrCreateSeed returns a persisted 32-byte Ed25519 seed, generating and
+// writing one (0600) if the file is missing. A stable seed means tokens minted
+// before a restart still verify afterwards.
+func LoadOrCreateSeed(path string) ([]byte, error) {
+	if b, err := os.ReadFile(path); err == nil && len(b) >= ed25519.SeedSize {
+		return b[:ed25519.SeedSize], nil
+	}
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
+		return nil, err
+	}
+	return seed, nil
 }
 
 // NewIssuer creates an issuer with a fresh random key.
@@ -160,11 +196,15 @@ func (i *Issuer) Authorize(token, right, resource string) (Claims, error) {
 	return c, nil
 }
 
-// Revoke invalidates a token by id.
-func (i *Issuer) Revoke(id string) {
+// Revoke invalidates a token by id (durably, if a backend is configured).
+func (i *Issuer) Revoke(id string) error {
+	if i.revBackend != nil {
+		return i.revBackend.Add(id)
+	}
 	i.mu.Lock()
-	defer i.mu.Unlock()
 	i.revoked[id] = true
+	i.mu.Unlock()
+	return nil
 }
 
 func (i *Issuer) verify(token string) (Claims, error) {
@@ -194,9 +234,14 @@ func (i *Issuer) verify(token string) (Claims, error) {
 	if c.Expiry != 0 && now >= c.Expiry {
 		return Claims{}, errors.New("token expired")
 	}
-	i.mu.Lock()
-	revoked := i.revoked[c.ID]
-	i.mu.Unlock()
+	var revoked bool
+	if i.revBackend != nil {
+		revoked = i.revBackend.Revoked(c.ID)
+	} else {
+		i.mu.Lock()
+		revoked = i.revoked[c.ID]
+		i.mu.Unlock()
+	}
 	if revoked {
 		return Claims{}, errors.New("token revoked")
 	}

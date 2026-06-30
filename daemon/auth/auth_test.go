@@ -89,3 +89,51 @@ func TestAdminGrantsAll(t *testing.T) {
 		t.Fatalf("admin should authorize any right: %v", err)
 	}
 }
+
+func seed32() []byte {
+	s := make([]byte, 32)
+	for i := range s {
+		s[i] = byte(i + 1)
+	}
+	return s
+}
+
+func TestPersistentKeySurvivesRestart(t *testing.T) {
+	seed := seed32()
+	before := FromSeed(seed)
+	tok, _ := before.Mint("alice", []string{"exec"}, "", time.Hour)
+
+	// Simulate a restart: a fresh issuer loaded from the same persisted seed.
+	after := FromSeed(seed)
+	if _, err := after.Authorize(tok, "exec", ""); err != nil {
+		t.Fatalf("token minted before restart must still verify after: %v", err)
+	}
+}
+
+type memBackend struct{ m map[string]bool }
+
+func (b *memBackend) Revoked(id string) bool { return b.m[id] }
+func (b *memBackend) Add(id string) error    { b.m[id] = true; return nil }
+
+func TestRevocationBackendPersists(t *testing.T) {
+	seed := seed32()
+	backend := &memBackend{m: map[string]bool{}}
+
+	before := FromSeed(seed)
+	before.UseRevocationBackend(backend)
+	tok, _ := before.Mint("alice", []string{"exec"}, "", time.Hour)
+	c, err := before.Authorize(tok, "exec", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := before.Revoke(c.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart: same seed, same durable backend -> revocation still in force.
+	after := FromSeed(seed)
+	after.UseRevocationBackend(backend)
+	if _, err := after.Authorize(tok, "exec", ""); err == nil {
+		t.Fatal("revocation must survive restart")
+	}
+}

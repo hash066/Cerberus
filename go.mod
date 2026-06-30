@@ -12,6 +12,7 @@ require (
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/tetratelabs/wazero v1.12.0
 	github.com/thejerf/suture/v4 v4.0.6
+	go.etcd.io/bbolt v1.5.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0

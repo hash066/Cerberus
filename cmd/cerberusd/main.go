@@ -10,6 +10,7 @@ import (
 	"net/rpc"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -19,10 +20,20 @@ import (
 	"github.com/hash066/cerberus/daemon/ffi"
 	"github.com/hash066/cerberus/daemon/gateway"
 	"github.com/hash066/cerberus/daemon/lifecycle"
+	"github.com/hash066/cerberus/daemon/store"
 	"github.com/hash066/cerberus/daemon/system"
 	"github.com/hash066/cerberus/daemon/wasm"
 	e2enode "github.com/hash066/cerberus/test/e2e/node"
 )
+
+// storeRevocations is a durable auth.RevocationBackend backed by the bbolt store.
+type storeRevocations struct{ s *store.Store }
+
+func (r storeRevocations) Revoked(id string) bool {
+	_, ok, _ := r.s.Get("revocations", id)
+	return ok
+}
+func (r storeRevocations) Add(id string) error { return r.s.Put("revocations", id, []byte{1}) }
 
 // DaemonRPC is the RPC service exposed to the CLI and tray. Every method
 // requires a capability token, so the control socket is not an open backdoor.
@@ -107,12 +118,23 @@ func main() {
 		}()
 	}
 
-	// Capability auth: mint a root operator token and write it where the CLI/tray
-	// can read it. Every gateway/RPC request must present a valid token.
-	issuer, err := auth.NewIssuer()
-	if err != nil {
-		log.Fatalf("auth init: %v", err)
+	// Durable persistence: the issuer key and revocation set survive restarts, so
+	// previously issued tokens keep working and revocations stay in force.
+	cfgDir := filepath.Dir(auth.OperatorTokenPath())
+	db, derr := store.Open(filepath.Join(cfgDir, "cerberus.db"))
+	if derr != nil {
+		log.Fatalf("open store: %v", derr)
 	}
+	defer db.Close()
+
+	// Capability auth: a persisted Ed25519 key is the daemon root of trust.
+	seed, serr := auth.LoadOrCreateSeed(filepath.Join(cfgDir, "issuer.key"))
+	if serr != nil {
+		log.Fatalf("load issuer key: %v", serr)
+	}
+	issuer := auth.FromSeed(seed)
+	issuer.UseRevocationBackend(storeRevocations{db})
+
 	operatorToken, err := issuer.Mint("operator", []string{"admin"}, "", 24*time.Hour)
 	if err != nil {
 		log.Fatalf("mint operator token: %v", err)
