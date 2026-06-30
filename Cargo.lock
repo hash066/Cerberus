@@ -89,6 +89,7 @@ version = "0.1.0"
 dependencies = [
  "cerberus-contract",
  "cerberus-ocap",
+ "sha2",
  "wasmi",
  "wat",
 ]
