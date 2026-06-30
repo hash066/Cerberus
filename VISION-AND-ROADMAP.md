@@ -75,13 +75,19 @@ The foundation — and notably the *hardest, most novel* part (capability securi
 - **Phase B — Multi-user auth** ✅ — `daemon/auth`: Ed25519 bearer **capability tokens** (mint/authorize/attenuate/revoke, expiry, scope, admin), enforced on the gateway (`:8080`), RPC (`:9092`), and status API (`:7777`). Operator token bootstrapped to the OS config dir; CLI authenticates.
 - **Phase C — Durability** ✅ — `daemon/store` (bbolt): issuer key, revocations, the **eUTXO credit ledger**, and **CRDT checkpoints** all survive restart.
 - **Phase D — Desktop dashboard** ✅ — `daemon/api` serves token-gated live status JSON; `tray/` is a real Tauri v2 app (Rust performs the authenticated fetch, the native webview renders).
-- **Phase E (in progress) — Real distributed substrate:**
+- **Phase E — Real distributed substrate** ✅ (closed):
   - Multi-shard **pipeline placement** in the scheduler ✅.
-  - **Item 1 — real Rust OCap kernel bound via cgo** ✅ (just landed): the Go control plane's full `CapKernel` (mint/attenuate/verify/revoke) is now backed by the Rust **Ed25519 `SignedKernel`** across a tiny C-ABI. `cerberusd -tags ffi` boots with `kernel=rust-signed-cabi`; capabilities are cryptographically enforced **end-to-end**. Reproducible build + toolchain recipe in [docs/ffi.md](docs/ffi.md).
-- **Composed daemon** ✅ — OCap + mesh (real libp2p/QUIC) + telemetry + scheduler + 9P run under an OTP-style supervisor (`daemon/system`).
+  - **E1 — real Rust OCap kernel via cgo** ✅: the Go control plane's full `CapKernel` (mint/attenuate/verify/revoke) is backed by the Rust **Ed25519 `SignedKernel`** across a tiny C-ABI. `cerberusd -tags ffi` boots with `kernel=rust-signed-cabi`; capabilities are cryptographically enforced **end-to-end** ([docs/ffi.md](docs/ffi.md)).
+  - **E2 cross-node compute over the mesh** ✅ (CID-addressed, HTTP exec path removed); **E3 PeerID-bound, capability-gated sessions** ✅; **E4 mesh revocation gossip** ✅ (revoke on node A → denied on node B); **lid-drop** wired ✅.
+- **Phase F — Real compute & peripherals** ✅ (the MLP, GPU excepted):
+  - **F1 Wasmtime** component-model executor ✅; **F3 capability + byte-quota-bound QUIC data plane** ✅; **F4 9P2000.L wire server** ✅; **F5 network audio** (jitter buffer + DLL drift control) ✅.
+  - **Cross-cut wiring** ✅ — opening a 9P device `.../ctl` now mints a **real data-plane grant** (`dataplane.RegisterGrant`) and returns the dialable endpoint (was a placeholder); the 9P wire server **and** the QUIC data-plane receiver run under the supervisor; **audio rides the data plane** (`daemon/audiolink`, one session = one capability/quota-bound transfer). Control plane mints the grant, the data plane moves the bytes (ARCHITECTURE §4.1).
+  - **F2 GPU dispatch** ⛔ deferred (needs real GPU hardware to validate honestly; not faked).
+- **Composed daemon** ✅ — OCap + mesh (real libp2p/QUIC) + telemetry + scheduler + 9P + data plane run under an OTP-style supervisor (`daemon/system`).
+- **Observability** ✅ — real **OpenTelemetry span export** (opt-in via `CERBERUS_TRACE`; replaces the no-op tracer) + a concurrent **load test** for the data-plane bridge.
 
 ### Green everywhere
-`go build/vet/test ./...`, `cargo build/test --workspace`, `cargo fmt --check`, `cargo clippy -D warnings`, and the 2-node E2E demo all pass.
+`go build/vet/test ./...`, `cargo build/test --workspace`, `cargo fmt --check`, `cargo clippy -D warnings`, the 2-node E2E demo (→ `1337`), and `go test -race` on the concurrency-sensitive packages all pass.
 
 ---
 
@@ -97,11 +103,11 @@ Honest list of the missing/partial pieces, grouped by theme. Each maps to a road
 - 🧪 Cross-node **revocation propagation** (`sys/revocations` OR-set) + attested peer admission (07).
 
 **B. Make compute & peripherals real**
-- 🟡 **Wasmtime component model + WASI P2** (richer than wazero).
-- ⛔ **GPU dispatch** (wgpu / MLX) — the `gpu`/`vram` capability actually running work on a GPU.
-- ⛔ **QUIC zero-copy data plane** — the single missing piece that unblocks VRAM *and* audio sharing.
-- 🧪 **9P wire server** (hugelgupf/p9) + **FUSE/WinFsp** mounts so remote devices appear as local paths.
-- 🧪 **Audio sharing (mic/speaker)** over ROC/AES67 — capture + transport + clock-sync.
+- ✅ **Wasmtime component model** (`core/runtime`, optional feature) — WASI-P2 still a documented hook (needs a `cargo-component` fixture).
+- ⛔ **GPU dispatch** (wgpu / MLX) — the `gpu`/`vram` capability actually running work on a GPU. *The one MLP item left; needs real hardware.*
+- ✅ **QUIC byte-quota data plane** (`daemon/dataplane`) — bulk transfer enforced before *and* during the stream; **wired to 9P `ctl` grants** and **carrying audio** (`daemon/audiolink`). *Remaining: PeerID-pin the data-plane TLS; true RDMA zero-copy is Frontier.*
+- ✅ **9P wire server** (hugelgupf/p9) serving the cap-gated namespace under the supervisor — **FUSE/WinFsp** mounts so remote devices appear as local paths are still 🧪 (kernel-driver-bound).
+- ✅ **Audio sharing (mic/speaker)** transport over the data plane (packetize + jitter-buffer + DLL clock-sync) — **OS capture/playback** (CoreAudio/WASAPI/PipeWire) is still ⛔ a labelled stub; not wired into a live daemon session yet.
 - 🧪 **Distributed filesystem** (`/cer/fs`): IPLD + Reed-Solomon erasure coding.
 
 **C. Make memory, economy & lifecycle production-shaped**
@@ -110,8 +116,8 @@ Honest list of the missing/partial pieces, grouped by theme. Each maps to a road
 - 🧪 **Power/thermal/sleep** OS hooks (09) → checkpoint + capability hand-back + standby promotion (the "lid-drop").
 
 **D. Make it a product (the unglamorous, essential layer)**
-- ⛔ **Hardening:** key custody (TPM/Secure Enclave), rate limits/quotas on the data plane, security audit + fuzzing, a written threat model.
-- ⛔ **Ops:** real OTel tracing exported, metrics/health endpoints, **load tests** (many nodes/users), **chaos tests** (partition, lid-drop, node loss) as automated suites.
+- ⛔ **Hardening:** key custody (TPM/Secure Enclave), rate limits/quotas on the data plane (byte-quota exists; per-principal rate limits don't), security audit + fuzzing, a written threat model.
+- 🟡 **Ops:** real **OTel tracing exported** ✅ (opt-in `CERBERUS_TRACE`, concise log exporter — swap `WithBatcher` for OTLP); a data-plane bridge **load test** ✅; still ⛔ metrics/health endpoints, many-node load tests, and **chaos tests** (partition, lid-drop, node loss) as automated suites.
 - ⛔ **Cross-platform reality:** actually build/run/verify on Mac + Windows + Linux; **launch & verify the Tauri GUI** on real hardware (never done headlessly); installers, code signing, auto-update.
 
 **E. Frontier (research bets, opt-in, off the critical path)**
@@ -141,8 +147,8 @@ Each phase has a **goal**, concrete **deliverables**, a **Definition of Done (Do
 - **F3** ✅ **QUIC zero-copy data plane** (`daemon/dataplane`): capability + byte-quota-bound bulk transfer, enforced before *and* during the stream. The unlock for VRAM + audio sharing. *Remaining: PeerID-pin the data-plane TLS.*
 - **F4** ✅ **9P2000.L wire server** (`daemon/ninep`, hugelgupf/p9) over the cap-gated namespace; per-connection capability; `ctl`→endpoint invariant held. *FUSE/WinFsp mount = labelled stub (kernel-driver-bound).*
 - **F5** ✅ **Network audio** (`daemon/audio`): packetized sender/receiver, reordering jitter buffer, DLL drift control, gap-fill concealment. *OS capture (CoreAudio/WASAPI/PipeWire) = labelled stub.*
-- **Cross-cut wiring (next):** 9P `ctl` open → `dataplane.RegisterGrant` → return the real endpoint (ARCHITECTURE §4.1); audio rides the data plane; serve the 9P wire + data-plane listener under the daemon supervisor.
-- **DoD (remaining):** open a remote GPU and run a real (small) inference shard (F2, real hardware); mount a peer device in Explorer/Finder (FUSE/WinFsp); stream a live OS mic across the mesh.
+- **Cross-cut wiring** ✅ (`daemon/system`, `daemon/ninep`, `daemon/audiolink`): 9P `.../ctl` open → `dataplane.RegisterGrant` → returns the real dialable endpoint (ARCHITECTURE §4.1); **audio rides the data plane**; the 9P wire server **and** data-plane receiver are served under the daemon supervisor. End-to-end + race tested.
+- **DoD (remaining):** open a remote GPU and run a real (small) inference shard (F2, real hardware); mount a peer device in Explorer/Finder (FUSE/WinFsp); stream a **live OS** mic across the mesh (the transport is done; OS capture is the stub left).
 
 > ⭐ **Minimum Lovable Product (MLP) cut line — end of Phase F.**
 > *"A small cluster of your own machines that securely runs sandboxed jobs and shares a GPU/mic across the LAN, visible in a desktop app."* This is the first genuinely demoable, lovable product — before full economy and full hardening.
@@ -223,7 +229,7 @@ The repo is already structured into three workstreams that build standalone agai
 ### Repo map
 ```
 cmd/        cerberusd (daemon), cerberus (CLI)
-daemon/     auth ffi gateway api store ledger state system scheduler ninep mesh telemetry supervisor lifecycle economy   (Go)
+daemon/     auth ffi gateway api store ledger state system scheduler ninep mesh dataplane audio audiolink telemetry supervisor lifecycle economy   (Go)
 core/       ocap crdt runtime identity economy cabi                                                                      (Rust)
 contract/   go + rust — FROZEN integration types (see CONTRACT.md)
 proto/ components/wit/ schemas/   frozen contract sources
