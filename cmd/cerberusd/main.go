@@ -18,6 +18,7 @@ import (
 	"github.com/hash066/cerberus/daemon/gateway"
 	"github.com/hash066/cerberus/daemon/lifecycle"
 	"github.com/hash066/cerberus/daemon/system"
+	"github.com/hash066/cerberus/daemon/wasm"
 	e2enode "github.com/hash066/cerberus/test/e2e/node"
 )
 
@@ -96,9 +97,8 @@ func main() {
 		}()
 	}
 
-	// Start Gateway
-	// We use a mock executor since we're in Workstream C
-	gw := gateway.NewGateway(&mockExecutor{})
+	// Start Gateway with the real wazero-backed executor (no mock).
+	gw := gateway.NewGateway(wasm.NewExecutor(e2enode.HelloShardWASM()))
 	go func() {
 		log.Println("Starting Gateway on :8080")
 		if err := gw.Start(":8080"); err != nil {
@@ -138,15 +138,4 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
-}
-
-// mockExecutor for gateway standalone
-type mockExecutor struct{}
-
-func (m *mockExecutor) Dispatch(ctx context.Context, t contract.ComputeTask) (contract.PromiseHandle, error) {
-	return contract.PromiseHandle(1), nil
-}
-
-func (m *mockExecutor) Resolve(ctx context.Context, p contract.PromiseHandle) (contract.ComputeResult, error) {
-	return contract.ComputeResult{OK: true, Output: []byte("Gateway standalone mock response")}, nil
 }
