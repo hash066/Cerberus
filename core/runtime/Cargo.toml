@@ -9,6 +9,16 @@ description = "Vertical 03 — WASM runtime (wasmi) + promise pipelining. Lane A
 cerberus-contract = { path = "../../contract/rust" }
 cerberus-ocap = { path = "../ocap" }
 wasmi = "1.1.0"
+# Wasmtime + Cranelift execution path (Phase F1) — the engine ARCHITECTURE §5/§6
+# name for the production runtime (Component Model + WASI P2). Added *alongside*,
+# not replacing, the pure-Rust wasmi path so callers can choose a backend.
+# `component-model` enables the typed WIT-world path; `cranelift` JITs to host ISA.
+wasmtime = { version = "37", default-features = false, features = [
+    "cranelift",
+    "runtime",
+    "component-model",
+    "std",
+] }
 # SHA-256 for content-addressed CIDs (ARCHITECTURE §3.4 ComputeTask.component).
 # Already resolved at 0.10 in the workspace lockfile (transitive of ed25519-dalek),
 # so promoting it to a direct dep adds no new version.

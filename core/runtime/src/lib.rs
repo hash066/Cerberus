@@ -12,12 +12,23 @@
 //! ARCHITECTURE §3.4 `ComputeTask.component` (an IPLD-style CID), so a worker is
 //! only ever fed bytes that verifiably hash to the id naming them.
 //!
-//! Next steps (docs/verticals/03-compute-orchestration.md): the WASM Component
-//! Model + WASI P2 host, `gpu`-capability dispatch to MLX/wgpu, and real
-//! cross-node promise pipelining over CapTP.
+//! ## Backends
+//! Two real WASM engines sit behind the same [`Executor`] seam, so a caller picks
+//! one without changing dispatch code:
+//! - [`WasmExecutor`] — **wasmi**, pure-Rust, no JIT/MSVC; the portable default.
+//! - [`WasmtimeExecutor`] — **Wasmtime + Cranelift** (ARCHITECTURE §5/§6), JITs to
+//!   the host ISA and carries the real **Component Model** path ([`run_component`]).
+//!   See [`wasmtime_exec`] for the WASI-P2 extension point.
+//!
+//! Next steps (docs/verticals/03-compute-orchestration.md): wire the Wasmtime
+//! Component Model to the frozen `agent` WIT world + WASI P2 host, `gpu`-capability
+//! dispatch to MLX/wgpu, and real cross-node promise pipelining over CapTP.
 
 mod blockstore;
 pub use blockstore::{BlockStore, Cid};
+
+pub mod wasmtime_exec;
+pub use wasmtime_exec::{run_component, HostImport, WasmtimeExecutor};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
