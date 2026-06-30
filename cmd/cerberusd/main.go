@@ -29,6 +29,33 @@ import (
 	e2enode "github.com/hash066/cerberus/test/e2e/node"
 )
 
+// rerouter is the slice of the scheduler the lid-drop coordinator needs. Declared
+// as a local interface so this package does not import daemon/scheduler.
+type rerouter interface {
+	RerouteNode(lost contract.PeerID) []contract.Plan
+}
+
+// lidDropCoordinator wires the lifecycle monitor's SLEEP_IMMINENT choreography to
+// the scheduler: when this node is about to go dark, promote hot standbys for
+// every shard placed here (ARCHITECTURE §4.2). It lives at the composition layer
+// so neither lifecycle nor scheduler imports the other.
+type lidDropCoordinator struct {
+	sched rerouter
+	self  contract.PeerID
+}
+
+func (c lidDropCoordinator) HandBackAndPromote(p lifecycle.SleepPrepare) error {
+	plans := c.sched.RerouteNode(c.self)
+	log.Printf("cerberusd: lid-drop (%s) — checkpointed doc %x; promoted standbys for %d task(s)",
+		p.Reason, p.DocID, len(plans))
+	return nil
+}
+
+func (c lidDropCoordinator) Resume(lifecycle.WakePrepare) error {
+	log.Println("cerberusd: wake — node rejoining mesh; standby release deferred to next placement")
+	return nil
+}
+
 // storeRevocations is a durable auth.RevocationBackend backed by the bbolt store.
 type storeRevocations struct{ s *store.Store }
 
@@ -141,6 +168,9 @@ func main() {
 		log.Printf("cerberusd: compose system failed: %v", serr)
 	} else {
 		fabric = sys.Fabric
+		// Wire the lid-drop choreography: SLEEP_IMMINENT -> checkpoint -> promote
+		// standbys for this node's shards (ARCHITECTURE §4.2).
+		mon.SetCoordinator(lidDropCoordinator{sched: sys.Scheduler})
 		log.Println("cerberusd: composed system up (mesh + telemetry + scheduler + 9P under supervisor)")
 		go func() {
 			if err := sys.Serve(ctx); err != nil && ctx.Err() == nil {

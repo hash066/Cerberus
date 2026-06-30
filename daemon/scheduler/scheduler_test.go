@@ -69,6 +69,31 @@ func TestRereotePromotesStandby(t *testing.T) {
 	}
 }
 
+func TestRerouteNodeMovesAllShardsOffLostNode(t *testing.T) {
+	s := New(nil)
+	s.UpdateNode(node(1, 4_000_000_000, false, true)) // standby
+	s.UpdateNode(node(2, 8_000_000_000, false, true)) // best -> primary for both
+
+	p1, err := s.Place(task(20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Place(task(21)); err != nil {
+		t.Fatal(err)
+	}
+	lost := p1.Placements[0].Node // node 2
+
+	plans := s.RerouteNode(lost)
+	if len(plans) != 2 {
+		t.Fatalf("expected both tasks rerouted off the lost node, got %d", len(plans))
+	}
+	for _, pl := range plans {
+		if pl.Placements[0].Node == lost {
+			t.Fatalf("task %x still placed on lost node", pl.TaskID)
+		}
+	}
+}
+
 func TestPlacePipelineSpreadsShards(t *testing.T) {
 	s := New(nil)
 	s.UpdateNode(node(1, 8_000_000_000, false, true))

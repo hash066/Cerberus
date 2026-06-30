@@ -183,6 +183,36 @@ func (s *Scheduler) Reroute(taskID []byte, lost contract.PeerID) (contract.Plan,
 	return newPlan, nil
 }
 
+// RerouteNode promotes standbys for every task currently placed (as primary) on
+// the lost node — the scheduler side of the "lid-drop" choreography
+// (ARCHITECTURE §4.2: when a node announces SLEEP_IMMINENT, its shards move to
+// hot standbys before it goes dark). Returns the new plan for each affected task.
+func (s *Scheduler) RerouteNode(lost contract.PeerID) []contract.Plan {
+	s.mu.Lock()
+	var keys []string
+	for key, plan := range s.placements {
+		for _, p := range plan.Placements {
+			if p.Node == lost {
+				keys = append(keys, key)
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	var out []contract.Plan
+	for _, key := range keys {
+		taskID, err := hex.DecodeString(key)
+		if err != nil {
+			continue
+		}
+		if np, rerr := s.Reroute(taskID, lost); rerr == nil {
+			out = append(out, np)
+		}
+	}
+	return out
+}
+
 func prevShard(p contract.Plan) contract.Shard {
 	if len(p.Placements) > 0 {
 		return p.Placements[0].Shard

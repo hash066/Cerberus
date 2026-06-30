@@ -34,3 +34,6 @@ Thumbs.db
 /.cerberus/
 .cerberus-e2e-*/
 *.log
+
+# Claude Code local settings + agent worktrees (ephemeral)
+.claude/

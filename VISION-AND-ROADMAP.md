@@ -47,15 +47,15 @@ Cerberus is specified as 11 interlocking "verticals." This is the complete visio
 | # | Pillar | The dream (what it ultimately enables) | Today |
 |---|---|---|---|
 | **00** | **OCap Security Kernel** | Every action in the system is gated by an unforgeable, attenuable, revocable Ed25519 capability — the "spine." No passwords, no roles, no ambient authority. | ✅ Real + now enforced into the Go daemon via cgo |
-| **01** | **Mesh Fabric & Transport** | Zero-config discovery; Zenoh intra-site + libp2p inter-site; resilient masterless transport over chaotic Wi-Fi and across sites; OTP-style supervision. | 🟡 libp2p/QUIC discovery + supervision real; Zenoh + mTLS pending |
+| **01** | **Mesh Fabric & Transport** | Zero-config discovery; Zenoh intra-site + libp2p inter-site; resilient masterless transport over chaotic Wi-Fi and across sites; OTP-style supervision. | 🟡 libp2p/QUIC discovery + supervision + **PeerID-bound sessions + cap-gated topics** real; Zenoh + raw-transport mTLS pending |
 | **02** | **Distributed State & CRDTs** | Shared agent memory that merges across partitions with no master; contradictory beliefs flagged to humans, never silently resolved. | 🟡 LWW map + checkpoints + belief-conflict real; full Automerge/yrs merge pending |
 | **03** | **Compute Orchestration** | Portable WASM components (not native binaries) run anywhere; tensor/pipeline sharding; promise pipelining; GPU abstraction via wgpu/MLX. | 🟡 Real WASM exec (wazero/wasmi); Wasmtime component model + GPU pending |
 | **04** | **9P Peripheral Virtualization** | Remote GPU/VRAM/**audio (mic+speaker)**/storage as a capability-addressed file namespace mountable on Win/Mac/Linux; bytes flow over a separate fast data plane. | 🟡 Cap-gated namespace logic real (in-memory); device backends + mounts + data plane stub |
 | **05** | **eUTXO & Open Mesh Economy** | Trustless cross-org compute trading; compute credits; optimistic/zk settlement so a provider can't bill for work it didn't do. | 🟡 Durable credit ledger real; advanced settlement (fraud/zk proofs) model-only |
 | **06** | **Placement & Scheduling Brain** | Telemetry-driven, multi-objective placement; shard pipelines across nodes; reroute to hot-standbys on failure. | ✅ Cost-model placement + reroute + multi-shard pipeline real (baseline) |
-| **07** | **Identity & Capability Lifecycle** | Issuance, attenuation, and *distributed revocation propagation*; key custody; attested admission of peers. | 🧪 Local lifecycle real; cross-node revocation OR-set + attestation pending |
+| **07** | **Identity & Capability Lifecycle** | Issuance, attenuation, and *distributed revocation propagation*; key custody; attested admission of peers. | 🟡 Revocation OR-set + signed-challenge admission real (engine-side); Go-daemon bridge + real TEE attestation pending |
 | **08** | **Observability & Tracing** | OpenTelemetry-style spans over the mesh; live topology, rings, and trace trees of swarm activity. | 🟡 Telemetry feed real; OTel export + trace UI pending |
-| **09** | **Power, Thermal & Sleep** | Nodes react to lids closing, battery, and heat: checkpoint, hand back capabilities, promote standbys — the "lid-drop" recovery. | 🧪 Event model defined; real OS power/thermal hooks pending |
+| **09** | **Power, Thermal & Sleep** | Nodes react to lids closing, battery, and heat: checkpoint, hand back capabilities, promote standbys — the "lid-drop" recovery. | 🟡 Event-driven state machine + lid-drop→scheduler wiring real & tested; real OS power/thermal hooks stubbed |
 | **10** | **Desktop App Model** | A polished tray-first desktop app (Tauri) + CLI + OpenAI-compatible gateway; install-and-go on every OS. | 🟡 Status API + dashboard code real; GUI not yet verified on real hardware; installers pending |
 | — | **Profiles** | One binary, two modes: **OpenMesh** (economy on) and **Sealed** (economy off, attestation on). | ✅ Boot-time switch real (`-profile=`) |
 
@@ -126,9 +126,10 @@ Each phase has a **goal**, concrete **deliverables**, a **Definition of Done (Do
 ### Phase E — Real Distributed Substrate *(in progress)*
 **Goal:** two *separate machines* securely run a capability-gated job over the real mesh.
 - **E1** ✅ Bind the real Rust OCap kernel via cgo (`-tags ffi`). *Done.*
-- **E2** Move cross-node compute off HTTP onto the **composed libp2p mesh**; resolve `ComputeTask.Component` CID → wasm via **IPLD**; wire **promise pipelining** for dependent shards.
-- **E3** **mTLS + PeerID** QUIC handshake; capability-gated pub/sub topics on the wire.
-- **E4** Cross-node **revocation OR-set** + attested admission (07): revoke on node A, denied on node B within seconds.
+- **E2** 🟡 `core/runtime`: content-addressed `CID → wasm` store + promise pipelining **done (engine-side)**. Remaining: FFI-bridge into the Go control plane and run it over the mesh transport in the e2e (currently local HTTP).
+- **E3** ✅ PeerID-bound sessions (libp2p/QUIC TLS, enforced) + capability-gated pub/sub topics, used by the composed daemon. Remaining: full custom-cert mTLS over the future raw data-plane transport.
+- **E4** 🟡 `sys/revocations` OR-set (converges, sticky) + signed-challenge admission **done (engine-side)**. Remaining: bridge the OR-set into Go `daemon/auth` so a revoke on node A denies on node B.
+- **E+** ✅ Lid-drop wired: `daemon/lifecycle` SLEEP_IMMINENT → checkpoint → `scheduler.RerouteNode` standby promotion (real OS power hooks still stubbed).
 - **DoD:** reproduce ARCHITECTURE **§4.1 ("agent requests 2 GiB remote VRAM")** across two physical machines: cap-checked walk → attenuated endpoint → result returns; revoked cap is rejected mesh-wide.
 
 ### Phase F — Real Compute & Peripherals

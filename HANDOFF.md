@@ -33,11 +33,14 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
 | Durable persistence — bbolt store; issuer key, revocations, eUTXO ledger, CRDT checkpoints survive restart (`daemon/store`,`daemon/ledger`,`daemon/state`,`daemon/auth`) | ✅ REAL, tested |
 | Status API + Tauri dashboard (`daemon/api`, `tray/`) | ✅ API REAL+tested; GUI real code, **not launched here** (needs Tauri toolchain) |
 | Composed daemon (OCap + mesh + telemetry + scheduler + 9P under OTP supervisor) (`daemon/system`) | ✅ REAL (composition); mesh = real libp2p/QUIC |
-| Scheduler — cost-model placement, reroute/standby, **multi-shard pipeline placement** (`daemon/scheduler`) | ✅ REAL, tested |
+| Scheduler — cost-model placement, reroute/standby, **multi-shard pipeline placement**, **per-node reroute (lid-drop)** (`daemon/scheduler`) | ✅ REAL, tested |
 | CRDT belief-conflict flagging (`core/crdt`, `daemon/state`) | ✅ REAL, tested |
+| Distributed revocation OR-set + attested admission (`core/crdt`, `core/identity`) | ✅ REAL, tested (Phase E4) — engine-side (Rust); FFI bridge into Go `daemon/auth` is the next step |
+| Content-addressed component store (CID→wasm) + promise pipelining (`core/runtime`) | ✅ REAL, tested (Phase E2) — engine-side (Rust); not yet driven from the Go control plane |
+| Lid-drop lifecycle (`daemon/lifecycle`) → scheduler standby promotion, wired in `cerberusd` | ✅ REAL state machine + wiring, tested; real OS power/thermal hooks are a labelled stub |
 | OCap kernel in Rust — Ed25519 CBOR caps + attenuation chains (`core/ocap` SignedKernel) | ✅ REAL, tested — **now bound into the Go daemon** under `-tags ffi` |
 | Real Rust kernel via cgo (`daemon/ffi` `-tags ffi` → `core/cabi` → `SignedKernel`) | ✅ REAL, tested (Phase E item 1). Full `CapKernel` (mint/attenuate/verify/revoke) over cgo; `cerberusd -tags ffi` boots with `kernel=rust-signed-cabi`. Toolchain recipe in [docs/ffi.md](docs/ffi.md) (zig cc + `x86_64-pc-windows-gnu` + GOARCH=amd64). **Default** build is still the pure-Go stub on win/386 (no C toolchain needed). |
-| mTLS / PeerID on the wire | ⛔ TODO (RPC/gateway are token-gated but plain TCP/localhost) |
+| mTLS / PeerID on the wire | 🟡 PeerID-bound sessions now enforced on the libp2p/QUIC mesh path + cap-gated topics (Phase E3, `daemon/mesh`); full custom-cert mTLS over a raw (non-libp2p) data-plane transport still TODO; local RPC/API remain token-gated localhost |
 | zk-WASM proof-of-inference, host-TEE memory shielding, RDMA-over-Thunderbolt | ⛔ FRONTIER (documented stubs by design; ~100× / hardware-limited) |
 | eUTXO advanced settlement (fraud proofs/zk) in `core/economy` (Rust) | ⚠️ model exists; daemon's live ledger is the Go `daemon/ledger` (durable) |
 | Tauri GUI rendering | ⛔ not verifiable headlessly; the preview of `tray/src/index.html` in a plain browser looks unstyled because CSS+Tauri runtime aren't loaded there — it is NOT the real app |
@@ -47,7 +50,14 @@ Commits: author/committer = **hash066 <harshitanagesh4@gmail.com>** (use `git co
 - **Phase B — multi-user auth**: `daemon/auth` Ed25519 bearer capability tokens (mint/authorize/attenuate/revoke, expiry, scope, admin); enforced on gateway (`:8080`), RPC (`:9092`), status API (`:7777`); operator token written to OS config dir; CLI authenticates.
 - **Phase C — durability**: bbolt `daemon/store`; persisted issuer key + revocations; durable eUTXO `daemon/ledger`; durable CRDT `daemon/state` (LWW map + checkpoints + belief-conflict). All survive restart; wired into `cerberusd`.
 - **Phase D — desktop dashboard**: `daemon/api` token-gated status JSON; `cerberusd` serves live data on `:7777`; `tray/` real Tauri v2 dashboard (Rust does the authenticated fetch, webview renders — no browser).
-- **Phase E (in progress)**: multi-shard pipeline placement in the scheduler; **item 1 done — real Rust OCap kernel bound via cgo** (`-tags ffi`): the expanded C-ABI in `core/cabi` now backs the full `contract.CapKernel` over the Ed25519 `SignedKernel`, so capabilities are cryptographically enforced at runtime end-to-end. Default build unchanged (pure-Go stub, win/386, no C toolchain). See [docs/ffi.md](docs/ffi.md).
+- **Phase E (in progress)**: multi-shard pipeline placement in the scheduler.
+  - **E1 done — real Rust OCap kernel bound via cgo** (`-tags ffi`): the expanded C-ABI in `core/cabi` backs the full `contract.CapKernel` over the Ed25519 `SignedKernel`; capabilities are cryptographically enforced end-to-end. Default build unchanged (pure-Go stub, win/386). See [docs/ffi.md](docs/ffi.md).
+  - **E2/E3/E4 + Track C landed via 4 parallel agents** (isolated worktrees, integrated on `integration`, all green + e2e=1337):
+    - **E2** (`core/runtime`): SHA-256 CIDv1 content store (integrity-checked) + CapTP promise pipelining. *Engine-side; Go/mesh bridge pending.*
+    - **E3** (`daemon/mesh`,`daemon/telemetry`): PeerID-bound sessions + capability-gated pub/sub topics, used by the composed daemon.
+    - **E4** (`core/crdt`,`core/identity`): `sys/revocations` OR-set (converges, sticky) + signed-challenge admission (TEE extension point). *Engine-side; Go `daemon/auth` bridge pending.*
+    - **Track C** (`daemon/lifecycle`,`daemon/gateway`): event-driven lid-drop state machine + gateway input hardening; lid-drop wired in `cerberusd` to `scheduler.RerouteNode` (real OS power hooks still a stub).
+  - **Remaining Phase E (next):** FFI-bridge the Rust E2/E4 engine work into the Go control plane (like E1 did for the kernel); run real cross-node compute over the mesh transport in the e2e.
 
 ## Repo layout (key)
 ```
