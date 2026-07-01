@@ -4,49 +4,193 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="stylesheet" href="styles.css" />
-    <title>Cerberus</title>
-    <script src="main.js" defer></script>
+    <title>Cerberus — Mesh Control</title>
+    <script src="main.js" type="module"></script>
   </head>
   <body>
-    <header>
-      <div class="brand"><span class="logo">🐺</span> Cerberus</div>
-      <div class="conn"><span id="conn" class="dot"></span><span id="conn-text">connecting…</span></div>
-    </header>
+    <div class="app">
+      <!-- ===== Sidebar ===== -->
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="logo">C</span>
+          <div>Cerberus<small>MESH CONTROL</small></div>
+        </div>
 
-    <main class="grid">
-      <section class="card">
-        <h2>Daemon</h2>
-        <div class="kv"><span>Version</span><b id="version">—</b></div>
-        <div class="kv"><span>Profile</span><b id="profile">—</b></div>
-        <div class="kv"><span>Kernel</span><b id="kernel">—</b></div>
-        <div class="kv"><span>Uptime</span><b id="uptime">—</b></div>
-      </section>
+        <nav class="nav" id="nav">
+          <button class="nav-item active" data-view="overview"><span class="ico">◉</span> Overview</button>
+          <button class="nav-item" data-view="mesh"><span class="ico">⬡</span> Mesh peers<span class="badge" id="nav-peers">0</span></button>
+          <button class="nav-item" data-view="devices"><span class="ico">▤</span> Devices</button>
+          <button class="nav-item" data-view="workloads"><span class="ico">▷</span> Workloads</button>
+          <button class="nav-item" data-view="metrics"><span class="ico">📈</span> Metrics</button>
+          <button class="nav-item" data-view="wallet"><span class="ico">◈</span> Wallet</button>
+          <button class="nav-item" data-view="conflicts"><span class="ico">⚠</span> Conflicts<span class="badge warn" id="nav-conflicts" style="display:none">0</span></button>
+        </nav>
 
-      <section class="card">
-        <h2>Mesh</h2>
-        <div class="kv"><span>Fabric</span><b id="mesh">—</b></div>
-        <div class="kv"><span>Peers</span><b id="peers">—</b></div>
-        <div class="peerlist" id="peerlist">—</div>
-      </section>
+        <div class="spacer"></div>
 
-      <section class="card">
-        <h2>Power &amp; Thermal</h2>
-        <div class="kv"><span>Source</span><b id="psource">—</b></div>
-        <div class="kv"><span>Battery</span><b id="battery">—</b></div>
-        <div class="kv"><span>Lid</span><b id="lid">—</b></div>
-        <div class="kv"><span>Sleep hint</span><b id="hint">—</b></div>
-      </section>
+        <div class="conn-pill">
+          <span class="dot" id="conn-dot"></span>
+          <span id="conn-text">connecting…</span>
+        </div>
+      </aside>
 
-      <section class="card">
-        <h2>Economy</h2>
-        <div class="kv"><span>Operator balance</span><b id="balance">—</b></div>
-        <div class="muted">compute credits (OpenMesh)</div>
-      </section>
-    </main>
+      <!-- ===== Main ===== -->
+      <main class="main">
+        <div class="topbar">
+          <div>
+            <h1 id="view-title">Overview</h1>
+            <div class="sub" id="view-sub">Live node &amp; mesh status</div>
+          </div>
+          <div class="topbar-actions">
+            <span class="chip" id="profile-chip">profile —</span>
+            <button class="btn ghost small" id="btn-refresh" title="Refresh now">↻ Refresh</button>
+          </div>
+        </div>
 
-    <footer>
-      <span id="err" class="err"></span>
-      <span class="muted">auth: operator capability token · status API :7777</span>
-    </footer>
+        <div class="content">
+          <div class="banner" id="banner">
+            <span class="ico">⚠</span>
+            <span class="grow"><b>Daemon unreachable.</b> <span id="banner-detail">Start <code>cerberusd</code> — the dashboard reconnects automatically.</span></span>
+          </div>
+
+          <!-- ========== Overview ========== -->
+          <section class="view active" id="view-overview">
+            <div class="grid cols-4">
+              <div class="stat"><div class="label">Mesh</div><div class="value small" id="ov-mesh">—</div><div class="delta" id="ov-mesh-sub">fabric</div><div class="accent-bar"></div></div>
+              <div class="stat"><div class="label">Peers</div><div class="value" id="ov-peers">—</div><div class="delta" id="ov-peers-sub">connected</div><div class="accent-bar"></div></div>
+              <div class="stat"><div class="label">Tasks placed</div><div class="value" id="ov-tasks">—</div><div class="delta" id="ov-tasks-sub">since boot</div><div class="accent-bar"></div></div>
+              <div class="stat"><div class="label">Balance</div><div class="value small" id="ov-balance">—</div><div class="delta">compute credits</div><div class="accent-bar"></div></div>
+            </div>
+
+            <div class="grid cols-3" style="margin-top:16px">
+              <div class="card">
+                <h2>Daemon</h2>
+                <div class="kv"><span>Version</span><b id="d-version">—</b></div>
+                <div class="kv"><span>Profile</span><b id="d-profile">—</b></div>
+                <div class="kv"><span>Kernel</span><b id="d-kernel">—</b></div>
+                <div class="kv"><span>Uptime</span><b id="d-uptime">—</b></div>
+              </div>
+
+              <div class="card">
+                <h2>Health</h2>
+                <div class="kv"><span>Liveness</span><b id="h-live">—</b></div>
+                <div class="kv"><span>Readiness</span><b id="h-ready">—</b></div>
+                <div class="kv"><span>Reason</span><b id="h-reason" class="mono">—</b></div>
+                <div class="muted" style="margin-top:8px">/healthz + /readyz on :7779 (open probes)</div>
+              </div>
+
+              <div class="card">
+                <h2>Power &amp; Lid</h2>
+                <div class="kv"><span>Source</span><b id="p-source">—</b></div>
+                <div class="kv"><span>Battery</span><b id="p-battery">—</b></div>
+                <div class="kv"><span>Lid</span><b id="p-lid">—</b></div>
+                <div class="kv"><span>Sleep hint</span><b id="p-hint">—</b></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ========== Mesh ========== -->
+          <section class="view" id="view-mesh">
+            <div class="card">
+              <h2>Mesh fabric <span class="h2-right" id="m-fabric-state">—</span></h2>
+              <div id="peer-container">
+                <div class="empty"><div class="big">⬡</div>No peers yet — this node is alone on the mesh.</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ========== Devices ========== -->
+          <section class="view" id="view-devices">
+            <div class="grid cols-2">
+              <div class="card span-2">
+                <h2>Device namespace (9P) <span class="h2-right">/cer/dev</span></h2>
+                <div id="dev-container"></div>
+              </div>
+              <div class="card span-2">
+                <h2>Grant / pool a device</h2>
+                <div class="form-row">
+                  <label class="field"><span>Device path</span><input class="inp mono" id="grant-path" placeholder="/cer/dev/vram/local/0" /></label>
+                  <label class="field"><span>Rights</span>
+                    <select class="inp" id="grant-rights">
+                      <option value="read">read</option>
+                      <option value="read,alloc">read, alloc</option>
+                      <option value="read,alloc,write">read, alloc, write</option>
+                    </select>
+                  </label>
+                  <button class="btn primary" id="btn-grant">Grant</button>
+                </div>
+                <div class="result" id="grant-result"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ========== Workloads ========== -->
+          <section class="view" id="view-workloads">
+            <div class="card">
+              <h2>Run a workload <span class="h2-right">gateway :8080 · POST /v1/chat/completions</span></h2>
+              <div class="form-row" style="margin-bottom:12px">
+                <label class="field" style="max-width:240px"><span>Model / component</span><input class="inp" id="wl-model" value="hello-shard" /></label>
+                <label class="field"><span>Prompt</span><input class="inp" id="wl-prompt" placeholder="say hello to the mesh" value="hello mesh" /></label>
+                <button class="btn primary" id="btn-run">▷ Run</button>
+              </div>
+              <div class="result" id="run-result"></div>
+              <div class="muted" style="margin-top:8px">Placed by the scheduler, executed across the mesh (real wazero component). Requires a token granting <code>exec</code>.</div>
+            </div>
+
+            <div class="card" style="margin-top:16px">
+              <h2>Running / recent workloads</h2>
+              <div id="wl-container"></div>
+            </div>
+          </section>
+
+          <!-- ========== Metrics ========== -->
+          <section class="view" id="view-metrics">
+            <div class="grid cols-4" id="metric-tiles"></div>
+            <div class="card" style="margin-top:16px">
+              <h2>Live counters <span class="h2-right">/metrics :7779 · polled</span></h2>
+              <table class="tbl" id="metric-table">
+                <thead><tr><th>Metric</th><th>Help</th><th class="num">Value</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+
+          <!-- ========== Wallet ========== -->
+          <section class="view" id="view-wallet">
+            <div class="grid cols-2">
+              <div class="stat"><div class="label">Operator balance</div><div class="value" id="w-balance">—</div><div class="delta">compute credits (OpenMesh eUTXO)</div><div class="accent-bar"></div></div>
+              <div class="card">
+                <h2>Operator capability</h2>
+                <div class="kv"><span>Token file</span><b id="w-tokenpath" class="mono" style="font-size:11px">—</b></div>
+                <div class="kv"><span>Subject</span><b>operator (admin)</b></div>
+                <div style="display:flex; gap:8px; margin-top:12px">
+                  <button class="btn" id="btn-copy-token">⧉ Copy operator token</button>
+                  <button class="btn ghost" id="btn-copy-path">Copy path</button>
+                </div>
+                <div class="result" id="token-result"></div>
+              </div>
+              <div class="card span-2">
+                <h2>Revoke a capability</h2>
+                <div class="form-row">
+                  <label class="field"><span>Capability / token id</span><input class="inp mono" id="revoke-id" placeholder="cap id (jti)" /></label>
+                  <button class="btn danger" id="btn-revoke">Revoke</button>
+                </div>
+                <div class="result" id="revoke-result"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ========== Conflicts ========== -->
+          <section class="view" id="view-conflicts">
+            <div class="card">
+              <h2>Open belief-conflicts <span class="h2-right">CRDT contradictions awaiting resolution</span></h2>
+              <div id="conf-container"></div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <div class="toast-wrap" id="toasts"></div>
   </body>
 </html>

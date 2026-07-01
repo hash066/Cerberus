@@ -1,43 +1,23 @@
 <!doctype html>
+<!--
+  This file is NOT the app. The Tauri build serves `src/` directly
+  (tauri.conf.json → build.frontendDist = "../src"); the real entry point is
+  tray/src/index.html. This root index.html is a leftover from the Vite scaffold
+  and is kept only as a signpost:
+
+    * Real dashboard entry ....... tray/src/index.html   (loaded by Tauri)
+    * Browser-openable design mock  tray/preview.html    (no daemon needed)
+
+  Open tray/preview.html in any browser to review the dashboard design.
+-->
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cerberus Telemetry</title>
-    <style>
-      body {
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-        background-color: #1e1e2e;
-        color: #cdd6f4;
-        margin: 0;
-        padding: 20px;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        height: 100vh;
-      }
-      h1 { color: #89b4fa; }
-      #telemetry-container {
-        background-color: #313244;
-        padding: 20px;
-        border-radius: 12px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-        text-align: left;
-        width: 100%;
-        max-width: 400px;
-      }
-      .metric { margin-bottom: 10px; }
-      .label { font-weight: bold; color: #a6e3a1; }
-    </style>
+    <meta http-equiv="refresh" content="0; url=preview.html" />
+    <title>Cerberus — see preview.html</title>
   </head>
   <body>
-    <h1>Cerberus Topology</h1>
-    <div id="telemetry-container">
-      <div class="metric"><span class="label">Daemon State:</span> <span id="state">Connecting...</span></div>
-      <div class="metric"><span class="label">Version:</span> <span id="version">Unknown</span></div>
-      <button id="refresh-btn">Refresh</button>
-    </div>
-    <script type="module" src="/src/main.js"></script>
+    <p>The real app entry is <code>src/index.html</code> (served by Tauri).</p>
+    <p>For a browser review, open <a href="preview.html">preview.html</a>.</p>
   </body>
 </html>

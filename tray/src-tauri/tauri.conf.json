@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tray",
+  "productName": "Cerberus",
   "version": "0.1.0",
   "identifier": "com.harshita.tray",
   "build": {
@@ -10,9 +10,12 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "tray",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "Cerberus — Mesh Control",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 880,
+        "minHeight": 600
       }
     ],
     "security": {
