@@ -13,11 +13,11 @@ require (
 	github.com/quic-go/quic-go v0.60.0
 	github.com/tetratelabs/wazero v1.12.0
 	github.com/thejerf/suture/v4 v4.0.6
+	github.com/winfsp/cgofuse v1.6.0
 	go.etcd.io/bbolt v1.5.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
-	google.golang.org/protobuf v1.36.6
 )
 
 require (
@@ -110,5 +110,6 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
+	google.golang.org/protobuf v1.36.6 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
