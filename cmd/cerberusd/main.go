@@ -20,6 +20,7 @@ import (
 	"github.com/hash066/cerberus/daemon/api"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/discovery"
+	"github.com/hash066/cerberus/daemon/economy"
 	"github.com/hash066/cerberus/daemon/ffi"
 	"github.com/hash066/cerberus/daemon/gateway"
 	"github.com/hash066/cerberus/daemon/ledger"
@@ -70,8 +71,8 @@ func (r storeRevocations) Revoked(id string) bool {
 }
 func (r storeRevocations) Add(id string) error { return r.s.Put("revocations", id, []byte{1}) }
 
-// The DaemonRPC service and its Status/Run/Nodes/Devices/Wallet/Caps/Conflicts
-// methods live in rpc.go. Every method is capability/token-gated so the control
+// The DaemonRPC service and its Status/Run/Nodes/Devices/Wallet/Caps/Conflicts/
+// EconomyChallenge methods live in rpc.go. Every method is capability/token-gated so the control
 // socket is not an open backdoor.
 
 func main() {
@@ -159,6 +160,12 @@ func main() {
 		}
 	}
 	log.Printf("cerberusd: ledger ready (operator balance=%d, profile=%s)", genBal, *profile)
+
+	// Optimistic compute-settlement layer (vertical 05, ARCHITECTURE §4.3),
+	// wrapping the SAME durable ledger opened above (not a second one) so
+	// SettleCompletedTask/Finalize/Challenge all see one durable escrow + block
+	// clock. This is the Settler the RPC's EconomyChallenge method calls.
+	settler := economy.NewSettler(lg)
 
 	// Lifecycle monitor with the real durable CRDT engine (checkpoints persist).
 	mon := lifecycle.NewMonitor(crdtEngine, []byte("daemon-doc"))
@@ -340,7 +347,7 @@ func main() {
 	// Start RPC server (token-gated). Every method presents the operator token
 	// and is authorized before touching a subsystem. The service borrows the
 	// already-composed objects: mesh fabric, scheduler, wazero executor, durable
-	// ledger + CRDT engine, the metric set, and the 9P device list.
+	// ledger + settler + CRDT engine, the metric set, and the 9P device list.
 	rpcService := &DaemonRPC{
 		authz:     issuer,
 		lifecycle: mon,
@@ -348,6 +355,7 @@ func main() {
 		sched:     sched,
 		exec:      localExec,
 		ledger:    lg,
+		settler:   settler,
 		crdt:      crdtEngine,
 		metrics:   met,
 		daemonDoc: []byte("daemon-doc"),
