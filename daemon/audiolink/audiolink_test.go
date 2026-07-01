@@ -2,6 +2,8 @@ package audiolink
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"io"
 	"testing"
 	"time"
@@ -24,7 +26,11 @@ func TestAudioRidesDataPlane(t *testing.T) {
 	kernel := stub.NewCapKernel()
 	dst := audio.NewBufferSink(format)
 
-	srv := dataplane.NewServer(kernel, time.Now().Unix())
+	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen identity: %v", err)
+	}
+	srv := dataplane.NewServer(kernel, time.Now().Unix(), identity)
 	if err := srv.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("dataplane listen: %v", err)
 	}

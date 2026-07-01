@@ -32,6 +32,14 @@ type DataEndpoint struct {
 	Endpoint string         `json:"endpoint"`
 	StreamID uint64         `json:"stream_id"`
 	Quota    contract.Quota `json:"quota"`
+	// ServerPeerID is the Ed25519 PeerID the data-plane server at Endpoint
+	// presents in its TLS certificate (the daemon's own real mesh identity —
+	// see daemon/system.Compose). The holder dialing this endpoint pins its TLS
+	// handshake to this exact key (daemon/dataplane's Client does this
+	// automatically when it is set), so a MITM cannot substitute its own
+	// certificate for the daemon's on this leg. Empty only if the Granter did
+	// not have a data-plane identity to report.
+	ServerPeerID contract.PeerID `json:"server_peer_id,omitempty"`
 }
 
 // Granter allocates a real data-plane transfer for an opened device control file

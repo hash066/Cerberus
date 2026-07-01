@@ -21,11 +21,17 @@
 //     contract.ErrQuotaExceeded, again before/instead of accepting the payload.
 //
 // What is a STUB / not yet here (not faked):
-//   - TLS uses a self-signed, per-process certificate negotiated over ALPN. This
-//     authenticates the *channel* but does NOT yet pin the peer's Ed25519 PeerID
-//     the way the libp2p mesh path does (HANDOFF.md: full custom-cert mTLS over a
-//     raw non-libp2p data-plane transport is still TODO). The capability — not the
-//     cert — is the authority here, which is the zero-trust invariant.
+//   - TLS now uses a self-signed certificate whose subject key IS the node's
+//     real Ed25519 mesh identity (see tls.go), and a dialer that names the
+//     server's expected PeerID in Endpoint.ServerPeerID gets that key pinned via
+//     VerifyPeerCertificate — a MITM presenting a different key is rejected
+//     before any payload byte is sent (see client.go). What remains a
+//     documented gap: a caller that genuinely does not know the server's PeerID
+//     ahead of the dial (ServerPeerID left zero) cannot pin, and the connection
+//     is then authenticated only by the in-band signed-capability check —
+//     exactly the raw-transport gap daemon/mesh/security.go documents for a
+//     non-libp2p path. This is not silently unsafe: it is the same fallback the
+//     mesh package already documents, called out at each such call site.
 //   - The capability handle travels in-band as an opaque u64 under the demo's
 //     shared-kernel model, matching daemon/mesh/compute.go. Cross-kernel signed
 //     capability transfer (CBOR cap verified against the issuer key) is the same
@@ -81,6 +87,16 @@ type Endpoint struct {
 	// Issuer names the node that minted SignedCap, so the receiver can resolve the
 	// matching (exchanged) public key to Verify under.
 	Issuer contract.PeerID `json:"issuer,omitempty"`
+	// ServerPeerID is the Ed25519 PeerID the Client EXPECTS the data-plane server
+	// at Addr to present in its TLS certificate (see tls.go: the server's cert
+	// subject key is its real mesh identity). When set, Client.Send pins the
+	// TLS handshake to this exact key via VerifyPeerCertificate and rejects the
+	// connection before any payload byte is sent if a different key is
+	// presented — this is what makes the transport resistant to a network MITM
+	// terminating the QUIC/TLS handshake with its own certificate. Left as the
+	// zero PeerID when the caller does not know the server's identity ahead of
+	// the dial; see tls.go's clientTLS doc for what that implies.
+	ServerPeerID contract.PeerID `json:"server_peer_id,omitempty"`
 }
 
 // alpnNextProto is the ALPN protocol id negotiated on the QUIC/TLS handshake. It

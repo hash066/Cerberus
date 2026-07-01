@@ -3,6 +3,8 @@ package system
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"io"
 	"sync"
@@ -14,6 +16,19 @@ import (
 	"github.com/hash066/cerberus/daemon/dataplane"
 	"github.com/hash066/cerberus/daemon/ninep"
 )
+
+// newTestIdentity generates a fresh Ed25519 keypair standing in for a node's
+// real mesh identity, matching daemon/system.Compose's wiring (dp :=
+// dataplane.NewServer(kernel, now, fab.Identity())) without requiring a live
+// mesh fabric in these fast, deterministic fixture tests.
+func newTestIdentity(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen identity: %v", err)
+	}
+	return priv
+}
 
 // fsFixture stands up the /cer/fs bridge exactly as Compose does — a real dfs
 // engine + a real QUIC data plane behind the ninep namespace's FSStore seam — but
@@ -32,7 +47,7 @@ func newFSFixture(t *testing.T) *fsFixture {
 
 	// Daemon-side data-plane receiver + routing sink (the write path streams into
 	// dfs.Put through the router).
-	dp := dataplane.NewServer(kernel, time.Now().Unix())
+	dp := dataplane.NewServer(kernel, time.Now().Unix(), newTestIdentity(t))
 	if err := dp.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("dataplane listen: %v", err)
 	}
@@ -70,11 +85,12 @@ func writeFile(t *testing.T, f *fsFixture, path string, cap contract.CapHandle, 
 		t.Fatalf("OpenFSWrite(%s): %v", path, err)
 	}
 	dpEP := dataplane.Endpoint{
-		Kind:       dataplane.EndpointKind(ep.Kind),
-		Addr:       ep.Endpoint,
-		TransferID: ep.StreamID,
-		Cap:        cap,
-		Quota:      ep.Quota,
+		Kind:         dataplane.EndpointKind(ep.Kind),
+		Addr:         ep.Endpoint,
+		TransferID:   ep.StreamID,
+		Cap:          cap,
+		Quota:        ep.Quota,
+		ServerPeerID: ep.ServerPeerID, // pin the write to the daemon's real identity.
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -91,7 +107,7 @@ func readFile(t *testing.T, f *fsFixture, path string, cap contract.CapHandle, t
 	t.Helper()
 
 	// Caller's own receiver.
-	recvSrv := dataplane.NewServer(f.kernel, time.Now().Unix())
+	recvSrv := dataplane.NewServer(f.kernel, time.Now().Unix(), newTestIdentity(t))
 	if err := recvSrv.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("recv listen: %v", err)
 	}
@@ -123,13 +139,16 @@ func readFile(t *testing.T, f *fsFixture, path string, cap contract.CapHandle, t
 	}
 	recvEP := recvSrv.RegisterGrant(transferID, recvCap, contract.Quota{Bytes: quota})
 
-	// The daemon streams dfs.Get's output to the caller's receiver.
+	// The daemon streams dfs.Get's output to the caller's receiver. ServerPeerID
+	// pins the daemon's dial to the caller's receiver's real identity, proving
+	// the read leg is pinned exactly like the write leg above.
 	err = f.ns.OpenFSRead(path, cap, ninep.RecvEndpoint{
-		Kind:     ninep.EndpointKind(recvEP.Kind),
-		Endpoint: recvEP.Addr,
-		StreamID: recvEP.TransferID,
-		Cap:      recvEP.Cap,
-		Quota:    recvEP.Quota,
+		Kind:         ninep.EndpointKind(recvEP.Kind),
+		Endpoint:     recvEP.Addr,
+		StreamID:     recvEP.TransferID,
+		Cap:          recvEP.Cap,
+		Quota:        recvEP.Quota,
+		ServerPeerID: recvEP.ServerPeerID,
 	})
 	if err != nil {
 		return nil, err
