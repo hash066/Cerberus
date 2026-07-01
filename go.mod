@@ -3,12 +3,14 @@ module github.com/hash066/cerberus
 go 1.25.7
 
 require (
+	github.com/go-ole/go-ole v1.2.6
 	github.com/hugelgupf/p9 v0.4.1
 	github.com/ipfs/go-cid v0.6.1
 	github.com/ipld/go-ipld-prime v0.24.0
 	github.com/klauspost/reedsolomon v1.14.1
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/libp2p/go-libp2p-pubsub v0.16.0
+	github.com/moutend/go-wca v0.3.0
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/quic-go/quic-go v0.60.0
 	github.com/tetratelabs/wazero v1.12.0
@@ -111,5 +113,6 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
+	google.golang.org/protobuf v1.36.6 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )

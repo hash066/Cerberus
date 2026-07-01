@@ -2,7 +2,6 @@ package audio
 
 import (
 	"context"
-	"errors"
 	"testing"
 )
 
@@ -266,13 +265,10 @@ func TestReceiverDropsMalformed(t *testing.T) {
 	}
 }
 
-// The OS capture/playback backends are honest stubs, not fakes.
-func TestOSBackendsAreStubs(t *testing.T) {
-	f := testFormat()
-	if _, err := NewOSCaptureSource(f); !errors.Is(err, ErrOSAudioUnavailable) {
-		t.Fatalf("OS capture should report unavailable, got %v", err)
-	}
-	if _, err := NewOSPlaybackSink(f); !errors.Is(err, ErrOSAudioUnavailable) {
-		t.Fatalf("OS playback should report unavailable, got %v", err)
-	}
-}
+// The OS capture/playback backends are honest: on a platform with no real
+// backend wired in, they are stubs (ErrOSAudioUnavailable) rather than a fake
+// that silently produces audio. This is asserted per-platform:
+//   - os_other_test.go (build tag !windows): stub on every non-Windows build.
+//   - os_windows_test.go (build tag windows): the backend is real WASAPI, so
+//     it either succeeds against a real device or fails with the equally
+//     honest ErrNoAudioDevice — never ErrOSAudioUnavailable.
