@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "cerberus": {
+      "command": "./bin/cerberus-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

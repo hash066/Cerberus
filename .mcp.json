@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "cerberus": {
+      "command": "${CLAUDE_PROJECT_DIR}/bin/cerberus-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
