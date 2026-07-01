@@ -273,7 +273,18 @@ func Run(ctx context.Context, cfg Config) error {
 	// Answer peer component-fetch requests from our own local content store, so
 	// another node whose local cidstore misses can fetch the real bytes from us
 	// (see fetchComponentFromPeers, called from handleComputeSigned on a miss).
-	fab.ServeComponentFetch(cstore)
+	// GATED by a signed capability proving mesh-fabric membership (RightRead on
+	// mesh.MeshFabricResource(meshSite)) — verified against the SAME issuer trust
+	// anchors (resolveIssuerKey) the exec-cap path already exchanges at discovery,
+	// so no separate trust mechanism is introduced. See daemon/mesh/component.go's
+	// package doc comment for why this coarser scope (not a per-component grant)
+	// is the defensible minimum for public, content-addressed component bytes.
+	fab.ServeComponentFetch(
+		cstore,
+		node.resolveIssuerKey,
+		func() int64 { return time.Now().Unix() },
+		auth.RevocationPredicateFromIssuer(nil),
+	)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", node.handleHealth)
@@ -395,6 +406,21 @@ func (s *server) grantExecCap() (contract.CapHandle, []byte, error) {
 		return 0, nil, err
 	}
 	return handle, env, nil
+}
+
+// grantMeshFabricCap mints a signed capability proving MEMBERSHIP on this node's
+// mesh fabric (mesh.MeshFabricResource(meshSite), RightRead) under our own
+// issuer key — the credential a peer presents to ServeComponentFetch's gate. It
+// is self-issued (this node is both the resource owner and the requester of its
+// own component-fetch surface), verified by the OTHER node under our issuer
+// pubkey, which it already holds as a trust anchor from the discovery handshake
+// (the same anchor the exec-cap path uses) — no new exchange mechanism.
+func (s *server) grantMeshFabricCap() ([]byte, error) {
+	g, err := auth.NewGrant(mesh.MeshFabricResource(meshSite), []contract.Right{contract.RightRead}, nil, time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	return s.signer.Issue(g)
 }
 
 // trustIssuer records a peer's base64 Ed25519 issuer pubkey as a trust anchor,
@@ -581,10 +607,19 @@ func (s *server) fetchComponentFromPeers(ctx context.Context, c cid.Cid) ([]byte
 		return nil, fmt.Errorf("component %s not found locally and no mesh peers are known", c)
 	}
 
+	// Mint the mesh-fabric-membership capability once per fetch attempt and
+	// present it to every candidate peer — each peer's ServeComponentFetch gate
+	// Verifies it under OUR issuer pubkey, which it already holds as a trust
+	// anchor from the discovery handshake (see grantMeshFabricCap).
+	membershipCap, err := s.grantMeshFabricCap()
+	if err != nil {
+		return nil, fmt.Errorf("mint mesh-fabric membership cap: %w", err)
+	}
+
 	var errs []string
 	for _, p := range candidates {
 		fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		b, err := s.fabric.RequestComponent(fctx, p.pid, c)
+		b, err := s.fabric.RequestComponent(fctx, p.pid, c, membershipCap, s.issuerID)
 		cancel()
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", p.id, err))

@@ -166,10 +166,23 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	// shard scatters onto a currently-known mesh peer over the real mesh RPC
 	// (daemon/mesh's ServeShards/RequestPutShard/RequestGetShard) instead of
 	// staying on this node — see shardstore.go for the v1 round-robin policy.
-	// ServeShards lets OTHER peers place shards HERE using the same mechanism.
+	// ServeShards lets OTHER peers place shards HERE using the same mechanism,
+	// GATED by a signed capability (daemon/mesh/shard.go): the caller must
+	// present a valid RightWrite/RightRead capability over
+	// mesh.MeshShardResource(site) before any local store access happens. The
+	// signer is keyed off this node's own mesh identity (fab.Identity()) so the
+	// issuer PeerID a minted cap names always equals the PeerID the QUIC/TLS
+	// handshake authenticates for this node's outbound streams — the trust model
+	// shard.go documents (self-issued, stream-bound, since there is no separate
+	// peer-key-exchange/discovery protocol in this daemon to hang a per-peer
+	// grant off of).
+	shardSigner, err := NewShardCapSigner(fab.Identity())
+	if err != nil {
+		return nil, fmt.Errorf("shard cap signer: %w", err)
+	}
 	localShards := dfs.NewMemShardStore()
-	fab.ServeShards(NewLocalShardServer(localShards))
-	scatterShards := NewRemoteScatterShardStore(localShards, fab)
+	fab.ServeShards(NewLocalShardServer(localShards), mesh.SelfIssuerResolver, func() int64 { return time.Now().Unix() }, nil)
+	scatterShards := NewRemoteScatterShardStore(localShards, fab, shardSigner, site)
 
 	fsStore, err := newDFSFSStore(dp, router, scatterShards, meta)
 	if err != nil {

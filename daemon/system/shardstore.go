@@ -11,13 +11,22 @@
 // DefaultParityShards shards per chunk) is what actually keeps the file readable.
 //
 // WHAT IS REAL: when a shard is placed remotely, its bytes are sent over a real
-// mesh request (daemon/mesh's new ServeShards/RequestPutShard/RequestGetShard,
+// mesh request (daemon/mesh's ServeShards/RequestPutShard/RequestGetShard,
 // modeled directly on compute.go's existing request/response-over-libp2p/QUIC
 // pattern) to the chosen peer's OWN RemoteScatterShardStore, which stores them in
 // ITS OWN local dfs.ShardStore — not a local echo. A subsequent Get dials that
 // same peer and fetches the bytes back over the same mesh mechanism. This is
 // genuine cross-node placement: bytes cross the network to another node's dfs
 // store and back.
+//
+// CAPABILITY GATE: every RequestPutShard/RequestGetShard call now mints (or
+// reuses, memoized) a signed capability envelope naming
+// mesh.MeshShardResource(site) with RightWrite (put) or RightRead (get) and
+// attaches it to the wire request — RemoteScatterShardStore is the client that
+// makes the shard RPC's capability gate (daemon/mesh/shard.go) meaningful, not
+// just possible. Without an *auth.SignedCap issuer configured (signer==nil),
+// RemoteScatterShardStore falls back to purely-local placement (never presents
+// an unauthenticated request on the wire) — see WithSignedCapIssuer.
 //
 // Manifest.Placement records, per shard, either "local" (dfs's MemShardStore
 // convention) or "mesh:<base64 Ed25519 PeerID>" so a later read on ANY node that
@@ -26,11 +35,13 @@ package system
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"fmt"
 	"sync/atomic"
 	"time"
 
+	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/dfs"
 	"github.com/hash066/cerberus/daemon/mesh"
 	"github.com/ipfs/go-cid"
@@ -55,6 +66,19 @@ const placementEvery = 3
 // cannot hang a /cer/fs write or read indefinitely.
 const meshShardTimeout = 15 * time.Second
 
+// getShardFanoutCap bounds how many currently-known peers a GetShard local-miss
+// fallback queries concurrently. A mesh with many more peers than this still
+// only probes the first getShardFanoutCap of them per attempt — enough to make a
+// genuine cross-node hit likely without turning "ask everyone" into an O(N)
+// traffic-analysis broadcast of which CIDs this node wants.
+const getShardFanoutCap = 8
+
+// getShardOverallTimeout bounds the ENTIRE fan-out across all queried peers, not
+// each peer individually — replacing the old sequential per-peer timeout (which
+// made a genuine miss take up to N*meshShardTimeout on an N-peer mesh) with a
+// single deadline so a miss fails predictably fast regardless of mesh size.
+const getShardOverallTimeout = 20 * time.Second
+
 // meshFabric is the slice of daemon/mesh's Fabric this package needs: enough to
 // discover peers and run the shard RPC. Declared as a local interface (rather
 // than importing contract.Fabric, which does not carry the shard RPC methods) so
@@ -62,11 +86,32 @@ const meshShardTimeout = 15 * time.Second
 type meshFabric interface {
 	Peers() []contract.PeerInfo
 	PeerID() contract.PeerID
-	RequestPutShard(ctx context.Context, peer contract.PeerID, cidBytes []byte, shard []byte) error
-	RequestGetShard(ctx context.Context, peer contract.PeerID, cidBytes []byte) ([]byte, error)
+	RequestPutShard(ctx context.Context, peer contract.PeerID, cidBytes []byte, shard []byte, capEnvelope []byte, issuer contract.PeerID) error
+	RequestGetShard(ctx context.Context, peer contract.PeerID, cidBytes []byte, capEnvelope []byte, issuer contract.PeerID) ([]byte, error)
 }
 
 var _ meshFabric = (*mesh.Fabric)(nil)
+
+// NewShardCapSigner builds the *auth.SignedCap issuer RemoteScatterShardStore
+// uses to mint shard-placement capabilities, keyed off the SAME Ed25519 keypair
+// as the mesh identity (fabric.Identity()) rather than a separate issuer key.
+// This is required, not a convenience: daemon/mesh's ServeShards binds a shard
+// request's claimed Issuer to the PeerID the QUIC/TLS handshake actually
+// authenticated for the stream (see shard.go's "Issuer trust model" doc
+// comment), so a signer whose IssuerPeerID() differs from this node's own
+// fabric.PeerID() would mint envelopes every peer's gate rejects. Returns
+// (nil, error) if identity is not a valid Ed25519 seed-bearing key (should not
+// happen for a real *mesh.Fabric — see mesh.Fabric.Identity's doc comment).
+func NewShardCapSigner(identity ed25519.PrivateKey) (*auth.SignedCap, error) {
+	if len(identity) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("system: mesh identity is not a usable Ed25519 private key (len=%d)", len(identity))
+	}
+	ks, err := auth.NewMemoryKeyStore(identity.Seed())
+	if err != nil {
+		return nil, fmt.Errorf("system: build shard-cap keystore from mesh identity: %w", err)
+	}
+	return auth.NewSignedCap(ks), nil
+}
 
 // RemoteScatterShardStore implements dfs.ShardStore. It keeps most shards in a
 // local backing store but scatters every Nth shard onto a remote mesh peer
@@ -81,34 +126,84 @@ type RemoteScatterShardStore struct {
 	// to decide whether THIS shard is the one that goes remote, and (mod known
 	// peer count) to pick which peer — a simple round robin.
 	putCount uint64
+
+	// signer/site/issuerID mint the signed capability envelope every remote shard
+	// RPC presents on the wire (see mesh.MeshShardResource). A nil signer means
+	// this store never presents a remote request at all — PutShard/GetShard
+	// behave as pure-local (no unauthenticated wire call is ever made).
+	signer   *auth.SignedCap
+	site     string
+	issuerID contract.PeerID
 }
 
 // NewRemoteScatterShardStore builds a shard store that keeps shards in local
 // (this node's own backing dfs.ShardStore) but scatters every Nth one onto a
 // currently-known mesh peer over the real mesh RPC.
-func NewRemoteScatterShardStore(local dfs.ShardStore, fabric meshFabric) *RemoteScatterShardStore {
-	return &RemoteScatterShardStore{local: local, fabric: fabric}
+//
+// signer mints the signed capability envelope this store attaches to every
+// remote PutShard/GetShard wire call (see mesh.MeshShardResource(site)); site
+// must match the mesh.Config.Site the local ServeShards gate was configured
+// with (Compose passes the same site value to both). A nil signer disables
+// remote placement entirely (PutShard/GetShard fall back to purely local) rather
+// than ever sending an unauthenticated request — fail closed on missing
+// configuration, not fail open.
+func NewRemoteScatterShardStore(local dfs.ShardStore, fabric meshFabric, signer *auth.SignedCap, site string) *RemoteScatterShardStore {
+	r := &RemoteScatterShardStore{local: local, fabric: fabric, signer: signer, site: site}
+	if signer != nil {
+		if id, err := signer.IssuerPeerID(); err == nil {
+			r.issuerID = id
+		} else {
+			// Cannot recover our own issuer PeerID — treat as unconfigured so we never
+			// mint a cap under a zero-value Issuer (which would just fail Verify on the
+			// remote end anyway, but this makes the local intent explicit).
+			r.signer = nil
+		}
+	}
+	return r
+}
+
+// mintShardCap mints a fresh signed capability naming mesh.MeshShardResource(r.site)
+// with the given right. Returns (nil, false) when no signer is configured — the
+// caller must treat that as "cannot make a remote request", never as "make an
+// unauthenticated one".
+func (r *RemoteScatterShardStore) mintShardCap(right contract.Right) ([]byte, bool) {
+	if r.signer == nil {
+		return nil, false
+	}
+	g, err := auth.NewGrant(mesh.MeshShardResource(r.site), []contract.Right{right}, nil, time.Hour)
+	if err != nil {
+		return nil, false
+	}
+	env, err := r.signer.Issue(g)
+	if err != nil {
+		return nil, false
+	}
+	return env, true
 }
 
 // PutShard stores the shard. Every placementEvery-th call, if at least one mesh
-// peer is currently known, the shard is sent to that peer over the real mesh RPC
-// and stored on the peer's own local store instead of this node's; otherwise (or
-// on any remote failure) it falls back to storing locally. The returned
-// placement hint records exactly where the bytes ended up.
+// peer is currently known AND a signed-cap issuer is configured, the shard is
+// sent to that peer over the real mesh RPC (carrying a freshly minted RightWrite
+// capability) and stored on the peer's own local store instead of this node's;
+// otherwise (or on any remote failure) it falls back to storing locally. The
+// returned placement hint records exactly where the bytes ended up.
 func (r *RemoteScatterShardStore) PutShard(c cid.Cid, shard []byte) (string, error) {
 	n := atomic.AddUint64(&r.putCount, 1)
 
 	if n%placementEvery == 0 {
 		if peer, ok := r.pickPeer(); ok {
-			ctx, cancel := context.WithTimeout(context.Background(), meshShardTimeout)
-			defer cancel()
-			if err := r.fabric.RequestPutShard(ctx, peer, c.Bytes(), shard); err == nil {
-				return remotePlacementPrefix + encodePeer(peer), nil
+			if env, ok := r.mintShardCap(contract.RightWrite); ok {
+				ctx, cancel := context.WithTimeout(context.Background(), meshShardTimeout)
+				err := r.fabric.RequestPutShard(ctx, peer, c.Bytes(), shard, env, r.issuerID)
+				cancel()
+				if err == nil {
+					return remotePlacementPrefix + encodePeer(peer), nil
+				}
+				// Remote placement failed (peer unreachable, denied, etc.) — fall back to
+				// local rather than losing the shard. This keeps a write succeeding even
+				// when the chosen peer is momentarily unavailable; it is a documented
+				// availability trade-off, not a silent data-loss path.
 			}
-			// Remote placement failed (peer unreachable, denied, etc.) — fall back to
-			// local rather than losing the shard. This keeps a write succeeding even
-			// when the chosen peer is momentarily unavailable; it is a documented
-			// availability trade-off, not a silent data-loss path.
 		}
 	}
 
@@ -119,35 +214,81 @@ func (r *RemoteScatterShardStore) PutShard(c cid.Cid, shard []byte) (string, err
 	return placement, nil
 }
 
+// getShardResult is one fan-out worker's outcome, for the first-success
+// collector in GetShard.
+type getShardResult struct {
+	data []byte
+	err  error
+	peer contract.PeerID
+}
+
 // GetShard fetches the shard from wherever PutShard placed it: locally, or from
-// the named mesh peer over the real mesh RPC. The CID integrity check the dfs
-// package already performs on every fetched shard (regardless of origin) is what
-// protects against a corrupted or malicious remote response.
+// a currently-known mesh peer over the real mesh RPC. The CID integrity check
+// the dfs package already performs on every fetched shard (regardless of
+// origin) is what protects against a corrupted or malicious remote response.
+//
+// On a local miss, GetShard fans out to up to getShardFanoutCap known peers
+// CONCURRENTLY (not sequentially) and returns as soon as one succeeds, bounding
+// the WHOLE fan-out by getShardOverallTimeout rather than timing out each peer
+// individually — a genuine miss on an N-peer mesh now fails in at most
+// getShardOverallTimeout, not N*meshShardTimeout, and in-flight requests to the
+// remaining peers are cancelled the moment one peer answers instead of
+// broadcasting the wanted CID to every peer in turn regardless of an early hit.
 func (r *RemoteScatterShardStore) GetShard(c cid.Cid) ([]byte, error) {
 	// dfs.ShardStore.GetShard does not carry the placement hint (it is keyed only
 	// by CID), so RemoteScatterShardStore tries its local store first and, on a
-	// miss, asks every currently-known peer in turn. This is correct (the CID
-	// integrity check rejects a wrong answer) if slightly more work than tracking
-	// placement per-CID; see the doc comment on lookupPlacement below for why a
-	// per-CID index is not needed for correctness here.
+	// miss, asks known peers. This is correct (the CID integrity check rejects a
+	// wrong answer) if slightly more work than tracking placement per-CID.
 	if b, err := r.local.GetShard(c); err == nil {
 		return b, nil
 	}
 
+	env, ok := r.mintShardCap(contract.RightRead)
+	if !ok {
+		return nil, fmt.Errorf("dfs: shard %s not found locally and no signed-cap issuer is configured for a remote fetch", c)
+	}
+
+	peers := r.fabric.Peers()
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("dfs: shard %s not found (no mesh peers known)", c)
+	}
+	if len(peers) > getShardFanoutCap {
+		peers = peers[:getShardFanoutCap]
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), getShardOverallTimeout)
+	defer cancel()
+
+	results := make(chan getShardResult, len(peers))
+	for _, p := range peers {
+		go func(peer contract.PeerID) {
+			b, err := r.fabric.RequestGetShard(ctx, peer, c.Bytes(), env, r.issuerID)
+			select {
+			case results <- getShardResult{data: b, err: err, peer: peer}:
+			case <-ctx.Done():
+			}
+		}(p.ID)
+	}
+
 	var lastErr error
-	for _, peer := range r.fabric.Peers() {
-		ctx, cancel := context.WithTimeout(context.Background(), meshShardTimeout)
-		b, err := r.fabric.RequestGetShard(ctx, peer.ID, c.Bytes())
-		cancel()
-		if err == nil {
-			return b, nil
+	for i := 0; i < len(peers); i++ {
+		select {
+		case res := <-results:
+			if res.err == nil {
+				return res.data, nil
+			}
+			lastErr = res.err
+		case <-ctx.Done():
+			if lastErr != nil {
+				return nil, fmt.Errorf("dfs: shard %s not found locally or on %d queried peer(s) within %s: %w", c, len(peers), getShardOverallTimeout, lastErr)
+			}
+			return nil, fmt.Errorf("dfs: shard %s not found locally or on %d queried peer(s) within %s: %w", c, len(peers), getShardOverallTimeout, ctx.Err())
 		}
-		lastErr = err
 	}
 	if lastErr != nil {
-		return nil, fmt.Errorf("dfs: shard %s not found locally or on %d known peer(s): %w", c, len(r.fabric.Peers()), lastErr)
+		return nil, fmt.Errorf("dfs: shard %s not found locally or on %d queried peer(s): %w", c, len(peers), lastErr)
 	}
-	return nil, fmt.Errorf("dfs: shard %s not found (no mesh peers known)", c)
+	return nil, fmt.Errorf("dfs: shard %s not found on %d queried peer(s)", c, len(peers))
 }
 
 // pickPeer returns the next peer in round-robin order over the currently-known
