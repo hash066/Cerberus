@@ -7,6 +7,7 @@ import (
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/contract/go/stub"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 func TestMatchKey(t *testing.T) {
@@ -100,6 +101,40 @@ func TestTwoNodeExchange(t *testing.T) {
 
 	if len(a.Peers()) == 0 {
 		t.Fatal("node A reports no peers after connect")
+	}
+}
+
+// TestDialableAddrsRoundTripsThroughAddrInfoFromString proves DialableAddrs
+// returns strings that are actually usable as a bootstrap address (the
+// documented contract: "each of which round-trips through
+// peer.AddrInfoFromString"), and that they name the right peer — a caller
+// (e.g. an out-of-band bootstrap exchange) that copies one of these strings
+// must resolve back to this exact node's PeerID.
+func TestDialableAddrsRoundTripsThroughAddrInfoFromString(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping networked mesh test in -short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	f, err := New(ctx, Config{Site: "test", Kernel: stub.NewCapKernel()})
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	defer f.Close()
+
+	addrs := f.DialableAddrs()
+	if len(addrs) == 0 {
+		t.Fatal("DialableAddrs returned no addresses for a listening node")
+	}
+	for _, s := range addrs {
+		ai, err := peer.AddrInfoFromString(s)
+		if err != nil {
+			t.Fatalf("DialableAddrs produced a non-parseable address %q: %v", s, err)
+		}
+		if ai.ID != f.host.ID() {
+			t.Fatalf("parsed AddrInfo names peer %s, want this node's own id %s", ai.ID, f.host.ID())
+		}
 	}
 }
 
