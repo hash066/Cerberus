@@ -16,12 +16,24 @@
 //   - READ: the daemon holds the bytes, so it is the SENDER — it dials the
 //     receiver the caller supplied and streams dfs.Get's output to it.
 //
-// DOCUMENTED STUBS (later steps, not faked):
-//   - The path→Manifest map (MemMetaStore) is in-memory. A durable, transactional
-//     metadata store (names, sizes, concurrent-write locks — vertical 04 §3) is
-//     the next step.
-//   - Shard placement is dfs's MemShardStore (single node). Peer scatter over the
-//     data plane is the next step (dfs.ShardStore + Manifest.Placement).
+// DURABILITY (this step): the path→Manifest map is now backed by daemon/store
+// (bbolt) via BoltMetaStore, mirroring the persistence idiom already established
+// in daemon/ledger/ledger.go (a bucket name constant, JSON-marshaled values,
+// store.Get/store.Put/store.Keys). MemMetaStore is kept for tests/fixtures that
+// do not want an on-disk file, but Compose now wires the durable store so the
+// path→Manifest mapping survives a daemon restart. See metastore.go.
+//
+// PEER SCATTER (this step): shard placement can now put SOME shards on a remote
+// mesh peer and fetch them back over a real mesh RPC (daemon/mesh, modeled
+// directly on compute.go's request/response pattern), instead of always keeping
+// every shard on this node. See shardstore.go for the v1 round-robin placement
+// policy; Manifest.Placement records, per shard, either "local" or "mesh:<peer>"
+// so a later read knows where to fetch from.
+//
+// DOCUMENTED STUB (still true): the shard placement policy is a simple
+// round-robin over currently-known mesh peers — no load balancing, no
+// failure-aware rebalancing, no re-replication on peer loss. That remains a
+// later step; see shardstore.go.
 
 package system
 
@@ -42,12 +54,21 @@ import (
 // ceiling, not a silent unbounded grant.
 const fsWriteQuota uint64 = 256 << 20 // 256 MiB
 
+// MetaStore is the path→Manifest seam dfsFSStore uses. MemMetaStore (below) and
+// BoltMetaStore (metastore.go) both implement it; Compose wires the durable
+// BoltMetaStore, tests/fixtures may use either.
+type MetaStore interface {
+	// Put durably records the manifest for path (overwriting any prior file at
+	// that path).
+	Put(path string, man dfs.Manifest) error
+	// Get returns the manifest for path, or false if no file was written there.
+	Get(path string) (dfs.Manifest, bool)
+}
+
 // MemMetaStore maps a /cer/fs path to the dfs Manifest of the file stored there.
-// It is the in-memory metadata store for v0.1.
-//
-// DOCUMENTED STUB: a durable, transactional metadata store with concurrent-write
-// locks (vertical 04 §3) is the next step. This map loses its entries on restart
-// and offers no cross-write isolation beyond a mutex.
+// It is the in-memory metadata store: entries do not survive a restart. Kept for
+// fast, dependency-free tests/fixtures; Compose wires BoltMetaStore (metastore.go)
+// for the durable path.
 type MemMetaStore struct {
 	mu   sync.RWMutex
 	byID map[string]dfs.Manifest
@@ -59,10 +80,11 @@ func NewMemMetaStore() *MemMetaStore {
 }
 
 // Put records the manifest for path (overwriting any prior file at that path).
-func (m *MemMetaStore) Put(path string, man dfs.Manifest) {
+func (m *MemMetaStore) Put(path string, man dfs.Manifest) error {
 	m.mu.Lock()
 	m.byID[path] = man
 	m.mu.Unlock()
+	return nil
 }
 
 // Get returns the manifest for path, or false if no file was written there.
@@ -72,6 +94,8 @@ func (m *MemMetaStore) Get(path string) (dfs.Manifest, bool) {
 	m.mu.RUnlock()
 	return man, ok
 }
+
+var _ MetaStore = (*MemMetaStore)(nil)
 
 // sinkRouter is the daemon's single data-plane Sink. The data-plane server calls
 // it with (transferID, reader) for every authorized inbound transfer; the router
@@ -125,17 +149,23 @@ type dfsFSStore struct {
 	dp     *dataplane.Server
 	router *sinkRouter
 	client *dataplane.Client
-	meta   *MemMetaStore
+	meta   MetaStore
 }
 
-// newDFSFSStore builds the /cer/fs backend over an in-memory shard store (v0.1).
-//
-// DOCUMENTED STUB: MemShardStore keeps every shard in this process's memory. Peer
-// scatter (placing shards on remote peers' free space and fetching over the data
-// plane) is the next step — dfs already carries the placement hints in the
-// Manifest for it.
-func newDFSFSStore(dp *dataplane.Server, router *sinkRouter) (*dfsFSStore, error) {
-	fs, err := dfs.New(dfs.NewMemShardStore(), dfs.DefaultConfig())
+// newDFSFSStore builds the /cer/fs backend over the given ShardStore and
+// MetaStore. Passing nil for either falls back to the v0.1 in-memory default
+// (dfs.NewMemShardStore / NewMemMetaStore), which keeps existing callers (tests,
+// fixtures) working unchanged. Compose passes a durable BoltMetaStore and a
+// mesh-backed remote ShardStore (see metastore.go / shardstore.go) for the real
+// daemon path.
+func newDFSFSStore(dp *dataplane.Server, router *sinkRouter, shards dfs.ShardStore, meta MetaStore) (*dfsFSStore, error) {
+	if shards == nil {
+		shards = dfs.NewMemShardStore()
+	}
+	if meta == nil {
+		meta = NewMemMetaStore()
+	}
+	fs, err := dfs.New(shards, dfs.DefaultConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +174,7 @@ func newDFSFSStore(dp *dataplane.Server, router *sinkRouter) (*dfsFSStore, error
 		dp:     dp,
 		router: router,
 		client: dataplane.NewClient(),
-		meta:   NewMemMetaStore(),
+		meta:   meta,
 	}, nil
 }
 
@@ -166,8 +196,7 @@ func (s *dfsFSStore) BeginWrite(path string, cap contract.CapHandle, transferID 
 		if err != nil {
 			return err
 		}
-		s.meta.Put(path, man)
-		return nil
+		return s.meta.Put(path, man)
 	})
 
 	return ninep.DataEndpoint{
@@ -177,6 +206,12 @@ func (s *dfsFSStore) BeginWrite(path string, cap contract.CapHandle, transferID 
 		Quota:        ep.Quota,
 		ServerPeerID: ep.ServerPeerID, // the daemon's own real identity; the caller pins its dial to it.
 	}, nil
+}
+
+// manifestFor returns the Manifest recorded for path, for white-box tests that
+// need to inspect placement without going through a full data-plane read.
+func (s *dfsFSStore) manifestFor(path string) (dfs.Manifest, bool) {
+	return s.meta.Get(path)
 }
 
 // BeginRead resolves path to its Manifest, reconstructs the file with dfs.Get,

@@ -13,9 +13,11 @@ import (
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/dataplane"
+	"github.com/hash066/cerberus/daemon/dfs"
 	"github.com/hash066/cerberus/daemon/mesh"
 	"github.com/hash066/cerberus/daemon/ninep"
 	"github.com/hash066/cerberus/daemon/scheduler"
+	"github.com/hash066/cerberus/daemon/store"
 	"github.com/hash066/cerberus/daemon/supervisor"
 	"github.com/hash066/cerberus/daemon/telemetry"
 )
@@ -38,12 +40,27 @@ type System struct {
 	DataPlaneAddr string
 	tree          *supervisor.Tree
 	traceShutdown func(context.Context) error
+
+	// fsStore and localShards are kept for white-box tests (same package) that
+	// need to inspect the /cer/fs Manifest a write produced or a node's own local
+	// shard store directly — e.g. to prove a shard genuinely left this node for a
+	// remote peer, rather than merely that a file round-trips (which would also
+	// pass under an all-local placement bug). Not part of the public API.
+	fsStore     *dfsFSStore
+	localShards *dfs.MemShardStore
 }
 
 // Compose wires every subsystem together against the frozen contract. The
 // capability kernel authorizes the mesh, telemetry, and namespace; nothing acts
 // on ambient authority.
-func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*System, error) {
+//
+// db is the daemon's single embedded bbolt store (see daemon/store,
+// cmd/cerberusd/main.go) used to durably persist the /cer/fs path→Manifest
+// mapping (BoltMetaStore, metastore.go) across a restart. Passing nil falls back
+// to an in-memory metadata store (entries do not survive a restart) — useful for
+// a caller that has no on-disk store to offer (e.g. an ephemeral test harness);
+// the live daemon always passes its real store.
+func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *store.Store) (*System, error) {
 	// Real intra-site mesh: libp2p + QUIC + mDNS, capability-gated.
 	fab, err := mesh.New(ctx, mesh.Config{Site: site, Kernel: kernel, EnableMDNS: true})
 	if err != nil {
@@ -130,16 +147,31 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 	ns.Register("/cer/dev/vram/local/0",
 		contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/local/0", Quota: &q})
 
-	// /cer/fs — the distributed filesystem, backed by the dfs engine (Phase G2)
-	// scattering shards into an in-memory ShardStore for v0.1. A write streams the
-	// file bytes over the data plane into dfs.Put and records the returned Manifest
-	// keyed by the path; a read resolves the path to its Manifest, runs dfs.Get,
-	// and streams the reconstructed bytes back over the data plane. Bulk file bytes
-	// ride the data plane, never 9P (ARCHITECTURE.md §3.5).
-	//   NEXT STEPS (labelled): the path→Manifest map (MemMetaStore) is in-memory —
-	//   a durable, transactional metadata store is next; and MemShardStore keeps
-	//   shards on this node — peer scatter over the data plane is next.
-	fsStore, err := newDFSFSStore(dp, router)
+	// /cer/fs — the distributed filesystem, backed by the dfs engine (Phase G2). A
+	// write streams the file bytes over the data plane into dfs.Put and durably
+	// records the returned Manifest keyed by the path; a read resolves the path to
+	// its Manifest, runs dfs.Get, and streams the reconstructed bytes back over the
+	// data plane. Bulk file bytes ride the data plane, never 9P (ARCHITECTURE.md
+	// §3.5).
+	//
+	// Metadata durability: the path→Manifest map is BoltMetaStore (bbolt-backed,
+	// metastore.go) when db is non-nil, so it survives a daemon restart; nil falls
+	// back to the in-memory MemMetaStore.
+	var meta MetaStore
+	if db != nil {
+		meta = NewBoltMetaStore(db)
+	}
+
+	// Shard placement: this node's own local shard store, wrapped so every Nth
+	// shard scatters onto a currently-known mesh peer over the real mesh RPC
+	// (daemon/mesh's ServeShards/RequestPutShard/RequestGetShard) instead of
+	// staying on this node — see shardstore.go for the v1 round-robin policy.
+	// ServeShards lets OTHER peers place shards HERE using the same mechanism.
+	localShards := dfs.NewMemShardStore()
+	fab.ServeShards(NewLocalShardServer(localShards))
+	scatterShards := NewRemoteScatterShardStore(localShards, fab)
+
+	fsStore, err := newDFSFSStore(dp, router, scatterShards, meta)
 	if err != nil {
 		return nil, fmt.Errorf("dfs fs store: %w", err)
 	}
@@ -220,6 +252,8 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 		DataPlaneAddr: dp.Addr(),
 		tree:          tree,
 		traceShutdown: traceShutdown,
+		fsStore:       fsStore,
+		localShards:   localShards,
 	}, nil
 }
 

@@ -56,7 +56,7 @@ func newFSFixture(t *testing.T) *fsFixture {
 	done := make(chan struct{})
 	go func() { _ = dp.Serve(ctx, router.route); close(done) }()
 
-	fsStore, err := newDFSFSStore(dp, router)
+	fsStore, err := newDFSFSStore(dp, router, nil, nil)
 	if err != nil {
 		t.Fatalf("dfs fs store: %v", err)
 	}
