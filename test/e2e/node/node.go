@@ -68,6 +68,13 @@ type Config struct {
 	PeerAddrs  []string
 	Ready      io.Writer
 	Log        io.Writer
+	// SkipHelloShardSeed, if true, does NOT pre-populate this node's content
+	// store with the hello-shard bytes. It exists so a test can prove the
+	// mesh peer-component-fetch path is real: a node built with this set must
+	// fetch the component from a peer over the mesh rather than already
+	// having it cached locally. The production e2e demo (test/e2e) leaves
+	// this false, matching its historical both-nodes-embed-the-bytes setup.
+	SkipHelloShardSeed bool
 }
 
 // Peer is a discovered node. Addr is its HTTP control URL; MeshPeerID is the
@@ -213,12 +220,17 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("issuer id: %w", err)
 	}
 
-	// Content-addressed component store: both demo nodes embed the hello-shard
-	// bytes and register them by CID, so the worker resolves the task's CID
-	// against the store (integrity-checked) rather than trusting wire bytes.
+	// Content-addressed component store: the worker resolves a task's CID
+	// against the store (integrity-checked) rather than trusting wire bytes. By
+	// default both demo nodes embed the hello-shard bytes and register them by
+	// CID up front (the historical v0.1 setup). SkipHelloShardSeed lets a test
+	// build a node that starts WITHOUT the bytes, to prove the peer-fetch path
+	// below is what actually supplies them.
 	cstore := wasm.NewContentStore()
-	if _, err := cstore.Put(HelloShardWASM()); err != nil {
-		return fmt.Errorf("seed content store: %w", err)
+	if !cfg.SkipHelloShardSeed {
+		if _, err := cstore.Put(HelloShardWASM()); err != nil {
+			return fmt.Errorf("seed content store: %w", err)
+		}
 	}
 
 	addr := "http://" + listener.Addr().String()
@@ -258,6 +270,10 @@ func Run(ctx context.Context, cfg Config) error {
 		auth.RevocationPredicateFromIssuer(nil), // no revocation store wired in the demo
 		contract.RightExec,
 	)
+	// Answer peer component-fetch requests from our own local content store, so
+	// another node whose local cidstore misses can fetch the real bytes from us
+	// (see fetchComponentFromPeers, called from handleComputeSigned on a miss).
+	fab.ServeComponentFetch(cstore)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", node.handleHealth)
@@ -523,7 +539,15 @@ func (s *server) handleComputeSigned(ctx context.Context, task contract.ComputeT
 	}
 	component, err := s.store.Get(c)
 	if err != nil {
-		return failResult(task.TaskID, err.Error()), nil
+		// Local miss: try fetching the bytes from a known mesh peer before giving
+		// up. This is the real p2p fetch path (daemon/mesh.RequestComponent) —
+		// the peer's returned bytes are re-hashed and verified against c before
+		// they are trusted, then cached locally so a later lookup is a local hit.
+		fetched, ferr := s.fetchComponentFromPeers(ctx, c)
+		if ferr != nil {
+			return failResult(task.TaskID, fmt.Sprintf("%v (peer fetch also failed: %v)", err, ferr)), nil
+		}
+		component = fetched
 	}
 
 	// Run the resolved wasm via the real wazero engine.
@@ -538,6 +562,68 @@ func (s *server) handleComputeSigned(ctx context.Context, task contract.ComputeT
 		OK:     true,
 		Output: []byte(strconv.Itoa(value)),
 	}, nil
+}
+
+// fetchComponentFromPeers is the "missing-component" fallback: it tries every
+// currently-known mesh peer, in turn, asking each for the bytes behind c via
+// daemon/mesh.RequestComponent (which itself verifies the returned bytes hash
+// to c before returning them — a peer cannot hand back a substituted
+// payload). The first peer that has it wins; the bytes are then cached in
+// this node's own content store so a subsequent lookup for the same CID is a
+// local hit. If no known peer has it, a clear aggregate error is returned —
+// never a hang or a panic.
+func (s *server) fetchComponentFromPeers(ctx context.Context, c cid.Cid) ([]byte, error) {
+	if s.fabric == nil {
+		return nil, fmt.Errorf("no mesh fabric composed on this node")
+	}
+	candidates := s.peerIDs()
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("component %s not found locally and no mesh peers are known", c)
+	}
+
+	var errs []string
+	for _, p := range candidates {
+		fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		b, err := s.fabric.RequestComponent(fctx, p.pid, c)
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", p.id, err))
+			continue
+		}
+		// Populate the local store so future lookups for this CID are local hits.
+		if _, perr := s.store.Put(b); perr != nil {
+			errs = append(errs, fmt.Sprintf("%s: fetched but failed to cache: %v", p.id, perr))
+			continue
+		}
+		s.log.Printf("%s fetched component %s from peer %s over the mesh (%d bytes)", s.self.ID, c, p.id, len(b))
+		return b, nil
+	}
+	return nil, fmt.Errorf("component %s not found on any of %d known peer(s): %s", c, len(candidates), strings.Join(errs, "; "))
+}
+
+// peerCandidate pairs a peer's human id with its mesh PeerID, for logging.
+type peerCandidate struct {
+	id  string
+	pid contract.PeerID
+}
+
+// peerIDs returns the mesh PeerIDs of all currently-known peers that have
+// completed discovery (i.e. have a usable mesh identity).
+func (s *server) peerIDs() []peerCandidate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]peerCandidate, 0, len(s.peers))
+	for _, p := range s.peers {
+		if p.MeshPeerID == "" {
+			continue
+		}
+		pid, err := decodePeerID(p.MeshPeerID)
+		if err != nil {
+			continue
+		}
+		out = append(out, peerCandidate{id: p.ID, pid: pid})
+	}
+	return out
 }
 
 func (s *server) discoveryLoop(ctx context.Context) {
