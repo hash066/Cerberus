@@ -15,6 +15,7 @@
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
+use std::panic::{self, AssertUnwindSafe};
 use std::slice;
 use std::sync::{Mutex, OnceLock};
 
@@ -22,6 +23,33 @@ use cerberus_contract::{CapId, CapKernel, Caveat, Quota, ResourceKind, ResourceR
 use cerberus_crdt::RevocationSet;
 use cerberus_ocap::SignedKernel;
 use cerberus_runtime::{BlockStore, Cid};
+
+/// Panic-safety guard for the FFI boundary (production-readiness hardening):
+/// a Rust panic must never unwind across an `extern "C"` fn into Go via cgo —
+/// that is undefined behavior per Rust's FFI-unwind rules (Go has no matching
+/// mechanism to catch a Rust panic, so the process could corrupt memory or
+/// crash unpredictably instead of failing cleanly).
+///
+/// Every exported function's body is wrapped with this guard. `f` is run under
+/// `catch_unwind`; on a caught panic, `default` is returned instead — the
+/// *same* sentinel value that function's own doc comment already documents as
+/// its ordinary (non-panic) failure return, so a caller cannot distinguish
+/// "panic" from "logic error" and gains no new failure mode to handle.
+///
+/// Closures here often capture a `MutexGuard` or borrow a `&'static Mutex<_>`
+/// across the call, neither of which is `UnwindSafe` by default (the compiler
+/// can't prove a mid-mutation panic leaves the guarded data in a consistent
+/// state). We assert unwind-safety deliberately: our engines are monotone
+/// grow-only structures (OR-set revoke/merge) or process singletons behind an
+/// internally-synchronized kernel, and on any caught panic we always return
+/// the failure sentinel rather than continue using partially-mutated state, so
+/// a torn intermediate value can never leak to the caller.
+fn guard<F, R>(default: R, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
+}
 
 /// Length in bytes of the self-describing CID binary form (`Cid::to_bytes`).
 const CID_LEN: usize = 36;
@@ -48,6 +76,22 @@ fn blockstore() -> &'static BlockStore {
 fn revocations() -> &'static Mutex<RevocationSet> {
     static R: OnceLock<Mutex<RevocationSet>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(RevocationSet::new()))
+}
+
+/// Lock `revocations()`, recovering from mutex poisoning instead of panicking.
+///
+/// `RevocationSet` is a monotone grow-only OR-set (`revoke`/`merge` only ever
+/// add elements and are individually idempotent), so a panic that occurred
+/// while some *other* caller held this lock cannot leave the set in a state
+/// that is unsafe to keep using — at worst a single in-flight insert was lost,
+/// which convergence (re-merge) or a future `revoke` call already tolerates.
+/// Recovering here (rather than treating "poisoned" as its own guarded-error
+/// case) keeps the revocation set live across an unrelated panic instead of
+/// wedging every future call behind the same guard's failure sentinel.
+fn revocations_lock() -> std::sync::MutexGuard<'static, RevocationSet> {
+    revocations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // Rights bitmask — must match cerberus.h and daemon/ffi/kernel_ffi.go.
@@ -114,13 +158,16 @@ fn max_bytes_caveats(max: u64) -> Vec<Caveat> {
 /// Contract version (static, never freed).
 #[no_mangle]
 pub extern "C" fn cerberus_version() -> *const c_char {
-    c"0.1.0".as_ptr()
+    // No documented error sentinel exists (this always succeeds), but every
+    // exported fn is wrapped for defense-in-depth/consistency; null is a safe,
+    // clearly-invalid pointer a Go caller would need to null-check anyway.
+    guard(std::ptr::null(), || c"0.1.0".as_ptr())
 }
 
 /// Backend identifier surfaced by the daemon status (static, never freed).
 #[no_mangle]
 pub extern "C" fn cerberus_backend() -> *const c_char {
-    c"rust-signed-cabi".as_ptr()
+    guard(std::ptr::null(), || c"rust-signed-cabi".as_ptr())
 }
 
 /// Copy this node's 32-byte issuer key (root of trust) into `out`. 0 on success,
@@ -130,12 +177,17 @@ pub extern "C" fn cerberus_backend() -> *const c_char {
 /// `out` must point to a writable buffer of at least 32 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn cerberus_issuer(out: *mut u8) -> c_int {
-    if out.is_null() {
-        return 1;
-    }
-    let iss = kernel().issuer();
-    std::ptr::copy_nonoverlapping(iss.as_ptr(), out, 32);
-    0
+    // SAFETY: the raw-pointer precondition is on the caller per the fn's own
+    // `# Safety` doc; guard() only adds panic-safety around the body below, it
+    // does not change (or re-check) that contract.
+    guard(1, || {
+        if out.is_null() {
+            return 1;
+        }
+        let iss = kernel().issuer();
+        std::ptr::copy_nonoverlapping(iss.as_ptr(), out, 32);
+        0
+    })
 }
 
 /// Mint a signed root capability. `kind` is a resource-kind enum; `rights` a
@@ -151,30 +203,36 @@ pub extern "C" fn cerberus_cap_mint(
     now_unix: u64,
     ttl_secs: u64,
 ) -> u64 {
-    let resource = ResourceRef {
-        kind: kind_from_u32(kind),
-        node: [0u8; 32],
-        path: String::from("/cer/dev/local"),
-        quota: Some(Quota {
-            bytes: quota_bytes,
-            flops: 0,
-            secs: 0,
-        }),
-    };
-    let ttl = if ttl_secs == 0 { None } else { Some(ttl_secs) };
-    kernel().mint_root(
-        resource,
-        &rights_from_mask(rights),
-        &max_bytes_caveats(max_caveat),
-        now_unix,
-        ttl,
-    )
+    guard(0, || {
+        let resource = ResourceRef {
+            kind: kind_from_u32(kind),
+            node: [0u8; 32],
+            path: String::from("/cer/dev/local"),
+            quota: Some(Quota {
+                bytes: quota_bytes,
+                flops: 0,
+                secs: 0,
+            }),
+        };
+        let ttl = if ttl_secs == 0 { None } else { Some(ttl_secs) };
+        kernel().mint_root(
+            resource,
+            &rights_from_mask(rights),
+            &max_bytes_caveats(max_caveat),
+            now_unix,
+            ttl,
+        )
+    })
 }
 
 /// Back-compat convenience: mint a VRAM read|alloc capability scoped to `bytes`.
 #[no_mangle]
 pub extern "C" fn cerberus_cap_mint_vram(bytes: u64) -> u64 {
-    cerberus_cap_mint(0, RIGHT_READ | RIGHT_ALLOC, bytes, 0, 0, 0)
+    // cerberus_cap_mint is itself guard()-wrapped; this extra layer is
+    // defense-in-depth so every exported fn is independently panic-safe.
+    guard(0, || {
+        cerberus_cap_mint(0, RIGHT_READ | RIGHT_ALLOC, bytes, 0, 0, 0)
+    })
 }
 
 /// Attenuate `parent`: drop `drop_rights` (bitmask) and add a `max_bytes` caveat
@@ -182,13 +240,15 @@ pub extern "C" fn cerberus_cap_mint_vram(bytes: u64) -> u64 {
 /// walks back to `parent`. Returns a new handle (>0), 0 on error.
 #[no_mangle]
 pub extern "C" fn cerberus_cap_attenuate(parent: u64, drop_rights: u32, max_caveat: u64) -> u64 {
-    kernel()
-        .attenuate(
-            parent,
-            &rights_from_mask(drop_rights),
-            &max_bytes_caveats(max_caveat),
-        )
-        .unwrap_or(0)
+    guard(0, || {
+        kernel()
+            .attenuate(
+                parent,
+                &rights_from_mask(drop_rights),
+                &max_bytes_caveats(max_caveat),
+            )
+            .unwrap_or(0)
+    })
 }
 
 /// Verify `handle` authorizes `op` at `now_unix` (full signature + attenuation
@@ -204,30 +264,32 @@ pub unsafe extern "C" fn cerberus_cap_verify(
     op: *const c_char,
     now_unix: u64,
 ) -> c_int {
-    let op = if op.is_null() {
-        ""
-    } else {
-        CStr::from_ptr(op).to_str().unwrap_or("")
-    };
-    match kernel().verify(handle, op, now_unix) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
+    guard(1, || {
+        let op = if op.is_null() {
+            ""
+        } else {
+            CStr::from_ptr(op).to_str().unwrap_or("")
+        };
+        match kernel().verify(handle, op, now_unix) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        }
+    })
 }
 
 /// Revoke `handle` (invalidating any child whose chain runs through it). 0 on success.
 #[no_mangle]
 pub extern "C" fn cerberus_cap_revoke(handle: u64) -> c_int {
-    match kernel().revoke(handle) {
+    guard(1, || match kernel().revoke(handle) {
         Ok(()) => 0,
         Err(_) => 1,
-    }
+    })
 }
 
 /// Report whether `handle` is revoked (or unknown). 1 = revoked/unknown, 0 = live.
 #[no_mangle]
 pub extern "C" fn cerberus_cap_is_revoked(handle: u64) -> c_int {
-    c_int::from(kernel().is_revoked(handle))
+    guard(1, || c_int::from(kernel().is_revoked(handle)))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,18 +316,20 @@ pub unsafe extern "C" fn cerberus_blockstore_put(
     len: usize,
     cid_out: *mut u8,
 ) -> c_int {
-    if cid_out.is_null() || (data.is_null() && len != 0) {
-        return 1;
-    }
-    let bytes = if len == 0 {
-        Vec::new()
-    } else {
-        slice::from_raw_parts(data, len).to_vec()
-    };
-    let cid = blockstore().put(bytes);
-    let encoded = cid.to_bytes(); // exactly CID_LEN bytes
-    std::ptr::copy_nonoverlapping(encoded.as_ptr(), cid_out, CID_LEN);
-    0
+    guard(1, || {
+        if cid_out.is_null() || (data.is_null() && len != 0) {
+            return 1;
+        }
+        let bytes = if len == 0 {
+            Vec::new()
+        } else {
+            slice::from_raw_parts(data, len).to_vec()
+        };
+        let cid = blockstore().put(bytes);
+        let encoded = cid.to_bytes(); // exactly CID_LEN bytes
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), cid_out, CID_LEN);
+        0
+    })
 }
 
 /// Length in bytes of the block named by the 36-byte CID at `cid`, or -1 if the
@@ -276,17 +340,19 @@ pub unsafe extern "C" fn cerberus_blockstore_put(
 /// `cid` must point to at least 36 (`CID_LEN`) readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn cerberus_blockstore_get_len(cid: *const u8) -> isize {
-    if cid.is_null() {
-        return -1;
-    }
-    let cid_bytes = slice::from_raw_parts(cid, CID_LEN);
-    let Some(parsed) = Cid::from_bytes(cid_bytes) else {
-        return -1;
-    };
-    match blockstore().get(&parsed) {
-        Some(bytes) => bytes.len() as isize,
-        None => -1,
-    }
+    guard(-1, || {
+        if cid.is_null() {
+            return -1;
+        }
+        let cid_bytes = slice::from_raw_parts(cid, CID_LEN);
+        let Some(parsed) = Cid::from_bytes(cid_bytes) else {
+            return -1;
+        };
+        match blockstore().get(&parsed) {
+            Some(bytes) => bytes.len() as isize,
+            None => -1,
+        }
+    })
 }
 
 /// Copy the block named by the 36-byte CID at `cid` into `out` (capacity `cap`).
@@ -303,21 +369,23 @@ pub unsafe extern "C" fn cerberus_blockstore_get(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    if cid.is_null() || out.is_null() {
-        return -1;
-    }
-    let cid_bytes = slice::from_raw_parts(cid, CID_LEN);
-    let Some(parsed) = Cid::from_bytes(cid_bytes) else {
-        return -1;
-    };
-    let Some(bytes) = blockstore().get(&parsed) else {
-        return -1;
-    };
-    if bytes.len() > cap {
-        return -1; // caller's buffer is too small; re-query the length
-    }
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
-    bytes.len() as isize
+    guard(-1, || {
+        if cid.is_null() || out.is_null() {
+            return -1;
+        }
+        let cid_bytes = slice::from_raw_parts(cid, CID_LEN);
+        let Some(parsed) = Cid::from_bytes(cid_bytes) else {
+            return -1;
+        };
+        let Some(bytes) = blockstore().get(&parsed) else {
+            return -1;
+        };
+        if bytes.len() > cap {
+            return -1; // caller's buffer is too small; re-query the length
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+        bytes.len() as isize
+    })
 }
 
 /// Whether the store holds a block for the 36-byte CID at `cid`. 1 = present,
@@ -327,14 +395,16 @@ pub unsafe extern "C" fn cerberus_blockstore_get(
 /// `cid` must point to at least 36 (`CID_LEN`) readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn cerberus_blockstore_has(cid: *const u8) -> c_int {
-    if cid.is_null() {
-        return 0;
-    }
-    let cid_bytes = slice::from_raw_parts(cid, CID_LEN);
-    match Cid::from_bytes(cid_bytes) {
-        Some(parsed) => c_int::from(blockstore().has(&parsed)),
-        None => 0,
-    }
+    guard(0, || {
+        if cid.is_null() {
+            return 0;
+        }
+        let cid_bytes = slice::from_raw_parts(cid, CID_LEN);
+        match Cid::from_bytes(cid_bytes) {
+            Some(parsed) => c_int::from(blockstore().has(&parsed)),
+            None => 0,
+        }
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -361,13 +431,15 @@ pub unsafe extern "C" fn cerberus_blockstore_has(cid: *const u8) -> c_int {
 /// `cap_id` must point to at least 16 (`CAP_ID_LEN`) readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn cerberus_revoke(cap_id: *const u8) -> c_int {
-    if cap_id.is_null() {
-        return 1;
-    }
-    let mut id: CapId = [0u8; CAP_ID_LEN];
-    std::ptr::copy_nonoverlapping(cap_id, id.as_mut_ptr(), CAP_ID_LEN);
-    revocations().lock().unwrap().revoke(id);
-    0
+    guard(1, || {
+        if cap_id.is_null() {
+            return 1;
+        }
+        let mut id: CapId = [0u8; CAP_ID_LEN];
+        std::ptr::copy_nonoverlapping(cap_id, id.as_mut_ptr(), CAP_ID_LEN);
+        revocations_lock().revoke(id);
+        0
+    })
 }
 
 /// Whether the 16-byte capability id at `cap_id` is in the revocation set.
@@ -377,12 +449,14 @@ pub unsafe extern "C" fn cerberus_revoke(cap_id: *const u8) -> c_int {
 /// `cap_id` must point to at least 16 (`CAP_ID_LEN`) readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn cerberus_is_revoked(cap_id: *const u8) -> c_int {
-    if cap_id.is_null() {
-        return 0;
-    }
-    let mut id: CapId = [0u8; CAP_ID_LEN];
-    std::ptr::copy_nonoverlapping(cap_id, id.as_mut_ptr(), CAP_ID_LEN);
-    c_int::from(revocations().lock().unwrap().is_revoked(&id))
+    guard(0, || {
+        if cap_id.is_null() {
+            return 0;
+        }
+        let mut id: CapId = [0u8; CAP_ID_LEN];
+        std::ptr::copy_nonoverlapping(cap_id, id.as_mut_ptr(), CAP_ID_LEN);
+        c_int::from(revocations_lock().is_revoked(&id))
+    })
 }
 
 /// Fold another replica's serialized revocation set (a concatenation of 16-byte
@@ -394,31 +468,36 @@ pub unsafe extern "C" fn cerberus_is_revoked(cap_id: *const u8) -> c_int {
 /// `data` must point to `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn cerberus_revocations_merge(data: *const u8, len: usize) -> isize {
-    if len == 0 {
-        return 0;
-    }
-    if data.is_null() || !len.is_multiple_of(CAP_ID_LEN) {
-        return -1;
-    }
-    let buf = slice::from_raw_parts(data, len);
-    let count = len / CAP_ID_LEN;
-    // Build the peer's set from the wire bytes, then merge it (set union). Using
-    // the engine's own `merge` keeps the CRDT join semantics exactly.
-    let mut peer = RevocationSet::new();
-    for chunk in buf.chunks_exact(CAP_ID_LEN) {
-        let mut id: CapId = [0u8; CAP_ID_LEN];
-        id.copy_from_slice(chunk);
-        peer.revoke(id);
-    }
-    revocations().lock().unwrap().merge(&peer);
-    count as isize
+    guard(-1, || {
+        if len == 0 {
+            return 0;
+        }
+        if data.is_null() || !len.is_multiple_of(CAP_ID_LEN) {
+            return -1;
+        }
+        let buf = slice::from_raw_parts(data, len);
+        let count = len / CAP_ID_LEN;
+        // Build the peer's set from the wire bytes, then merge it (set union). Using
+        // the engine's own `merge` keeps the CRDT join semantics exactly.
+        let mut peer = RevocationSet::new();
+        for chunk in buf.chunks_exact(CAP_ID_LEN) {
+            let mut id: CapId = [0u8; CAP_ID_LEN];
+            id.copy_from_slice(chunk);
+            peer.revoke(id);
+        }
+        revocations_lock().merge(&peer);
+        count as isize
+    })
 }
 
 /// Number of bytes the local revocation set serializes to (`16 * count`), so a
 /// caller can size its export buffer.
 #[no_mangle]
 pub extern "C" fn cerberus_revocations_export_len() -> usize {
-    revocations().lock().unwrap().len() * CAP_ID_LEN
+    // This function has no documented error sentinel (it always reports a
+    // count), so its own contract's "failure" value is 0 (an empty set) —
+    // the same value a genuinely-empty set would produce.
+    guard(0, || revocations_lock().len() * CAP_ID_LEN)
 }
 
 /// Serialize the local revocation set into `out` (capacity `cap`) as a
@@ -429,20 +508,22 @@ pub extern "C" fn cerberus_revocations_export_len() -> usize {
 /// `out` must point to `cap` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn cerberus_revocations_export(out: *mut u8, cap: usize) -> isize {
-    if out.is_null() {
-        return -1;
-    }
-    let set = revocations().lock().unwrap();
-    let need = set.len() * CAP_ID_LEN;
-    if need > cap {
-        return -1;
-    }
-    let mut offset = 0usize;
-    for id in set.elements() {
-        std::ptr::copy_nonoverlapping(id.as_ptr(), out.add(offset), CAP_ID_LEN);
-        offset += CAP_ID_LEN;
-    }
-    need as isize
+    guard(-1, || {
+        if out.is_null() {
+            return -1;
+        }
+        let set = revocations_lock();
+        let need = set.len() * CAP_ID_LEN;
+        if need > cap {
+            return -1;
+        }
+        let mut offset = 0usize;
+        for id in set.elements() {
+            std::ptr::copy_nonoverlapping(id.as_ptr(), out.add(offset), CAP_ID_LEN);
+            offset += CAP_ID_LEN;
+        }
+        need as isize
+    })
 }
 
 #[cfg(test)]
@@ -600,5 +681,83 @@ mod tests {
             assert_eq!(cerberus_revocations_merge(buf.as_ptr(), buf.len()), -1);
             assert_eq!(cerberus_revocations_merge(buf.as_ptr(), 0), 0); // empty is a no-op
         }
+    }
+
+    // ── Panic-safety guard (production-readiness hardening) ────────────────────
+    //
+    // A panic inside any exported fn must never unwind across the FFI boundary
+    // into Go. These tests prove `guard()` itself catches a panic and returns the
+    // caller-supplied sentinel instead of propagating — i.e. no panic escapes the
+    // test process — and that the mechanism holds for a few of the different
+    // sentinel "shapes" used above (i32/isize/bool-as-c_int), plus that a
+    // poisoned Mutex (the other panic-adjacent hazard called out in the guard's
+    // doc comment) is recovered rather than re-panicking on next use.
+
+    #[test]
+    fn guard_catches_panic_and_returns_default_i32() {
+        // Directly exercises the guard helper with a panicking closure — this is
+        // the core proof: std::panic::catch_unwind is doing its job and no panic
+        // escapes this test (if it did, the test process would abort/fail noisily
+        // rather than pass).
+        let result: i32 = guard(-1, || -> i32 { panic!("boom") });
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn guard_catches_panic_and_returns_default_isize() {
+        let result: isize = guard(-1, || -> isize { panic!("boom") });
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn guard_catches_panic_and_returns_default_zero_handle() {
+        // Mirrors the mint/attenuate handle contract: 0 means "failed".
+        let result: u64 = guard(0, || -> u64 { panic!("boom") });
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn guard_passes_through_ok_value_when_no_panic() {
+        // A guard that never panics must be transparent: the real value flows
+        // through untouched, not the default sentinel.
+        let result: i32 = guard(-1, || 42);
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn guard_recovers_poisoned_mutex_without_repanicking() {
+        // Simulate the other panic-adjacent hazard `guard`'s doc calls out:
+        // a Mutex poisoned by a panic while held on another thread. Poison a
+        // fresh mutex (not the process-wide `revocations()` singleton, so this
+        // test can't perturb others run in parallel), then prove our
+        // "recover-on-poison" policy (mirrored by `revocations_lock()`) reads the
+        // data back out without panicking.
+        let m: Mutex<RevocationSet> = Mutex::new(RevocationSet::new());
+        let poisoned = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut guard = m.lock().unwrap();
+            guard.revoke([0x42; CAP_ID_LEN]);
+            panic!("simulated panic while holding the lock");
+        }));
+        assert!(poisoned.is_err());
+        assert!(m.is_poisoned());
+
+        // The same recovery policy as `revocations_lock()`: treat a poisoned
+        // lock as recoverable rather than propagating, since RevocationSet is a
+        // monotone grow-only OR-set (a mid-mutation panic can't leave it in a
+        // state unsafe to keep reading/adding to).
+        let recovered = m.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(recovered.is_revoked(&[0x42; CAP_ID_LEN]));
+    }
+
+    #[test]
+    fn guard_wraps_real_exported_fn_end_to_end() {
+        // Not a forced panic (there is no test-only hook to inject one into the
+        // real kernel/blockstore paths without touching non-test code), but this
+        // confirms guard()-wrapped exported fns still behave correctly for the
+        // ordinary success and ordinary-failure cases — i.e. wrapping with
+        // guard() changed nothing observable in the non-panicking paths.
+        let h = cerberus_cap_mint(0, RIGHT_READ, 0, 0, 0, 0);
+        assert!(h > 0); // success path unaffected by the guard wrapper
+        assert_eq!(cerberus_cap_attenuate(0, 0, 0), 0); // unknown parent -> documented 0
     }
 }

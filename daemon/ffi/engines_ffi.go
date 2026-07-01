@@ -19,6 +19,7 @@ import "C"
 
 import (
 	"errors"
+	"fmt"
 	"unsafe"
 
 	contract "github.com/hash066/cerberus/contract/go"
@@ -49,8 +50,20 @@ func NewBlockstore() Blockstore { return Blockstore{} }
 
 // Put stores data and returns its content id. Idempotent: identical bytes yield
 // the same CID without duplicating storage.
-func (Blockstore) Put(data []byte) (CID, error) {
-	var cid CID
+//
+// The recover() calls in this file are defense in depth only, against a
+// Go-side panic in this marshaling code (e.g. a slice-index or pointer-cast
+// mistake). They cannot and do not catch a panic that originates inside the
+// Rust cerberus_* call itself — that would unwind across the extern "C"
+// boundary as undefined behavior before any Go defer runs. That hazard is
+// closed on the Rust side by core/cabi/src/lib.rs's catch_unwind guard()
+// wrapper around every exported fn.
+func (Blockstore) Put(data []byte) (cid CID, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			cid, err = CID{}, fmt.Errorf("ffi: blockstore put panicked: %v", rec)
+		}
+	}()
 	var dataPtr *C.uint8_t
 	if len(data) > 0 {
 		dataPtr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
@@ -65,7 +78,12 @@ func (Blockstore) Put(data []byte) (CID, error) {
 // Get returns the bytes named by cid, re-verified to hash to it. It returns
 // ErrNotFound if the block is absent, the CID is malformed, or integrity fails.
 // Uses the ABI's size-then-copy pattern (ask the length, allocate, copy).
-func (Blockstore) Get(cid CID) ([]byte, error) {
+func (Blockstore) Get(cid CID) (out []byte, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			out, err = nil, fmt.Errorf("ffi: blockstore get panicked: %v", rec)
+		}
+	}()
 	cidPtr := (*C.uint8_t)(unsafe.Pointer(&cid[0]))
 	n := C.cerberus_blockstore_get_len(cidPtr)
 	if n < 0 {
@@ -74,7 +92,7 @@ func (Blockstore) Get(cid CID) ([]byte, error) {
 	if n == 0 {
 		return []byte{}, nil
 	}
-	out := make([]byte, int(n))
+	out = make([]byte, int(n))
 	written := C.cerberus_blockstore_get(cidPtr, (*C.uint8_t)(unsafe.Pointer(&out[0])), C.size_t(len(out)))
 	if written < 0 {
 		return nil, ErrNotFound
@@ -83,7 +101,15 @@ func (Blockstore) Get(cid CID) ([]byte, error) {
 }
 
 // Has reports whether the store holds a block for cid (without copying it).
-func (Blockstore) Has(cid CID) bool {
+// A recovered panic reports false (absent) rather than crashing the daemon;
+// callers that need to distinguish "absent" from "internal error" should
+// prefer Get, which returns an error.
+func (Blockstore) Has(cid CID) (present bool) {
+	defer func() {
+		if recover() != nil {
+			present = false
+		}
+	}()
 	return C.cerberus_blockstore_has((*C.uint8_t)(unsafe.Pointer(&cid[0]))) != 0
 }
 
@@ -100,13 +126,25 @@ type RevocationSet struct{}
 func NewRevocationSet() RevocationSet { return RevocationSet{} }
 
 // Revoke adds id to the revocation set. Monotone: re-revoking the same id is a
-// no-op, and there is no inverse.
+// no-op, and there is no inverse. Any Go-side panic in the marshaling here is
+// recovered and silently dropped (this method has no error return to report
+// it through — matching the underlying cerberus_revoke ABI, which itself has
+// no failure mode for a well-formed 16-byte id); see the file-level note above
+// Blockstore.Put for what recover() can and cannot catch here.
 func (RevocationSet) Revoke(id contract.CapID) {
+	defer func() { _ = recover() }()
 	C.cerberus_revoke((*C.uint8_t)(unsafe.Pointer(&id[0])))
 }
 
-// IsRevoked reports whether id is in the (merged) revocation set.
-func (RevocationSet) IsRevoked(id contract.CapID) bool {
+// IsRevoked reports whether id is in the (merged) revocation set. A recovered
+// panic fails closed (reports revoked/true), mirroring the Rust ABI's own
+// convention (cerberus_is_revoked: "1 = revoked, 0 = live").
+func (RevocationSet) IsRevoked(id contract.CapID) (revoked bool) {
+	defer func() {
+		if recover() != nil {
+			revoked = true
+		}
+	}()
 	return C.cerberus_is_revoked((*C.uint8_t)(unsafe.Pointer(&id[0]))) != 0
 }
 
@@ -114,12 +152,17 @@ func (RevocationSet) IsRevoked(id contract.CapID) bool {
 // deterministic order. The wire format is defined by the cabi ABI (core/crdt
 // exposes no serializer of its own — see the note in core/cabi/src/lib.rs); it
 // is exactly what Merge consumes.
-func (RevocationSet) Export() ([]byte, error) {
+func (RevocationSet) Export() (out []byte, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			out, err = nil, fmt.Errorf("ffi: revocations export panicked: %v", rec)
+		}
+	}()
 	n := C.cerberus_revocations_export_len()
 	if n == 0 {
 		return []byte{}, nil
 	}
-	out := make([]byte, int(n))
+	out = make([]byte, int(n))
 	written := C.cerberus_revocations_export((*C.uint8_t)(unsafe.Pointer(&out[0])), C.size_t(len(out)))
 	if written < 0 {
 		return nil, errors.New("ffi: revocations export failed")
@@ -130,7 +173,12 @@ func (RevocationSet) Export() ([]byte, error) {
 // Merge folds another replica's exported set (from Export) into the local set,
 // returning the number of ids merged. The merge is a set union: convergent,
 // commutative, and idempotent, so replicas converge under any reorder/partition.
-func (RevocationSet) Merge(data []byte) (int, error) {
+func (RevocationSet) Merge(data []byte) (n int, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			n, err = 0, fmt.Errorf("ffi: revocations merge panicked: %v", rec)
+		}
+	}()
 	if len(data) == 0 {
 		return 0, nil
 	}
