@@ -81,7 +81,17 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 	// VRAM, audio, file content) actually flow over. It is physically separate
 	// from the control plane (ARCHITECTURE.md §4.1) — the 9P namespace only mints
 	// grants against it; payloads never traverse 9P.
-	dp := dataplane.NewServer(kernel, time.Now().Unix())
+	//
+	// Security: the data plane is a raw QUIC transport that does NOT carry
+	// libp2p's own handshake, so (per daemon/mesh/security.go's documented gap)
+	// it cannot rely on libp2p to authenticate its peers the way the mesh fabric
+	// does. Instead it binds its OWN TLS certificate to the SAME real Ed25519
+	// identity the mesh fabric uses (fab.Identity(), whose public half is
+	// fab.PeerID()) — not a throwaway per-listener key — so a dialer who already
+	// knows this node's PeerID can pin the data-plane cert to it (see
+	// daemon/dataplane/tls.go), closing the MITM gap the fresh-random-cert
+	// version had.
+	dp := dataplane.NewServer(kernel, time.Now().Unix(), fab.Identity())
 	if err := dp.Listen("127.0.0.1:0"); err != nil {
 		return nil, fmt.Errorf("dataplane listen: %w", err)
 	}
@@ -126,10 +136,11 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 	ns.SetGranter(func(cap contract.CapHandle, _ contract.ResourceRef, transferID uint64, quota contract.Quota) (ninep.DataEndpoint, error) {
 		ep := dp.RegisterGrant(transferID, cap, quota)
 		return ninep.DataEndpoint{
-			Kind:     ninep.EndpointKind(ep.Kind),
-			Endpoint: ep.Addr,
-			StreamID: ep.TransferID,
-			Quota:    ep.Quota,
+			Kind:         ninep.EndpointKind(ep.Kind),
+			Endpoint:     ep.Addr,
+			StreamID:     ep.TransferID,
+			Quota:        ep.Quota,
+			ServerPeerID: ep.ServerPeerID, // the daemon's own real identity; the holder pins its dial to it.
 		}, nil
 	})
 

@@ -3,6 +3,8 @@ package dataplane
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"io"
 	"sync"
@@ -12,6 +14,19 @@ import (
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/contract/go/stub"
 )
+
+// newTestIdentity generates a fresh Ed25519 keypair standing in for a node's
+// real mesh identity, for tests that just need "some" valid identity key rather
+// than a specific known one (see tls_pinning_test.go for tests exercising
+// PINNING against a KNOWN identity).
+func newTestIdentity(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen identity: %v", err)
+	}
+	return priv
+}
 
 // These tests exercise the data plane over a real loopback QUIC connection on
 // 127.0.0.1, using the contract stub CapKernel as the authority (per the task).
@@ -55,7 +70,7 @@ func (c *collectSink) bytes() []byte {
 // the background until the returned cancel is called.
 func newRunningServer(t *testing.T, kernel contract.CapKernel, sink Sink) (*Server, func()) {
 	t.Helper()
-	srv := NewServer(kernel, testNow)
+	srv := NewServer(kernel, testNow, newTestIdentity(t))
 	if err := srv.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -214,7 +229,7 @@ func TestEndpointDescriptorConsistent(t *testing.T) {
 	kernel := stub.NewCapKernel()
 	cap, _ := kernel.Mint(contract.ResourceRef{Kind: contract.KindVRAM}, []contract.Right{contract.RightRead}, nil)
 
-	srv := NewServer(kernel, testNow)
+	srv := NewServer(kernel, testNow, newTestIdentity(t))
 	if err := srv.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -235,5 +250,11 @@ func TestEndpointDescriptorConsistent(t *testing.T) {
 	}
 	if ep.Quota.Bytes != 2<<20 {
 		t.Errorf("quota = %d, want %d", ep.Quota.Bytes, 2<<20)
+	}
+	if ep.ServerPeerID != srv.PeerID() {
+		t.Errorf("ServerPeerID = %x, want server's own PeerID %x", ep.ServerPeerID, srv.PeerID())
+	}
+	if ep.ServerPeerID == (contract.PeerID{}) {
+		t.Errorf("ServerPeerID must not be zero when the server has a real identity")
 	}
 }

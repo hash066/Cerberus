@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -52,6 +53,12 @@ type Server struct {
 	kernel    contract.CapKernel
 	verifyCap SignedCapVerifier
 	now       int64
+	// identity is the node's real Ed25519 mesh identity keypair. Listen binds
+	// the TLS certificate's subject key to identity's public half (see tls.go),
+	// so the cert attests to the node's actual, durable PeerID rather than a
+	// throwaway key — this is what lets a client pin the server's identity
+	// instead of trusting the channel on capability-authorization alone.
+	identity ed25519.PrivateKey
 
 	mu     sync.Mutex
 	grants map[uint64]grant // transferID -> authorized grant
@@ -64,10 +71,17 @@ type grant struct {
 	quota contract.Quota
 }
 
-// NewServer builds a data-plane server backed by a capability kernel. now is the
-// unix time passed to CapKernel.Verify (tests pass a fixed value).
-func NewServer(kernel contract.CapKernel, now int64) *Server {
-	return &Server{kernel: kernel, now: now, grants: map[uint64]grant{}}
+// NewServer builds a data-plane server backed by a capability kernel and the
+// node's real Ed25519 mesh identity keypair. now is the unix time passed to
+// CapKernel.Verify (tests pass a fixed value). identity MUST be the same
+// keypair the node uses as its mesh PeerID (contract.PeerID is the Ed25519
+// public half) — Listen binds the TLS certificate to it so a dialer who
+// already knows this node's PeerID can pin against it end-to-end (see
+// client.go / tls.go). Passing a fresh/unrelated key here would silently
+// defeat pinning, so callers must thread through the node's actual identity
+// rather than generate a new one per server.
+func NewServer(kernel contract.CapKernel, now int64, identity ed25519.PrivateKey) *Server {
+	return &Server{kernel: kernel, now: now, identity: identity, grants: map[uint64]grant{}}
 }
 
 // SetSignedVerifier installs a cross-kernel signed-capability verifier. Once set,
@@ -99,14 +113,29 @@ func (s *Server) RegisterSignedGrant(transferID uint64, cap contract.CapHandle, 
 	}
 	s.mu.Unlock()
 	return Endpoint{
-		Kind:       EndpointQUIC,
-		Addr:       addr,
-		TransferID: transferID,
-		Cap:        cap,
-		Quota:      quota,
-		SignedCap:  envelope,
-		Issuer:     issuer,
+		Kind:         EndpointQUIC,
+		Addr:         addr,
+		TransferID:   transferID,
+		Cap:          cap,
+		Quota:        quota,
+		SignedCap:    envelope,
+		Issuer:       issuer,
+		ServerPeerID: s.PeerID(), // caller already knows which server it is dialing: pin it.
 	}
+}
+
+// PeerID returns the Ed25519 public key (contract.PeerID) this server's TLS
+// certificate is bound to — i.e. the identity a dialing client should put in
+// Endpoint.ServerPeerID to pin this server. Returns the zero PeerID if the
+// server was built without an identity keypair.
+func (s *Server) PeerID() contract.PeerID {
+	pub, ok := s.identity.Public().(ed25519.PublicKey)
+	if !ok || len(pub) != len(contract.PeerID{}) {
+		return contract.PeerID{}
+	}
+	var id contract.PeerID
+	copy(id[:], pub)
+	return id
 }
 
 // Addr returns the listen address (valid after Listen).
@@ -122,7 +151,7 @@ func (s *Server) Addr() string {
 // Listen binds a QUIC listener on addr (e.g. "127.0.0.1:0" for an ephemeral
 // port). Call Serve to accept transfers.
 func (s *Server) Listen(addr string) error {
-	tlsConf, err := newSelfSignedTLS()
+	tlsConf, err := newSelfSignedTLS(s.identity)
 	if err != nil {
 		return err
 	}

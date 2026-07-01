@@ -31,6 +31,15 @@ func NewClient() *Client { return &Client{} }
 // its length in bytes, which the client declares in the header. The whole blob is
 // streamed chunk by chunk and is never required to be resident in one buffer.
 //
+// If ep.ServerPeerID is set, the QUIC/TLS dial PINS the server's certificate to
+// that exact Ed25519 key (see tls.go's VerifyPeerCertificate): a network MITM
+// terminating the handshake with its own certificate — even a validly
+// self-signed one — is rejected during the dial, before the header or any
+// payload byte is written. If ep.ServerPeerID is the zero PeerID (the caller did
+// not know which peer it intended to reach ahead of the dial), no pinning
+// happens and the transfer is authorized only by the in-band capability checks
+// below — a documented gap, not a silent one (see tls.go / endpoint.go).
+//
 // Send returns nil only if the server acknowledged a complete, in-quota transfer.
 // An over-quota or unauthorized transfer returns a contract.CapError.
 func (c *Client) Send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) error {
@@ -43,7 +52,7 @@ func (c *Client) Send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) e
 			fmt.Sprintf("blob %d bytes exceeds quota %d", n, ep.Quota.Bytes))
 	}
 
-	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(), &quic.Config{})
+	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(ep.ServerPeerID), &quic.Config{})
 	if err != nil {
 		return contract.Errf(contract.ErrPartitioned, err.Error())
 	}

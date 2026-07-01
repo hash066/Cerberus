@@ -32,7 +32,7 @@ func TestConcurrentCtlGrantsAndTransfers(t *testing.T) {
 	ref := contract.ResourceRef{Kind: contract.KindVRAM, Path: dev, Quota: &q}
 
 	kernel := stub.NewCapKernel()
-	dp := dataplane.NewServer(kernel, time.Now().Unix())
+	dp := dataplane.NewServer(kernel, time.Now().Unix(), newTestIdentity(t))
 	if err := dp.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("dataplane listen: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestConcurrentCtlGrantsAndTransfers(t *testing.T) {
 	ns.Register(dev, ref)
 	ns.SetGranter(func(cap contract.CapHandle, _ contract.ResourceRef, transferID uint64, quota contract.Quota) (ninep.DataEndpoint, error) {
 		ep := dp.RegisterGrant(transferID, cap, quota)
-		return ninep.DataEndpoint{Kind: ninep.EndpointKind(ep.Kind), Endpoint: ep.Addr, StreamID: ep.TransferID, Quota: ep.Quota}, nil
+		return ninep.DataEndpoint{Kind: ninep.EndpointKind(ep.Kind), Endpoint: ep.Addr, StreamID: ep.TransferID, Quota: ep.Quota, ServerPeerID: ep.ServerPeerID}, nil
 	})
 
 	client := dataplane.NewClient()
@@ -76,7 +76,7 @@ func TestConcurrentCtlGrantsAndTransfers(t *testing.T) {
 				errs <- fmt.Errorf("worker %d open: %w", i, err)
 				return
 			}
-			dpEP := dataplane.Endpoint{Kind: dataplane.EndpointQUIC, Addr: ep.Endpoint, TransferID: ep.StreamID, Cap: cap, Quota: ep.Quota}
+			dpEP := dataplane.Endpoint{Kind: dataplane.EndpointQUIC, Addr: ep.Endpoint, TransferID: ep.StreamID, Cap: cap, Quota: ep.Quota, ServerPeerID: ep.ServerPeerID}
 			sctx, scancel := context.WithTimeout(ctx, 10*time.Second)
 			defer scancel()
 			if err := client.SendBytes(sctx, dpEP, bytes.Repeat([]byte{byte(i)}, blobSize)); err != nil {

@@ -12,7 +12,7 @@ import (
 // enforces the byte ceiling regardless of what the client claims. It returns nil
 // only if the server acked OK.
 func sendRaw(ctx context.Context, ep Endpoint, h header, payload []byte) error {
-	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(), &quic.Config{})
+	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(ep.ServerPeerID), &quic.Config{})
 	if err != nil {
 		return err
 	}

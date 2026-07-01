@@ -70,6 +70,15 @@ type RecvEndpoint struct {
 	// Quota bounds the inbound transfer the caller authorized (must be >= file
 	// size or the caller's receiver rejects the delivery).
 	Quota contract.Quota `json:"quota"`
+	// ServerPeerID, if set, is the Ed25519 PeerID the caller's OWN receiver
+	// presents in its TLS certificate. When known, the daemon (acting as the
+	// data-plane CLIENT for a read — see BeginRead) pins its dial to this key,
+	// so a MITM impersonating the caller's receiver is rejected before any file
+	// byte is sent. This is optional: a caller that stood up an ad hoc receiver
+	// without a durable identity leaves this zero, and the transfer is then
+	// authorized only by the in-band capability check (Cap/Quota above) — a
+	// documented, not silently unsafe, gap (see daemon/dataplane/tls.go).
+	ServerPeerID contract.PeerID `json:"server_peer_id,omitempty"`
 }
 
 // FSStore is the seam the composition layer implements to back /cer/fs with the

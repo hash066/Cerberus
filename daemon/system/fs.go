@@ -171,10 +171,11 @@ func (s *dfsFSStore) BeginWrite(path string, cap contract.CapHandle, transferID 
 	})
 
 	return ninep.DataEndpoint{
-		Kind:     ninep.EndpointKind(ep.Kind),
-		Endpoint: ep.Addr,
-		StreamID: ep.TransferID,
-		Quota:    ep.Quota,
+		Kind:         ninep.EndpointKind(ep.Kind),
+		Endpoint:     ep.Addr,
+		StreamID:     ep.TransferID,
+		Quota:        ep.Quota,
+		ServerPeerID: ep.ServerPeerID, // the daemon's own real identity; the caller pins its dial to it.
 	}, nil
 }
 
@@ -198,12 +199,21 @@ func (s *dfsFSStore) BeginRead(path string, _ contract.CapHandle, recv ninep.Rec
 	// authorized by the caller's own inbound grant (recv carries the transfer id,
 	// cap and quota the caller registered on its receiver). The file content rides
 	// the data plane, not 9P.
+	//
+	// Pinning note: if the caller told us which PeerID its own receiver presents
+	// (recv.ServerPeerID), we pin the dial to it — a MITM impersonating the
+	// caller's receiver is rejected before any file byte is sent (see
+	// daemon/dataplane/tls.go). When the caller did not supply one (an ad hoc
+	// receiver with no durable identity), ServerPeerID stays zero and pinning is
+	// skipped; the transfer is then authorized only by the in-band capability
+	// check (recv.Cap/recv.Quota) — a documented gap, not a silent one.
 	dpEP := dataplane.Endpoint{
-		Kind:       dataplane.EndpointKind(recv.Kind),
-		Addr:       recv.Endpoint,
-		TransferID: recv.StreamID,
-		Cap:        recv.Cap,
-		Quota:      recv.Quota,
+		Kind:         dataplane.EndpointKind(recv.Kind),
+		Addr:         recv.Endpoint,
+		TransferID:   recv.StreamID,
+		Cap:          recv.Cap,
+		Quota:        recv.Quota,
+		ServerPeerID: recv.ServerPeerID,
 	}
 	return s.client.Send(context.Background(), dpEP, rc, uint64(man.TotalBytes))
 }

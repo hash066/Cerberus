@@ -18,6 +18,7 @@ package mesh
 
 import (
 	"context"
+	stded25519 "crypto/ed25519"
 	"crypto/rand"
 	"fmt"
 	"sync"
@@ -60,6 +61,13 @@ type Fabric struct {
 	kernel contract.CapKernel
 
 	peerID contract.PeerID
+	// identity is this node's real Ed25519 mesh keypair in standard
+	// crypto/ed25519 form (same key libp2p authenticates the QUIC/TLS handshake
+	// with; its public half is peerID). Exposed via Identity() so other raw
+	// transports that do NOT carry libp2p's own handshake (e.g. daemon/dataplane
+	// — see security.go's documented TODO) can bind their OWN TLS material to
+	// this node's real identity instead of an unrelated throwaway key.
+	identity stded25519.PrivateKey
 
 	mu      sync.Mutex
 	subs    []*subscription
@@ -123,6 +131,14 @@ func New(ctx context.Context, cfg Config) (*Fabric, error) {
 
 	if raw, err := priv.GetPublic().Raw(); err == nil && len(raw) == 32 {
 		copy(f.peerID[:], raw)
+	}
+	// Keep the standard crypto/ed25519 form of this node's real identity key so
+	// Identity() can hand it to a raw (non-libp2p) transport such as
+	// daemon/dataplane. libp2p's Ed25519PrivateKey.Raw() returns exactly the
+	// 64-byte crypto/ed25519.PrivateKey encoding (seed||pubkey), so this is a
+	// direct reinterpretation, not a re-derivation — it is the SAME key.
+	if raw, err := priv.Raw(); err == nil && len(raw) == stded25519.PrivateKeySize {
+		f.identity = stded25519.PrivateKey(raw)
 	}
 
 	ps, err := pubsub.NewGossipSub(cctx, h)
@@ -308,6 +324,16 @@ func (f *Fabric) Inbound() <-chan contract.Session { return f.inbound }
 
 // PeerID returns this node's Ed25519 identity.
 func (f *Fabric) PeerID() contract.PeerID { return f.peerID }
+
+// Identity returns this node's real Ed25519 mesh identity keypair in standard
+// crypto/ed25519 form — the same key libp2p's QUIC/TLS handshake authenticates
+// PeerID with. It exists so a transport that does NOT itself carry libp2p's
+// handshake (e.g. daemon/dataplane's raw QUIC listener — see security.go's
+// documented TODO) can bind its OWN TLS certificate to this node's real
+// identity instead of a throwaway key, letting dialers pin against the same
+// PeerID mesh callers already use. Returns nil if the key could not be
+// recovered in standard form (should not happen in practice).
+func (f *Fabric) Identity() stded25519.PrivateKey { return f.identity }
 
 // AddrInfo returns this node's dialable libp2p address info (for tests/bootstrap).
 func (f *Fabric) AddrInfo() peer.AddrInfo {

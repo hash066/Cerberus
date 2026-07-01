@@ -68,7 +68,7 @@ func newSignedFixture(t *testing.T) *signedFixture {
 
 	kernel := stub.NewCapKernel()
 	sink := &collectSink{}
-	srv := NewServer(kernel, testNow)
+	srv := NewServer(kernel, testNow, newTestIdentity(t))
 	// The signed-cap gate verifies at real wall-clock time (auth.NewGrant stamps
 	// NotBefore=now); the kernel gate's fixed testNow is orthogonal.
 	srv.SetSignedVerifier(func(env []byte, issuer contract.PeerID) error {

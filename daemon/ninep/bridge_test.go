@@ -3,6 +3,8 @@ package ninep_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"io"
 	"testing"
 	"time"
@@ -12,6 +14,20 @@ import (
 	"github.com/hash066/cerberus/daemon/dataplane"
 	"github.com/hash066/cerberus/daemon/ninep"
 )
+
+// newTestIdentity generates a fresh Ed25519 keypair standing in for a node's
+// real mesh identity, matching daemon/system.Compose's wiring (dp :=
+// dataplane.NewServer(kernel, now, fab.Identity())) without requiring a live
+// mesh fabric in these fast, deterministic bridge tests. Shared by every
+// ninep_test file that stands up a dataplane.Server.
+func newTestIdentity(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen identity: %v", err)
+	}
+	return priv
+}
 
 // TestOpenCtlGrantsRealDataPlaneTransfer proves the cross-cut wiring (HANDOFF
 // Phase F "next"): opening a device `.../ctl` on the 9P namespace allocates a
@@ -30,7 +46,7 @@ func TestOpenCtlGrantsRealDataPlaneTransfer(t *testing.T) {
 	now := time.Now().Unix()
 
 	// Data plane: real QUIC receiver.
-	dp := dataplane.NewServer(kernel, now)
+	dp := dataplane.NewServer(kernel, now, newTestIdentity(t))
 	if err := dp.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("dataplane listen: %v", err)
 	}
@@ -56,10 +72,11 @@ func TestOpenCtlGrantsRealDataPlaneTransfer(t *testing.T) {
 	ns.SetGranter(func(cap contract.CapHandle, _ contract.ResourceRef, transferID uint64, quota contract.Quota) (ninep.DataEndpoint, error) {
 		ep := dp.RegisterGrant(transferID, cap, quota)
 		return ninep.DataEndpoint{
-			Kind:     ninep.EndpointKind(ep.Kind),
-			Endpoint: ep.Addr,
-			StreamID: ep.TransferID,
-			Quota:    ep.Quota,
+			Kind:         ninep.EndpointKind(ep.Kind),
+			Endpoint:     ep.Addr,
+			StreamID:     ep.TransferID,
+			Quota:        ep.Quota,
+			ServerPeerID: ep.ServerPeerID,
 		}, nil
 	})
 
@@ -83,8 +100,10 @@ func TestOpenCtlGrantsRealDataPlaneTransfer(t *testing.T) {
 	client := dataplane.NewClient()
 
 	// Within quota: the transfer succeeds and the bytes arrive over the data plane.
+	// ServerPeerID pins this dial to the daemon's real identity (the same
+	// pattern daemon/system.Compose wires end-to-end).
 	blob := bytes.Repeat([]byte("x"), 512)
-	dpEP := dataplane.Endpoint{Kind: dataplane.EndpointQUIC, Addr: ep.Endpoint, TransferID: ep.StreamID, Cap: cap, Quota: ep.Quota}
+	dpEP := dataplane.Endpoint{Kind: dataplane.EndpointQUIC, Addr: ep.Endpoint, TransferID: ep.StreamID, Cap: cap, Quota: ep.Quota, ServerPeerID: ep.ServerPeerID}
 	sendCtx, sendCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer sendCancel()
 	if err := client.SendBytes(sendCtx, dpEP, blob); err != nil {
@@ -105,7 +124,7 @@ func TestOpenCtlGrantsRealDataPlaneTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second open ctl: %v", err)
 	}
-	dpEP2 := dataplane.Endpoint{Kind: dataplane.EndpointQUIC, Addr: ep2.Endpoint, TransferID: ep2.StreamID, Cap: cap, Quota: ep2.Quota}
+	dpEP2 := dataplane.Endpoint{Kind: dataplane.EndpointQUIC, Addr: ep2.Endpoint, TransferID: ep2.StreamID, Cap: cap, Quota: ep2.Quota, ServerPeerID: ep2.ServerPeerID}
 	over := bytes.Repeat([]byte("y"), int(q.Bytes)+1)
 	overCtx, overCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer overCancel()
