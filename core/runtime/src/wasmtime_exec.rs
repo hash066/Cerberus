@@ -40,9 +40,59 @@
 //! The WASI path is gated behind the `wasmtime` feature (it pulls `wasmtime-wasi`),
 //! so the cabi `default-features = false` staticlib never compiles it.
 
-use wasmtime::{Engine, Linker, Module, Store};
+use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::{Executor, Task, TaskResult};
+
+/// Resource-governance defaults for untrusted guest WASM on the Wasmtime backend —
+/// mirrors the wasmi-side constants in [`crate`] so both backends enforce the same
+/// bounds (ARCHITECTURE's "hypervisor for untrusted multi-agent workloads" premise:
+/// a guest must never hang the calling thread or exhaust host memory).
+///
+/// ## Fuel
+/// [`wasmtime::Config::consume_fuel`] charges an implementation-defined cost per unit
+/// of work; [`DEFAULT_FUEL`] is generous against this crate's trivial shard tasks
+/// while still tripping in well under a second for a runaway loop.
+///
+/// ## Memory / tables / instances
+/// [`DEFAULT_MEMORY_LIMIT_BYTES`] is applied via [`wasmtime::StoreLimitsBuilder`] +
+/// [`wasmtime::Store::limiter`] (the [`wasmtime::ResourceLimiter`] hook): a
+/// `memory.grow` past the cap fails cleanly instead of the host allocating it.
+pub const DEFAULT_FUEL: u64 = 10_000_000;
+
+/// Default linear-memory cap per store: 64 MiB.
+pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Builds a Wasmtime [`Engine`] with fuel metering turned on (the CPU-bounding half of
+/// resource governance).
+fn governed_engine() -> Engine {
+    let mut config = Config::default();
+    config.consume_fuel(true);
+    Engine::new(&config).expect("default wasmtime config is always valid")
+}
+
+/// Builds the default [`StoreLimits`] (the memory-bounding half of resource
+/// governance) per [`DEFAULT_MEMORY_LIMIT_BYTES`].
+fn governed_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(DEFAULT_MEMORY_LIMIT_BYTES)
+        .build()
+}
+
+/// Applies the default fuel budget to a freshly created, fuel-enabled store.
+fn set_default_fuel<T>(store: &mut Store<T>) -> Result<(), String> {
+    store
+        .set_fuel(DEFAULT_FUEL)
+        .map_err(|e| format!("set_fuel: {e}"))
+}
+
+/// Store data for [`WasmtimeExecutor::execute`]: the LE-i32 view of the task input
+/// (what `host.input` reads) plus the [`StoreLimits`] the [`wasmtime::ResourceLimiter`]
+/// hook reads from, so fuel *and* memory limits both apply.
+struct ExecState {
+    input: i32,
+    limits: StoreLimits,
+}
 
 /// Which host imports the Wasmtime executor exposes to the guest core module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -91,15 +141,23 @@ impl WasmtimeExecutor {
     fn execute(&self, t: &Task) -> Result<i32, String> {
         let input_i32 = le_i32_prefix(&t.input);
 
-        let engine = Engine::default();
+        let engine = governed_engine();
         let module = Module::new(&engine, &t.wasm[..]).map_err(|e| format!("compile: {e}"))?;
-        let mut store = Store::new(&engine, input_i32);
-        let mut linker = Linker::<i32>::new(&engine);
+        let mut store = Store::new(
+            &engine,
+            ExecState {
+                input: input_i32,
+                limits: governed_limits(),
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+        set_default_fuel(&mut store)?;
+        let mut linker = Linker::<ExecState>::new(&engine);
 
         if self.imports == HostImport::Input {
             linker
-                .func_wrap("host", "input", |caller: wasmtime::Caller<'_, i32>| {
-                    *caller.data()
+                .func_wrap("host", "input", |caller: wasmtime::Caller<'_, ExecState>| {
+                    caller.data().input
                 })
                 .map_err(|e| format!("link host.input: {e}"))?;
         }
@@ -146,11 +204,13 @@ fn le_i32_prefix(input: &[u8]) -> i32 {
 pub fn run_component(bytes: &[u8], name: &str) -> Result<u32, String> {
     use wasmtime::component::{Component, Linker};
 
-    let engine = Engine::default();
+    let engine = governed_engine();
     let component =
         Component::new(&engine, bytes).map_err(|e| format!("component compile: {e}"))?;
-    let linker = Linker::<()>::new(&engine);
-    let mut store = Store::new(&engine, ());
+    let linker = Linker::<StoreLimits>::new(&engine);
+    let mut store = Store::new(&engine, governed_limits());
+    store.limiter(|limits| limits);
+    set_default_fuel(&mut store)?;
     let instance = linker
         .instantiate(&mut store, &component)
         .map_err(|e| format!("component instantiate: {e}"))?;
@@ -166,13 +226,16 @@ pub fn run_component(bytes: &[u8], name: &str) -> Result<u32, String> {
     Ok(result)
 }
 
-/// Host state for the WASI Preview 2 store: the WASI context plus the resource
-/// table the WASI host implementations use to track open streams/handles.
+/// Host state for the WASI Preview 2 store: the WASI context, the resource table the
+/// WASI host implementations use to track open streams/handles, and the
+/// [`StoreLimits`] the [`wasmtime::ResourceLimiter`] hook reads from so a WASI
+/// component is bounded by the same memory cap as the other execution paths.
 ///
 /// `cfg`-gated on the `wasmtime` feature (which now enables `wasmtime-wasi`).
 struct WasiHost {
     ctx: wasmtime_wasi::WasiCtx,
     table: wasmtime::component::ResourceTable,
+    limits: StoreLimits,
 }
 
 impl wasmtime_wasi::WasiView for WasiHost {
@@ -202,7 +265,7 @@ pub fn run_wasi_component(bytes: &[u8], name: &str) -> Result<u32, String> {
     use wasmtime::component::{Component, Linker};
     use wasmtime_wasi::{WasiCtxBuilder, WasiView};
 
-    let engine = Engine::default();
+    let engine = governed_engine();
     let component =
         Component::new(&engine, bytes).map_err(|e| format!("component compile: {e}"))?;
 
@@ -218,8 +281,11 @@ pub fn run_wasi_component(bytes: &[u8], name: &str) -> Result<u32, String> {
             .inherit_stderr()
             .build(),
         table: wasmtime::component::ResourceTable::new(),
+        limits: governed_limits(),
     };
     let mut store = Store::new(&engine, host);
+    store.limiter(|host| &mut host.limits);
+    set_default_fuel(&mut store)?;
 
     let instance = linker
         .instantiate(&mut store, &component)
@@ -301,6 +367,28 @@ mod tests {
         .unwrap()
     }
 
+    // A module exporting `run` that never returns: `(loop (br 0))` is an unconditional
+    // backward branch to itself.
+    fn infinite_loop_wasm() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module (func (export "run") (result i32) (loop (br 0)) i32.const 0))"#,
+        )
+        .unwrap()
+    }
+
+    // A module with a 1-page memory (no declared maximum) whose `run` tries to grow it
+    // by ~2.6 GiB worth of pages — far past DEFAULT_MEMORY_LIMIT_BYTES (64 MiB).
+    fn memory_hog_wasm() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                 (memory 1)
+                 (func (export "run") (result i32)
+                   i32.const 40000
+                   memory.grow))"#,
+        )
+        .unwrap()
+    }
+
     // A WASM *component* (not a core module) exporting `answer: func() -> u32`.
     // Hand-written component-model text: a core module supplies the function, and
     // the component canon-lifts it to the component-level export. `wat` parses the
@@ -330,6 +418,67 @@ mod tests {
         t.entry = "nope".into();
         let r = WasmtimeExecutor::new().run(&t);
         assert!(!r.ok, "missing entry must reject, not panic");
+    }
+
+    #[test]
+    fn wasmtime_infinite_loop_traps_on_fuel_exhaustion_instead_of_hanging() {
+        // Without fuel metering this guest never returns, hanging the calling thread
+        // forever. Resource governance must trap it in bounded real time.
+        let start = std::time::Instant::now();
+        let r = WasmtimeExecutor::new().run(&Task::wasm(vec![9], infinite_loop_wasm()));
+        let elapsed = start.elapsed();
+        assert!(!r.ok, "infinite loop must be rejected, not succeed");
+        assert!(
+            r.error.contains("fuel") || r.error.contains("trap"),
+            "expected a fuel/trap error, got: {}",
+            r.error
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "fuel exhaustion must bound real time, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn wasmtime_memory_grow_past_cap_is_rejected_not_oom() {
+        // memory.grow returns -1 (does not trap) when the limiter denies growth, so
+        // the guest's `run` still returns cleanly with -1 rather than the host OOM-ing.
+        let r = WasmtimeExecutor::new().run(&Task::wasm(vec![10], memory_hog_wasm()));
+        assert!(
+            r.ok,
+            "grow-denied is a clean -1 return, not an executor error: {}",
+            r.error
+        );
+        assert_eq!(
+            r.as_i32(),
+            Some(-1),
+            "memory.grow past the cap must fail (-1), not succeed"
+        );
+    }
+
+    #[test]
+    fn run_component_traps_on_fuel_exhaustion() {
+        // Component-Model path: an infinite-looping core func lifted to a component
+        // export must also be bounded by fuel, not hang the calling thread.
+        let comp = wat::parse_str(
+            r#"(component
+                 (core module $m
+                   (func (export "spin") (result i32) (loop (br 0)) i32.const 0))
+                 (core instance $i (instantiate $m))
+                 (func $s (result u32) (canon lift (core func $i "spin")))
+                 (export "spin" (func $s)))"#,
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let err = run_component(&comp, "spin").expect_err("infinite loop must trap, not succeed");
+        assert!(
+            err.contains("fuel") || err.contains("trap"),
+            "expected a fuel/trap error, got: {err}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "fuel exhaustion must bound real time"
+        );
     }
 
     #[test]

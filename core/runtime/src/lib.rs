@@ -50,7 +50,68 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use wasmi::{Engine, Linker, Module, Store};
+use wasmi::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
+
+/// Resource-governance defaults for untrusted guest WASM on the wasmi backend
+/// (ARCHITECTURE's "hypervisor for untrusted multi-agent workloads" premise means a
+/// guest must never be able to hang the calling thread or exhaust host memory).
+///
+/// ## Fuel
+/// wasmi 1.1's fuel metering ([`wasmi::Config::consume_fuel`]) charges an
+/// implementation-defined cost per bytecode step; there's no portable "N seconds"
+/// unit, so [`DEFAULT_FUEL`] is picked generously against the handful-of-instructions
+/// tasks in this crate's test suite while still being small enough that a runaway
+/// loop (`(loop (br 0))`) traps almost immediately rather than spinning forever.
+///
+/// ## Memory
+/// [`DEFAULT_MEMORY_LIMIT_BYTES`] caps how far a guest's linear memory may grow, via
+/// [`wasmi::StoreLimitsBuilder::memory_size`] enforced through wasmi's
+/// [`wasmi::ResourceLimiter`] hook ([`wasmi::Store::limiter`]): a `memory.grow` past
+/// the cap is rejected (returns `-1`), the store is never actually asked to allocate it.
+pub const DEFAULT_FUEL: u64 = 10_000_000;
+
+/// Default linear-memory cap per store: 64 MiB. Generous for realistic shard tasks,
+/// small enough that a malicious `memory.grow` cannot pressure host RAM before being
+/// rejected.
+pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Builds a wasmi [`Engine`] with fuel metering turned on (the CPU-bounding half of
+/// resource governance; the memory half is applied per-`Store` via [`governed_limits`]
+/// + [`Store::limiter`]).
+fn governed_engine() -> Engine {
+    let mut config = Config::default();
+    config.consume_fuel(true);
+    Engine::new(&config)
+}
+
+/// Builds the default [`StoreLimits`] (the memory-bounding half of resource
+/// governance) per [`DEFAULT_MEMORY_LIMIT_BYTES`].
+fn governed_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(DEFAULT_MEMORY_LIMIT_BYTES)
+        .build()
+}
+
+/// Store data for a governed wasmi execution that also needs host-callable state `T`
+/// (e.g. the `host.input` value): bundles the caller's `T` with the [`StoreLimits`]
+/// the [`wasmi::ResourceLimiter`] hook reads from, so both fuel *and* memory limits
+/// apply even when a task needs custom store data. See [`InputAwareWasmExecutor`]
+/// (test-only) for the pattern; the equivalent shape is used by the wasmtime backend.
+#[cfg(test)]
+struct GovernedData<T> {
+    inner: T,
+    limits: StoreLimits,
+}
+
+#[cfg(test)]
+impl<T> GovernedData<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            limits: governed_limits(),
+        }
+    }
+}
 
 /// A unit of work handed to the runtime.
 #[derive(Clone, Debug)]
@@ -141,10 +202,14 @@ impl WasmExecutor {
     }
 
     fn execute(t: &Task) -> Result<i32, String> {
-        let engine = Engine::default();
+        let engine = governed_engine();
         let module = Module::new(&engine, &t.wasm[..]).map_err(|e| format!("compile: {e}"))?;
-        let mut store = Store::new(&engine, ());
-        let linker = Linker::<()>::new(&engine);
+        let mut store = Store::new(&engine, governed_limits());
+        store.limiter(|limits| limits);
+        store
+            .set_fuel(DEFAULT_FUEL)
+            .map_err(|e| format!("set_fuel: {e}"))?;
+        let linker = Linker::<StoreLimits>::new(&engine);
         let instance = linker
             .instantiate_and_start(&mut store, &module)
             .map_err(|e| format!("instantiate: {e}"))?;
@@ -362,6 +427,60 @@ mod tests {
         assert!(!r.ok);
     }
 
+    // A module exporting `run` that never returns: `(loop (br 0))` is an unconditional
+    // backward branch to itself, spinning forever with no host-visible progress.
+    fn infinite_loop_wasm() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module (func (export "run") (result i32) (loop (br 0)) i32.const 0))"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn infinite_loop_traps_on_fuel_exhaustion_instead_of_hanging() {
+        // Without fuel metering this guest never returns, hanging the calling thread
+        // forever. Resource governance must trap it in bounded real time.
+        let start = std::time::Instant::now();
+        let r = WasmExecutor.run(&Task::wasm(vec![9], infinite_loop_wasm()));
+        let elapsed = start.elapsed();
+        assert!(!r.ok, "infinite loop must be rejected, not succeed");
+        assert!(
+            r.error.contains("fuel") || r.error.contains("trap"),
+            "expected a fuel/trap error, got: {}",
+            r.error
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "fuel exhaustion must bound real time, took {elapsed:?}"
+        );
+    }
+
+    // A module with a 1-page memory (no declared maximum) whose `run` tries to grow
+    // it by ~2 GiB worth of pages — far past DEFAULT_MEMORY_LIMIT_BYTES (64 MiB).
+    fn memory_hog_wasm() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                 (memory 1)
+                 (func (export "run") (result i32)
+                   i32.const 40000 ;; ~2.6 GiB worth of 64 KiB pages
+                   memory.grow))"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn memory_grow_past_cap_is_rejected_not_oom() {
+        // memory.grow returns -1 (does not trap) when the limiter denies growth, so the
+        // guest's `run` still returns cleanly with -1 rather than the host OOM-ing.
+        let r = WasmExecutor.run(&Task::wasm(vec![10], memory_hog_wasm()));
+        assert!(r.ok, "grow-denied is a clean -1 return, not an executor error: {}", r.error);
+        assert_eq!(
+            r.as_i32(),
+            Some(-1),
+            "memory.grow past the cap must fail (-1), not succeed"
+        );
+    }
+
     #[test]
     fn echo_executor_round_trips_input() {
         let mut t = Task::wasm(vec![3], Vec::new());
@@ -397,17 +516,23 @@ mod tests {
             } else {
                 0
             };
-            let engine = Engine::default();
+            let engine = governed_engine();
             let module = match Module::new(&engine, &t.wasm[..]) {
                 Ok(m) => m,
                 Err(e) => return TaskResult::err(t.task_id.clone(), format!("compile: {e}")),
             };
-            let mut store = Store::new(&engine, input_i32);
-            let mut linker = Linker::<i32>::new(&engine);
+            let mut store = Store::new(&engine, GovernedData::new(input_i32));
+            store.limiter(|data| &mut data.limits);
+            if let Err(e) = store.set_fuel(DEFAULT_FUEL) {
+                return TaskResult::err(t.task_id.clone(), format!("set_fuel: {e}"));
+            }
+            let mut linker = Linker::<GovernedData<i32>>::new(&engine);
             linker
-                .func_wrap("host", "input", |caller: wasmi::Caller<'_, i32>| -> i32 {
-                    *caller.data()
-                })
+                .func_wrap(
+                    "host",
+                    "input",
+                    |caller: wasmi::Caller<'_, GovernedData<i32>>| -> i32 { caller.data().inner },
+                )
                 .unwrap();
             let instance = match linker.instantiate_and_start(&mut store, &module) {
                 Ok(i) => i,
