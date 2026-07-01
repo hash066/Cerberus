@@ -25,6 +25,7 @@ import (
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/auth"
+	"github.com/hash066/cerberus/daemon/economy"
 	"github.com/hash066/cerberus/daemon/ledger"
 	"github.com/hash066/cerberus/daemon/lifecycle"
 	"github.com/hash066/cerberus/daemon/mesh"
@@ -95,6 +96,7 @@ type DaemonRPC struct {
 	sched     *scheduler.Scheduler
 	exec      *wasm.Executor
 	ledger    *ledger.Ledger
+	settler   *economy.Settler // optimistic compute-settlement layer wrapping ledger
 	crdt      *state.Engine
 	metrics   *metrics.Metrics
 	daemonDoc []byte // the CRDT doc id the daemon checkpoints belief state under
@@ -605,6 +607,80 @@ func (d *DaemonRPC) resolveDoc(hexDoc string) ([]byte, error) {
 		return []byte(hexDoc), nil
 	}
 	return b, nil
+}
+
+// ---- economy (optimistic settlement fraud-proof challenge) ----------------
+//
+// This is the missing operational half of the "optimistic settlement, unchallenged
+// claims finalize, challenged ones get slashed" model (ARCHITECTURE §4.3,
+// daemon/economy/settle.go, daemon/ledger/settlement.go). SettleCompletedTask and
+// Finalize are wired end-to-end elsewhere; EconomyChallenge is the operational
+// surface that lets an operator (or a watchdog acting on the operator's behalf)
+// actually mount a fraud-proof dispute against a pending settlement through the
+// daemon's real RPC, rather than only via daemon/economy's unit tests.
+
+type EconomyChallengeRequest struct {
+	Token string
+	// Tx is the pending settlement tx id (as returned by an opened settlement).
+	Tx uint64
+	// ComponentCID / InputCID must match the settlement's binding — the fraud
+	// proof re-executes this component on this input.
+	ComponentCID string
+	InputCID     string
+	// ClaimedOutputCID must match what the provider actually claimed (the
+	// settlement's bound output CID); ActualOutputCID is the challenger's
+	// honest recomputation. A mismatch between the two is what makes the proof
+	// valid.
+	ClaimedOutputCID string
+	ActualOutputCID  string
+	// Challenger is the principal credited with the provider's forfeited bond
+	// on a successful challenge. Empty defaults to the authorized caller's
+	// subject.
+	Challenger string
+}
+
+type EconomyChallengeResponse struct {
+	Tx          uint64
+	Slashed     bool
+	Refunded    uint64 // credits refunded to the consumer
+	BondAwarded uint64 // provider bond awarded to the challenger
+}
+
+// EconomyChallenge disputes a pending optimistic settlement with a fraud proof.
+// Requires spend (the same economy-adjacent right that gates moving/awarding
+// ledger funds): a challenge, like a wallet spend, moves real credits (the
+// provider's forfeited bond) and must not be reachable by a bare read/write
+// token. A valid proof (claimed output CID does not match the honest
+// re-execution of the bound component+input) slashes the provider: the
+// consumer is refunded and the bond is awarded to the challenger. An invalid or
+// non-fraudulent proof is rejected cleanly and nothing moves.
+func (d *DaemonRPC) EconomyChallenge(req *EconomyChallengeRequest, resp *EconomyChallengeResponse) error {
+	claims, err := d.authz.Authorize(req.Token, "spend", "")
+	if err != nil {
+		return fmt.Errorf("unauthorized (economy challenge requires spend): %w", err)
+	}
+	if d.settler == nil {
+		return fmt.Errorf("economy challenge: settlement layer not available")
+	}
+	challenger := strings.TrimSpace(req.Challenger)
+	if challenger == "" {
+		challenger = claims.Subject
+	}
+	fraud := ledger.FraudProof{
+		ComponentCID:     req.ComponentCID,
+		InputCID:         req.InputCID,
+		ClaimedOutputCID: req.ClaimedOutputCID,
+		ActualOutputCID:  req.ActualOutputCID,
+	}
+	slash, cerr := d.settler.Challenge(req.Tx, fraud, challenger)
+	if cerr != nil {
+		return fmt.Errorf("economy challenge: %w", cerr)
+	}
+	resp.Tx = slash.Tx
+	resp.Slashed = true
+	resp.Refunded = slash.Refunded
+	resp.BondAwarded = slash.BondAwarded
+	return nil
 }
 
 // ---- helpers --------------------------------------------------------------

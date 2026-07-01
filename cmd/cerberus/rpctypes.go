@@ -147,3 +147,20 @@ type ConflictsResolveResponse struct {
 	Resolved bool
 	Subject  string
 }
+
+// economy challenge
+type EconomyChallengeRequest struct {
+	Token            string
+	Tx               uint64
+	ComponentCID     string
+	InputCID         string
+	ClaimedOutputCID string
+	ActualOutputCID  string
+	Challenger       string
+}
+type EconomyChallengeResponse struct {
+	Tx          uint64
+	Slashed     bool
+	Refunded    uint64
+	BondAwarded uint64
+}

@@ -9,6 +9,7 @@ import (
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/auth"
+	"github.com/hash066/cerberus/daemon/economy"
 	"github.com/hash066/cerberus/daemon/ledger"
 	"github.com/hash066/cerberus/daemon/lifecycle"
 	"github.com/hash066/cerberus/daemon/state"
@@ -70,6 +71,7 @@ func testDaemon(t *testing.T) (*DaemonRPC, string) {
 		lifecycle: mon,
 		exec:      wasm.NewExecutor(runWASM),
 		ledger:    lg,
+		settler:   economy.NewSettler(lg),
 		crdt:      eng,
 		daemonDoc: []byte("daemon-doc"),
 		caps:      newCapRegistry(),
@@ -305,5 +307,169 @@ func mkBeliefOp(docID []byte, actor, subject, value string) contract.CrdtOp {
 		Clock:  contract.VectorClock{Entries: map[string]uint64{hex.EncodeToString(a[:]): 1}},
 		Domain: state.DomainBelief,
 		Delta:  delta,
+	}
+}
+
+// ---- economy challenge (fraud-proof dispute) end-to-end through the RPC ----
+//
+// These exercise the operational surface a real daemon exposes: open a
+// settlement via the composed Settler (as the gateway's settlement seam would
+// on a completed priced task), then dispute it through DaemonRPC.EconomyChallenge
+// exactly as `cerberus economy challenge` would drive it — not just calling
+// economy.Settler.Challenge directly as a library, the way daemon/economy's own
+// unit tests do.
+
+// openTestSettlement mints consumer/provider funds on d.ledger and opens a
+// pending optimistic settlement via d.settler, returning the tx id. Mirrors the
+// fixture pattern in daemon/economy/settle_test.go and daemon/ledger/settlement_test.go.
+func openTestSettlement(t *testing.T, d *DaemonRPC, disputeBlocks uint64) (tx uint64, componentCID, inputCID, claimedCID string) {
+	t.Helper()
+	payIn, err := d.ledger.Mint("orgX", 100)
+	if err != nil {
+		t.Fatalf("mint consumer funds: %v", err)
+	}
+	bondIn, err := d.ledger.Mint("orgY", 30)
+	if err != nil {
+		t.Fatalf("mint provider bond: %v", err)
+	}
+	task := contract.ComputeTask{TaskID: []byte{0x01}, Component: []byte{0xde, 0xad}}
+	tx, err = d.settler.SettleCompletedTask(task, "inputCID", economy.Claim{
+		Consumer:      "orgX",
+		Provider:      "orgY",
+		PaymentInput:  payIn,
+		Payment:       60,
+		BondInput:     bondIn,
+		Bond:          30,
+		OutputCID:     "claimedCID",
+		DisputeBlocks: disputeBlocks,
+	})
+	if err != nil {
+		t.Fatalf("SettleCompletedTask: %v", err)
+	}
+	return tx, "dead", "inputCID", "claimedCID" // hex("dead") = task.Component {0xde, 0xad}
+}
+
+// A valid fraud proof submitted through the RPC's EconomyChallenge slashes the
+// dishonest provider end-to-end: bond forfeited (awarded to the challenger),
+// consumer refunded — driven through the same surface `cerberus economy
+// challenge` uses, not the economy package directly.
+func TestEconomyChallengeSlashesDishonestProvider(t *testing.T) {
+	d, tok := testDaemon(t)
+	tx, componentCID, inputCID, claimedCID := openTestSettlement(t, d, 8)
+
+	req := &EconomyChallengeRequest{
+		Token:            tok,
+		Tx:               tx,
+		ComponentCID:     componentCID,
+		InputCID:         inputCID,
+		ClaimedOutputCID: claimedCID,
+		ActualOutputCID:  "honestCID", // honest recompute differs from the claim -> fraud
+		Challenger:       "watchdog",
+	}
+	var resp EconomyChallengeResponse
+	if err := d.EconomyChallenge(req, &resp); err != nil {
+		t.Fatalf("EconomyChallenge (valid fraud proof): %v", err)
+	}
+	if !resp.Slashed {
+		t.Fatalf("expected Slashed=true, got %+v", resp)
+	}
+	if resp.Refunded != 60 || resp.BondAwarded != 30 {
+		t.Fatalf("slash = %+v, want refund 60 / bond 30", resp)
+	}
+
+	// Consumer fully refunded (100 minted, 60 was locked into escrow, now back).
+	if bal, _ := d.ledger.Balance("orgX"); bal != 100 {
+		t.Fatalf("orgX after slash = %d, want 100 (fully refunded)", bal)
+	}
+	// Provider lost its bond entirely.
+	if bal, _ := d.ledger.Balance("orgY"); bal != 0 {
+		t.Fatalf("orgY after slash = %d, want 0 (bond forfeited)", bal)
+	}
+	// Challenger (watchdog) awarded the forfeited bond.
+	if bal, _ := d.ledger.Balance("watchdog"); bal != 30 {
+		t.Fatalf("watchdog after slash = %d, want 30 (awarded bond)", bal)
+	}
+
+	// The settlement is durably marked slashed, not left pending.
+	pend, ok, err := d.settler.Pending(tx)
+	if err != nil || !ok {
+		t.Fatalf("Pending: ok=%v err=%v", ok, err)
+	}
+	if pend.State != ledger.ClaimSlashed {
+		t.Fatalf("settlement state = %s, want slashed", pend.State)
+	}
+}
+
+// An invalid (non-fraudulent) proof must be rejected cleanly through the RPC
+// method: the honest provider is not slashed, and nothing moves.
+func TestEconomyChallengeRejectsInvalidProof(t *testing.T) {
+	d, tok := testDaemon(t)
+	tx, componentCID, inputCID, claimedCID := openTestSettlement(t, d, 8)
+
+	req := &EconomyChallengeRequest{
+		Token:            tok,
+		Tx:               tx,
+		ComponentCID:     componentCID,
+		InputCID:         inputCID,
+		ClaimedOutputCID: claimedCID,
+		ActualOutputCID:  claimedCID, // honest recompute MATCHES the claim -> not fraud
+		Challenger:       "watchdog",
+	}
+	var resp EconomyChallengeResponse
+	if err := d.EconomyChallenge(req, &resp); err == nil {
+		t.Fatalf("EconomyChallenge accepted a non-fraudulent proof: %+v", resp)
+	}
+
+	// Nothing moved: the honest provider's bond is still locked in escrow, not
+	// forfeited, and the challenger got nothing.
+	if bal, _ := d.ledger.Balance("orgY"); bal != 0 {
+		// orgY started with bond fully locked into escrow (0 free balance); a
+		// rejected challenge must not change that, but it also must not slash.
+		t.Fatalf("orgY balance moved on a rejected challenge: %d", bal)
+	}
+	if bal, _ := d.ledger.Balance("watchdog"); bal != 0 {
+		t.Fatalf("challenger was paid out on a rejected (invalid) challenge: %d", bal)
+	}
+	pend, ok, err := d.settler.Pending(tx)
+	if err != nil || !ok {
+		t.Fatalf("Pending: ok=%v err=%v", ok, err)
+	}
+	if pend.State != ledger.ClaimPending {
+		t.Fatalf("settlement state = %s, want still pending after rejected challenge", pend.State)
+	}
+}
+
+// A caller without the spend right must be denied before the challenge logic
+// even runs — the settlement must remain untouched.
+func TestEconomyChallengeRequiresSpendRight(t *testing.T) {
+	d, _ := testDaemon(t)
+	tx, componentCID, inputCID, claimedCID := openTestSettlement(t, d, 8)
+
+	readTok, err := d.authz.Mint("reader", []string{"read"}, "", time.Hour)
+	if err != nil {
+		t.Fatalf("mint read-only token: %v", err)
+	}
+	req := &EconomyChallengeRequest{
+		Token:            readTok,
+		Tx:               tx,
+		ComponentCID:     componentCID,
+		InputCID:         inputCID,
+		ClaimedOutputCID: claimedCID,
+		ActualOutputCID:  "honestCID",
+		Challenger:       "watchdog",
+	}
+	var resp EconomyChallengeResponse
+	if err := d.EconomyChallenge(req, &resp); err == nil {
+		t.Fatalf("EconomyChallenge allowed a read-only token to challenge: %+v", resp)
+	}
+
+	// The claim must still be pending — a denied caller must not have reached
+	// the challenge/slash logic at all.
+	pend, ok, perr := d.settler.Pending(tx)
+	if perr != nil || !ok {
+		t.Fatalf("Pending: ok=%v err=%v", ok, perr)
+	}
+	if pend.State != ledger.ClaimPending {
+		t.Fatalf("settlement state = %s, want pending (unauthorized caller must not affect it)", pend.State)
 	}
 }

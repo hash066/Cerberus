@@ -14,6 +14,7 @@
 //	caps mint|attenuate|revoke|list capability-token lifecycle
 //	components add|list            local named-component registry (name -> CID)
 //	conflicts list|resolve …        CRDT belief-conflict inspection / resolution
+//	economy challenge …             dispute a pending settlement with a fraud proof
 //	metrics                         fetch the local Prometheus /metrics text
 //	version                         print the client + contract version
 //
@@ -160,6 +161,8 @@ func run(args []string) int {
 		return cmdComponents(rest, jsonOut)
 	case "conflicts":
 		return cmdConflicts(rest, jsonOut)
+	case "economy":
+		return cmdEconomy(rest, jsonOut)
 	case "metrics":
 		return cmdMetrics(rest, jsonOut)
 	case "doctor":
@@ -191,6 +194,8 @@ Commands:
   components list                     List registered components (name, CID, size)
   conflicts list [--doc <hex>]        Open CRDT belief conflicts
   conflicts resolve <subject> <value> [--doc <hex>]
+  economy challenge <tx-id> --component-cid C --input-cid I --claimed-output-cid O --actual-output-cid A [--challenger P]
+                                       Dispute a pending settlement with a fraud proof
   metrics                             Fetch the local Prometheus /metrics text
   doctor                              Diagnose daemon discovery + reachability
   version                             Print client + contract version
@@ -670,6 +675,74 @@ func cmdConflicts(args []string, jsonOut bool) int {
 
 	default:
 		fmt.Fprintf(os.Stderr, "conflicts: unknown subcommand %q (list | resolve)\n", sub)
+		return exitUsage
+	}
+}
+
+// ---- economy (optimistic-settlement fraud-proof challenge) ----------------
+
+func cmdEconomy(args []string, jsonOut bool) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "economy: need a subcommand: challenge")
+		return exitUsage
+	}
+	sub := args[0]
+	rest := args[1:]
+
+	token, code := loadToken()
+	if code != exitOK {
+		return code
+	}
+	client, code := dial()
+	if code != exitOK {
+		return code
+	}
+	defer client.Close()
+
+	switch sub {
+	case "challenge":
+		componentCID, rest := extractValueFlag(rest, "--component-cid")
+		inputCID, rest := extractValueFlag(rest, "--input-cid")
+		claimedCID, rest := extractValueFlag(rest, "--claimed-output-cid")
+		actualCID, rest := extractValueFlag(rest, "--actual-output-cid")
+		challenger, rest := extractValueFlag(rest, "--challenger")
+		if len(rest) < 1 {
+			fmt.Fprintln(os.Stderr, "economy challenge: need <tx-id>")
+			fmt.Fprintln(os.Stderr, "usage: cerberus economy challenge <tx-id> --component-cid C --input-cid I --claimed-output-cid O --actual-output-cid A [--challenger P]")
+			return exitUsage
+		}
+		tx, err := strconv.ParseUint(rest[0], 10, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "economy challenge: bad tx id %q: %v\n", rest[0], err)
+			return exitUsage
+		}
+		if componentCID == "" || inputCID == "" || claimedCID == "" || actualCID == "" {
+			fmt.Fprintln(os.Stderr, "economy challenge: --component-cid, --input-cid, --claimed-output-cid, and --actual-output-cid are all required")
+			return exitUsage
+		}
+		req := &EconomyChallengeRequest{
+			Token:            token,
+			Tx:               tx,
+			ComponentCID:     componentCID,
+			InputCID:         inputCID,
+			ClaimedOutputCID: claimedCID,
+			ActualOutputCID:  actualCID,
+			Challenger:       challenger,
+		}
+		var resp EconomyChallengeResponse
+		if err := client.Call("DaemonRPC.EconomyChallenge", req, &resp); err != nil {
+			return rpcErr("economy challenge", err)
+		}
+		if jsonOut {
+			return printJSON(resp)
+		}
+		fmt.Printf("Challenge on tx %d: SLASHED\n", resp.Tx)
+		fmt.Printf("  Refunded to consumer: %d credits\n", resp.Refunded)
+		fmt.Printf("  Bond awarded:         %d credits\n", resp.BondAwarded)
+		return exitOK
+
+	default:
+		fmt.Fprintf(os.Stderr, "economy: unknown subcommand %q (challenge)\n", sub)
 		return exitUsage
 	}
 }
