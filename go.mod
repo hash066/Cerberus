@@ -13,6 +13,7 @@ require (
 	github.com/quic-go/quic-go v0.60.0
 	github.com/tetratelabs/wazero v1.12.0
 	github.com/thejerf/suture/v4 v4.0.6
+	github.com/winfsp/cgofuse v1.6.0
 	go.etcd.io/bbolt v1.5.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0

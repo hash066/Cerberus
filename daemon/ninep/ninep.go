@@ -109,6 +109,75 @@ func (s *Server) IsAncestorDir(path string) bool {
 	return false
 }
 
+// ListChildren returns the immediate next path segment for every registered
+// device (or /cer/fs) that is reachable under dir, filtered to exactly the
+// entries cap is authorized to see. It is the read-directory counterpart to
+// Walk: it never exposes a name the same capability check Walk performs would
+// deny, so a FUSE/WinFsp Readdir built on this method carries no more
+// authority than a Twalk of each individual name would (CLAUDE.md golden rule
+// 5 — no ambient authority; see mount_windows.go).
+//
+// dir is a namespace path (e.g. "/cer", "/cer/dev", "/cer/dev/vram/AA/0"); the
+// returned names are single path components, deduplicated. A device directory
+// itself (e.g. "/cer/dev/vram/AA/0") additionally lists the fixed leaves
+// "ctl" and "info" once the read check on that device passes. /cer/fs is
+// listed as a bare structural entry (its files are named by the caller, not
+// enumerated — the metadata store is not a directory listing source in v0.1).
+func (s *Server) ListChildren(dir string, cap contract.CapHandle) []string {
+	dir = strings.TrimRight(dir, "/")
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+
+	s.mu.Lock()
+	type devEntry struct {
+		devDir string
+		ref    contract.ResourceRef
+	}
+	var devs []devEntry
+	for d, r := range s.devices {
+		devs = append(devs, devEntry{d, r})
+	}
+	s.mu.Unlock()
+
+	for _, de := range devs {
+		switch {
+		case de.devDir == dir:
+			// dir IS a registered device: list its fixed leaves, gated by the
+			// same read check Walk would perform on them.
+			if s.check(cap, "read", de.ref) == nil {
+				add("ctl")
+				add("info")
+			}
+		case strings.HasPrefix(de.devDir, dir+"/"):
+			// dir is a structural ancestor of this device: expose only the
+			// next path component toward it (no capability required for a
+			// pure ancestor hop, exactly as Walk's IsAncestorDir branch
+			// allows) — the capability check fires once a listing reaches
+			// the device itself (the case above).
+			rest := strings.TrimPrefix(de.devDir, dir+"/")
+			if i := strings.IndexByte(rest, '/'); i >= 0 {
+				add(rest[:i])
+			} else {
+				add(rest)
+			}
+		}
+	}
+
+	if dir == "/cer" || dir == rootPath {
+		if s.fs != nil {
+			add("fs")
+		}
+	}
+	return out
+}
+
 // deviceFor returns the registered device whose dir is a prefix of path (longest match).
 func (s *Server) deviceFor(path string) (string, contract.ResourceRef, bool) {
 	best := ""

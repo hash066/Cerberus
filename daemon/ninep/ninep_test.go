@@ -82,3 +82,61 @@ func TestRevocationDeniesAccess(t *testing.T) {
 		t.Fatal("revoked capability must not open ctl")
 	}
 }
+
+// containsAll reports whether want is a subset of got.
+func containsAll(got []string, want ...string) bool {
+	set := map[string]bool{}
+	for _, g := range got {
+		set[g] = true
+	}
+	for _, w := range want {
+		if !set[w] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestListChildrenAncestorDirsAreTraversableWithoutCap: listing a structural
+// ancestor directory (e.g. /cer/dev/vram) needs no capability at all — it
+// exposes only path-component names, never a resource — mirroring
+// IsAncestorDir's existing no-cap-required behavior for Walk.
+func TestListChildrenAncestorDirsAreTraversableWithoutCap(t *testing.T) {
+	s, _, _ := setup()
+	if got := s.ListChildren("/cer/dev/vram", contract.CapHandle(0)); !containsAll(got, "AA") {
+		t.Fatalf("listing an ancestor dir should reveal the next path component even with no cap, got %v", got)
+	}
+	if got := s.ListChildren("/cer/dev/vram/AA", contract.CapHandle(0)); !containsAll(got, "0") {
+		t.Fatalf("listing an ancestor dir should reveal the next path component even with no cap, got %v", got)
+	}
+}
+
+// TestListChildrenDeviceDirRequiresCapability: listing the device directory
+// ITSELF (its ctl/info leaves) is gated by the identical read check Walk
+// performs — no ambient authority (CLAUDE.md golden rule 5).
+func TestListChildrenDeviceDirRequiresCapability(t *testing.T) {
+	s, cap, _ := setup()
+
+	withCap := s.ListChildren(dev, cap)
+	if !containsAll(withCap, "ctl", "info") {
+		t.Fatalf("a valid read capability should reveal ctl/info leaves, got %v", withCap)
+	}
+
+	withoutCap := s.ListChildren(dev, contract.CapHandle(0))
+	if len(withoutCap) != 0 {
+		t.Fatalf("listing a device dir with no capability must reveal no leaves (no ambient authority), got %v", withoutCap)
+	}
+}
+
+// TestListChildrenRevokedCapDenied: exactly like Walk, a revoked capability
+// stops seeing the device's leaves.
+func TestListChildrenRevokedCapDenied(t *testing.T) {
+	s, cap, k := setup()
+	if got := s.ListChildren(dev, cap); !containsAll(got, "ctl", "info") {
+		t.Fatalf("valid cap should list leaves before revocation, got %v", got)
+	}
+	_ = k.Revoke(cap)
+	if got := s.ListChildren(dev, cap); len(got) != 0 {
+		t.Fatalf("a revoked capability must not list any leaves, got %v", got)
+	}
+}
