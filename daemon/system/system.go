@@ -86,11 +86,37 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 		return nil, fmt.Errorf("dataplane listen: %w", err)
 	}
 
+	// The daemon's single data-plane Sink: a router that dispatches each authorized
+	// inbound transfer by id. FS writes register a per-transfer handler that pipes
+	// the bytes into dfs.Put; every other transfer (device/VRAM ctl grants) is
+	// drained within its quota exactly as the prior nil sink did.
+	router := newSinkRouter()
+
 	// 9P capability namespace with a sample local VRAM device.
 	ns := ninep.New(kernel)
 	q := contract.Quota{Bytes: 2 * 1024 * 1024 * 1024}
 	ns.Register("/cer/dev/vram/local/0",
 		contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/local/0", Quota: &q})
+
+	// /cer/fs — the distributed filesystem, backed by the dfs engine (Phase G2)
+	// scattering shards into an in-memory ShardStore for v0.1. A write streams the
+	// file bytes over the data plane into dfs.Put and records the returned Manifest
+	// keyed by the path; a read resolves the path to its Manifest, runs dfs.Get,
+	// and streams the reconstructed bytes back over the data plane. Bulk file bytes
+	// ride the data plane, never 9P (ARCHITECTURE.md §3.5).
+	//   NEXT STEPS (labelled): the path→Manifest map (MemMetaStore) is in-memory —
+	//   a durable, transactional metadata store is next; and MemShardStore keeps
+	//   shards on this node — peer scatter over the data plane is next.
+	fsStore, err := newDFSFSStore(dp, router)
+	if err != nil {
+		return nil, fmt.Errorf("dfs fs store: %w", err)
+	}
+	// The /cer/fs subtree is served by the namespace's own WalkFS/OpenFSWrite/
+	// OpenFSRead methods (not the device Register path), so we install the backend
+	// rather than registering a device resource. Wiring the backend also makes
+	// /cer/fs walkable and read/writable; leaving it unwired keeps devices working
+	// with /cer/fs reporting PARTITIONED.
+	ns.SetFSStore(fsStore)
 
 	// The cross-cut wiring (HANDOFF Phase F "next"): opening a device `.../ctl`
 	// allocates a real transfer on the data plane and hands back the endpoint the
@@ -129,10 +155,11 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 	tree := supervisor.New("cerberusd")
 	tree.Supervise(supervisor.Permanent, runFunc(pub.Run))
 	tree.Supervise(supervisor.Permanent, runFunc(func(c context.Context) error { return schedulerLoop(c, sched) }))
-	// Serve the data-plane receiver. A nil sink drains each authorized transfer
-	// within its quota; the consumer of device bytes plugs in here.
+	// Serve the data-plane receiver. The router sink dispatches each authorized
+	// transfer: an FS write streams into dfs.Put, everything else drains within its
+	// quota (the prior nil-sink behaviour for device grants).
 	tree.Supervise(supervisor.Permanent, runFunc(func(c context.Context) error {
-		return dp.Serve(c, nil)
+		return dp.Serve(c, router.route)
 	}))
 	// Serve the 9P2000.L control-plane namespace over the wire, closing the
 	// listener on shutdown so Serve unblocks.

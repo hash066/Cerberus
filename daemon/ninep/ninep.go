@@ -54,6 +54,7 @@ type Server struct {
 	now        int64
 	nextStream uint64
 	granter    Granter
+	fs         FSStore // backs the /cer/fs subtree; nil until SetFSStore
 }
 
 // New builds a namespace server backed by a capability kernel.
