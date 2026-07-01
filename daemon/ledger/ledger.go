@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	bucket   = "ledger"
-	metaNext = "meta:next"
-	utxoPfx  = "utxo:"
+	bucket    = "ledger"
+	metaNext  = "meta:next"
+	metaBlock = "meta:block"
+	utxoPfx   = "utxo:"
 )
 
 // Utxo is an unspent compute-credit output.
@@ -33,6 +34,7 @@ type Ledger struct {
 	s       *store.Store
 	mu      sync.Mutex
 	next    uint64
+	block   uint64
 	enabled bool
 }
 
@@ -45,6 +47,11 @@ func Open(s *store.Store, openMesh bool) (*Ledger, error) {
 	} else if ok && len(b) == 8 {
 		l.next = binary.BigEndian.Uint64(b)
 	}
+	if b, ok, err := s.Get(bucket, metaBlock); err != nil {
+		return nil, err
+	} else if ok && len(b) == 8 {
+		l.block = binary.BigEndian.Uint64(b)
+	}
 	return l, nil
 }
 
@@ -54,6 +61,37 @@ func (l *Ledger) persistNext() error {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], l.next)
 	return l.s.Put(bucket, metaNext, b[:])
+}
+
+func (l *Ledger) persistBlock() error {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], l.block)
+	return l.s.Put(bucket, metaBlock, b[:])
+}
+
+// Block returns the current durable logical block height. The dispute window
+// gating optimistic settlements (see settlement.go) is measured against this
+// clock, so it must survive a daemon restart — it is loaded in Open alongside
+// the UTXO id counter, from the same bbolt-backed store.
+func (l *Ledger) Block() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.block
+}
+
+// AdvanceBlock moves the durable logical block height forward by n and
+// persists the new height before returning. If the persist fails, the
+// in-memory height is rolled back so it never diverges from what's on disk.
+func (l *Ledger) AdvanceBlock(n uint64) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	prev := l.block
+	l.block += n
+	if err := l.persistBlock(); err != nil {
+		l.block = prev
+		return prev, err
+	}
+	return l.block, nil
 }
 
 func (l *Ledger) mintLocked(owner string, value uint64) (uint64, error) {

@@ -14,7 +14,6 @@ package economy
 import (
 	"encoding/hex"
 	"errors"
-	"sync"
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/ledger"
@@ -22,13 +21,15 @@ import (
 
 // Settler drives optimistic compute settlement on the durable ledger. It owns a
 // monotonic logical block clock that the dispute window is measured against; in
-// production this would track the eUTXO chain height, here it is a simple
-// in-process counter advanced on each settlement event.
+// production this would track the eUTXO chain height. The clock itself is
+// durable — it is delegated to the ledger, which persists it to the same
+// bbolt-backed store as the UTXO set (see daemon/ledger.Ledger.Block /
+// AdvanceBlock), so it survives a daemon restart instead of resetting to zero
+// while pending settlements it gates are still on disk expecting the old
+// height. The ledger's own locking covers this state, so Settler needs no
+// mutex of its own here.
 type Settler struct {
 	lg *ledger.Ledger
-
-	mu    sync.Mutex
-	block uint64
 }
 
 // NewSettler wraps a durable ledger.
@@ -36,20 +37,26 @@ func NewSettler(lg *ledger.Ledger) *Settler {
 	return &Settler{lg: lg}
 }
 
-// Block returns the current logical block height.
+// Block returns the current logical block height, durably persisted on the
+// wrapped ledger.
 func (s *Settler) Block() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.block
+	return s.lg.Block()
 }
 
-// Advance moves the logical clock forward by n blocks (e.g. as the chain ticks).
-// Returns the new height.
+// Advance moves the logical clock forward by n blocks (e.g. as the chain
+// ticks), durably persisting the new height before returning it. A persist
+// failure leaves the height at its previous (still-durable) value rather than
+// silently diverging from disk; such a failure is not expected in normal
+// operation, so it is not surfaced through this legacy signature — callers
+// needing to observe it should use the ledger directly via AdvanceBlock.
 func (s *Settler) Advance(n uint64) uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.block += n
-	return s.block
+	// On persist failure, AdvanceBlock returns the last known-durable height
+	// (see Ledger.AdvanceBlock), which is exactly what we want to report here
+	// too: never a height that isn't actually durable. Advance's legacy
+	// signature has no error return, so the failure itself isn't surfaced;
+	// callers needing that should use the ledger directly via AdvanceBlock.
+	h, _ := s.lg.AdvanceBlock(n)
+	return h
 }
 
 // Claim is a provider's payment claim for a completed task. PaymentInput is the
