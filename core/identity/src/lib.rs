@@ -15,10 +15,16 @@
 //! Keep the Go<->Rust boundary tiny: Go (lane B mesh/telemetry) talks to this
 //! through core/cabi opaque handles at integration, not directly.
 
-use std::collections::HashSet;
-
-use cerberus_contract::{CapError, CapErrorCode, CapId, Capability, PeerId};
+use cerberus_contract::{CapError, CapErrorCode, Capability, PeerId};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+
+/// The gossiped revocation OR-set (`sys/revocations`). Re-exported from
+/// `core/crdt` rather than duplicated here: this crate's `cap_verify` seam only
+/// ever needs `revoke`/`is_revoked`/`merge`, and `core/crdt::RevocationSet`
+/// already implements exactly this monotone OR-set (and is the copy that's
+/// actually wired up over FFI in `core/cabi`). Keeping a single implementation
+/// avoids two "grow-only revoked-id set" types silently drifting apart.
+pub use cerberus_crdt::RevocationSet;
 
 /// An Ed25519 keypair. The public key is the node/issuer identity (`PeerId`).
 pub struct Keypair {
@@ -107,41 +113,6 @@ fn err(code: CapErrorCode, msg: &str) -> CapError {
     CapError {
         code,
         msg: msg.to_string(),
-    }
-}
-
-/// Convergent revocation set: an add-only OR-set of revoked capability ids,
-/// gossiped on `sys/revocations`. Union merge makes it partition-tolerant.
-#[derive(Default, Clone)]
-pub struct RevocationSet {
-    revoked: HashSet<[u8; 16]>,
-}
-
-impl RevocationSet {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn revoke(&mut self, id: CapId) {
-        self.revoked.insert(id);
-    }
-
-    /// The `is_revoked` seam used by core/ocap on every capability use.
-    pub fn is_revoked(&self, id: &CapId) -> bool {
-        self.revoked.contains(id)
-    }
-
-    pub fn len(&self) -> usize {
-        self.revoked.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.revoked.is_empty()
-    }
-
-    /// Partition-tolerant merge: union (OR-set converges regardless of order).
-    pub fn merge(&mut self, other: &RevocationSet) {
-        self.revoked.extend(other.revoked.iter().copied());
     }
 }
 
