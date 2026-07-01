@@ -30,10 +30,28 @@ type quotaFor func(transferID uint64, cap contract.CapHandle) (contract.Quota, b
 // reader is valid only for the duration of the call.
 type Sink func(transferID uint64, r io.Reader) error
 
+// SignedCapVerifier cryptographically checks the signed capability envelope a
+// sender presents in the transfer header, BEFORE any payload byte is read. It is
+// how the data plane retires the opaque-handle demo model: the receiver trusts a
+// capability it did NOT mint by verifying the issuer's Ed25519 signature over a
+// public key it obtained out of band (exchanged at discovery), not by sharing an
+// in-process kernel.
+//
+// env is the signed envelope (daemon/auth.SignedCap bytes); issuer is the PeerID
+// the sender named for key lookup. The implementation resolves the trusted key
+// for issuer and calls auth.Verify; a non-nil return DENIES the transfer (no
+// bytes flow). The dataplane package deliberately takes this as a closure so it
+// need not import daemon/auth on its API surface.
+//
+// A nil verifier keeps the legacy handle-only behavior (kernel + quota), so
+// existing callers and tests are unaffected.
+type SignedCapVerifier func(env []byte, issuer contract.PeerID) error
+
 // Server is a capability-gated QUIC data-plane receiver.
 type Server struct {
-	kernel contract.CapKernel
-	now    int64
+	kernel    contract.CapKernel
+	verifyCap SignedCapVerifier
+	now       int64
 
 	mu     sync.Mutex
 	grants map[uint64]grant // transferID -> authorized grant
@@ -52,10 +70,27 @@ func NewServer(kernel contract.CapKernel, now int64) *Server {
 	return &Server{kernel: kernel, now: now, grants: map[uint64]grant{}}
 }
 
+// SetSignedVerifier installs a cross-kernel signed-capability verifier. Once set,
+// every inbound transfer must carry a valid signed envelope in its header (in
+// addition to satisfying the registered grant + quota); an unsigned, forged,
+// tampered, wrong-issuer, expired, or revoked cap is denied before any payload
+// byte is read. Pass nil to disable (legacy handle-only behavior). Not safe to
+// call concurrently with Serve.
+func (s *Server) SetSignedVerifier(v SignedCapVerifier) { s.verifyCap = v }
+
 // RegisterGrant records that the control plane authorized transferID under cap
 // with the given quota. The server enforces exactly this when the transfer
 // arrives. Returns the Endpoint descriptor the control plane hands to the holder.
 func (s *Server) RegisterGrant(transferID uint64, cap contract.CapHandle, quota contract.Quota) Endpoint {
+	return s.RegisterSignedGrant(transferID, cap, quota, nil, contract.PeerID{})
+}
+
+// RegisterSignedGrant is RegisterGrant plus the cross-kernel authority: it embeds
+// the Ed25519-signed capability envelope (and its issuer PeerID) in the returned
+// Endpoint so the Client presents it in the transfer header and a signed-verifier
+// server checks it before any byte flows. Use this when the server has a
+// SignedCapVerifier installed. envelope may be nil for the legacy handle-only path.
+func (s *Server) RegisterSignedGrant(transferID uint64, cap contract.CapHandle, quota contract.Quota, envelope []byte, issuer contract.PeerID) Endpoint {
 	s.mu.Lock()
 	s.grants[transferID] = grant{cap: cap, quota: quota}
 	addr := ""
@@ -69,6 +104,8 @@ func (s *Server) RegisterGrant(transferID uint64, cap contract.CapHandle, quota 
 		TransferID: transferID,
 		Cap:        cap,
 		Quota:      quota,
+		SignedCap:  envelope,
+		Issuer:     issuer,
 	}
 }
 
@@ -154,6 +191,23 @@ func (s *Server) handleStream(st *quic.Stream, sink Sink) {
 		s.reject(st, contract.Errf(contract.ErrDenied, "unknown or unauthorized transfer"))
 		return
 	}
+
+	// 1a) Cross-kernel signed-capability gate (the zero-trust authority): when a
+	//     verifier is configured, the Ed25519-signed envelope the sender presents
+	//     must Verify against the issuer's public key BEFORE any payload byte is
+	//     read. This is what lets the receiver trust a cap it did not mint. Fails
+	//     closed: a missing/forged/tampered/wrong-issuer/expired/revoked cap denies.
+	if s.verifyCap != nil {
+		if len(h.SignedCap) == 0 {
+			s.reject(st, contract.Errf(contract.ErrDenied, "transfer carries no signed capability"))
+			return
+		}
+		if err := s.verifyCap(h.SignedCap, h.Issuer); err != nil {
+			s.reject(st, contract.Errf(contract.ErrDenied, "signed capability denied: "+err.Error()))
+			return
+		}
+	}
+
 	if err := s.kernel.Verify(g.cap, contract.Request{Op: "read"}, s.now); err != nil {
 		s.reject(st, err)
 		return

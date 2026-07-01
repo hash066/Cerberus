@@ -72,6 +72,15 @@ type Endpoint struct {
 	// the transfer; 0 means "no bytes permitted" (an unbounded grant must say so
 	// explicitly via a large ceiling, never by leaving Bytes zero).
 	Quota contract.Quota `json:"quota"`
+	// SignedCap is the Ed25519-signed capability envelope (daemon/auth.SignedCap)
+	// that authorizes this transfer cross-kernel. The control plane fills it in
+	// when it grants the endpoint; the Client presents it in the transfer header,
+	// and a signed-verifier server checks it before any byte flows. Optional: empty
+	// on the legacy handle-only path.
+	SignedCap []byte `json:"signed_cap,omitempty"`
+	// Issuer names the node that minted SignedCap, so the receiver can resolve the
+	// matching (exchanged) public key to Verify under.
+	Issuer contract.PeerID `json:"issuer,omitempty"`
 }
 
 // alpnNextProto is the ALPN protocol id negotiated on the QUIC/TLS handshake. It

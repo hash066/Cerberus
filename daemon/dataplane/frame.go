@@ -43,6 +43,17 @@ type header struct {
 	// before the payload flows. The server still enforces the ceiling while
 	// streaming, so a lying Length cannot smuggle extra bytes past the quota.
 	Length uint64 `json:"length"`
+	// SignedCap is the Ed25519-signed capability envelope (daemon/auth.SignedCap)
+	// that authorizes this transfer cross-kernel. When the server is configured
+	// with a signed-cap verifier, it Verifies this envelope against the issuer's
+	// public key BEFORE any payload byte is read — so the receiver trusts a cap it
+	// did not mint, not an opaque shared-kernel handle. Empty on the legacy
+	// (handle-only) path.
+	SignedCap []byte `json:"signed_cap,omitempty"`
+	// Issuer names the node that minted SignedCap, so the receiver can resolve the
+	// matching (exchanged) public key. It is only a key-lookup hint: a false issuer
+	// resolves to no key or the wrong key, and Verify then fails.
+	Issuer contract.PeerID `json:"issuer,omitempty"`
 }
 
 // writeHeader length-prefixes and writes the JSON header to w.
