@@ -6,12 +6,25 @@
 // path. Requests are mapped to a ComputeTask and dispatched through the executor
 // (the scheduler/runtime place and run it across the mesh). The endpoint binds
 // localhost only (ARCHITECTURE §1.1, vertical 10 §7) — no remote admin surface.
+//
+// v3 surface:
+//   - POST /v1/chat/completions   non-streaming (chat.completion) AND streaming
+//     via SSE (text/event-stream, chat.completion.chunk) when {"stream":true}.
+//   - GET  /v1/models             lists the available components/agents as models.
+//   - POST /v1/completions        the legacy text-completion shape.
+//
+// Every route runs the requested component through the executor and surfaces the
+// real shard result (e.g. the 1337 value) as the assistant/text content — this
+// is a real dispatch, not a canned string.
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
@@ -25,7 +38,24 @@ const (
 	// maxMessages / maxContentBytes bound the work a single request can request.
 	maxMessages     = 256
 	maxContentBytes = 512 << 10 // 512 KiB total across all message contents
+	// maxPromptBytes bounds a legacy /v1/completions prompt.
+	maxPromptBytes = 512 << 10
 )
+
+// Model is one entry the gateway advertises on /v1/models. A Cerberus "model" is
+// a WASM component/agent addressable by CID; ID is the string an OpenAI client
+// passes as "model" and ComponentCID is the component the executor should run.
+type Model struct {
+	// ID is the OpenAI-facing model name (what a client sets as "model").
+	ID string
+	// ComponentCID is the content id of the WASM component this model runs.
+	// Surfaced to clients (as metadata) and used to build the ComputeTask.
+	ComponentCID string
+	// OwnedBy is the "owned_by" field OpenAI clients expect (default "cerberus").
+	OwnedBy string
+	// Created is the advertised creation time (unix seconds); 0 → gateway start.
+	Created int64
+}
 
 // Gateway is the OpenAI-compatible HTTP front door. Every request must present a
 // capability token (Authorization: Bearer <token>) granting "exec" — there is no
@@ -33,37 +63,71 @@ const (
 type Gateway struct {
 	executor contract.Executor
 	authz    auth.Authorizer
+
+	mu      sync.RWMutex
+	models  map[string]Model // keyed by Model.ID
+	settler Settler          // optional; no-op when unset
+	pricing PricingPolicy    // optional; nil = nothing is priced
+	started int64
 }
 
+// NewGateway builds a gateway over the given executor and authorizer. It starts
+// with no advertised models and a no-op settler; the composition (LEAD) wires
+// real models via RegisterModel and a real settler via SetSettler.
 func NewGateway(executor contract.Executor, authz auth.Authorizer) *Gateway {
-	return &Gateway{executor: executor, authz: authz}
+	return &Gateway{
+		executor: executor,
+		authz:    authz,
+		models:   map[string]Model{},
+		settler:  noopSettler{},
+		started:  time.Now().Unix(),
+	}
 }
 
-// ChatMessage is one OpenAI-style chat message.
-type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+// RegisterModel advertises a component/agent as an OpenAI model. Re-registering
+// the same ID replaces it. Safe for concurrent use. A model with an empty ID is
+// ignored. This is how the composition exposes the mesh's components on
+// /v1/models; a request naming an unregistered model still dispatches (the
+// executor decides), so the registry is advisory, not a gate.
+func (g *Gateway) RegisterModel(m Model) {
+	if strings.TrimSpace(m.ID) == "" {
+		return
+	}
+	if m.OwnedBy == "" {
+		m.OwnedBy = "cerberus"
+	}
+	if m.Created == 0 {
+		m.Created = g.started
+	}
+	g.mu.Lock()
+	g.models[m.ID] = m
+	g.mu.Unlock()
 }
 
-// ChatRequest is the subset of the OpenAI chat-completions request we accept.
-type ChatRequest struct {
-	Model    string        `json:"model"`
-	Messages []ChatMessage `json:"messages"`
+// listModels returns the advertised models in a stable (ID-sorted) order.
+func (g *Gateway) listModels() []Model {
+	g.mu.RLock()
+	out := make([]Model, 0, len(g.models))
+	for _, m := range g.models {
+		out = append(out, m)
+	}
+	g.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
-// ChatChoice mirrors one entry of the OpenAI choices array.
-type ChatChoice struct {
-	Index   int         `json:"index"`
-	Message ChatMessage `json:"message"`
-}
-
-// ChatResponse is the OpenAI-shaped chat-completion response.
-type ChatResponse struct {
-	ID      string       `json:"id"`
-	Object  string       `json:"object"`
-	Created int64        `json:"created"`
-	Model   string       `json:"model,omitempty"`
-	Choices []ChatChoice `json:"choices"`
+// componentFor resolves the WASM component bytes/CID for a requested model name.
+// If the model is registered its ComponentCID is used; otherwise the raw model
+// string is passed through so the executor can still attempt a dispatch (keeping
+// the gateway usable before any model is registered).
+func (g *Gateway) componentFor(model string) []byte {
+	g.mu.RLock()
+	m, ok := g.models[model]
+	g.mu.RUnlock()
+	if ok && m.ComponentCID != "" {
+		return []byte(m.ComponentCID)
+	}
+	return []byte(model)
 }
 
 // errorResponse mirrors OpenAI's {"error": {...}} envelope so SDKs surface it.
@@ -83,109 +147,53 @@ func writeError(w http.ResponseWriter, status int, typ, msg string) {
 	_ = json.NewEncoder(w).Encode(errorResponse{Error: errorBody{Message: msg, Type: typ}})
 }
 
-// validate enforces the request shape before we spend any compute on it.
-func (req *ChatRequest) validate() (int, string) {
-	if strings.TrimSpace(req.Model) == "" {
-		return http.StatusBadRequest, "missing required field: model"
-	}
-	if len(req.Messages) == 0 {
-		return http.StatusBadRequest, "messages must contain at least one message"
-	}
-	if len(req.Messages) > maxMessages {
-		return http.StatusRequestEntityTooLarge, "too many messages"
-	}
-	total := 0
-	for _, m := range req.Messages {
-		if strings.TrimSpace(m.Role) == "" {
-			return http.StatusBadRequest, "message is missing a role"
-		}
-		if m.Content == "" {
-			return http.StatusBadRequest, "message is missing content"
-		}
-		total += len(m.Content)
-		if total > maxContentBytes {
-			return http.StatusRequestEntityTooLarge, "message content too large"
-		}
-	}
-	return 0, ""
-}
-
-func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
-		return
-	}
-
-	// Capability auth: the caller must present a Bearer token granting "exec".
-	// No token, wrong scheme, or insufficient rights → 401, before any parsing.
+// authorize runs the shared Bearer-cap gate for every route: the caller must
+// present a token granting "exec". Returns the verified claims, or writes a 401
+// and returns ok=false. Auth runs before any body parsing so we never spend
+// effort on unauthenticated input.
+func (g *Gateway) authorize(w http.ResponseWriter, r *http.Request) (auth.Claims, bool) {
 	tok := auth.BearerToken(r.Header.Get("Authorization"))
 	if tok == "" {
 		writeError(w, http.StatusUnauthorized, "invalid_request_error", "missing bearer token")
-		return
+		return auth.Claims{}, false
 	}
 	claims, err := g.authz.Authorize(tok, "exec", "")
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid_request_error", "unauthorized: "+err.Error())
-		return
+		return auth.Claims{}, false
 	}
+	return claims, true
+}
 
-	// Bound the body and decode strictly: reject unknown fields and trailing data
-	// so malformed/oversized input is refused rather than silently tolerated.
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	var req ChatRequest
-	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
-		return
-	}
-	if dec.More() {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "unexpected trailing data in body")
-		return
-	}
-	if status, msg := req.validate(); status != 0 {
-		writeError(w, status, "invalid_request_error", msg)
-		return
-	}
-
-	// Map the request to a Cerberus ComputeTask scoped to the caller's subject.
-	// The subject comes from the verified token, never from client-supplied input.
+// dispatch runs the requested component through the executor and returns the
+// resolved result. The subject is taken from the verified token, never from
+// client input, so a request can only ever run as its authenticated principal.
+func (g *Gateway) dispatch(ctx context.Context, subject, model string) (contract.ComputeResult, error) {
 	task := contract.ComputeTask{
-		TaskID:    []byte(claims.Subject + ":" + req.Model),
-		Component: []byte("llm-component-cid"),
+		TaskID:    []byte(subject + ":" + model),
+		Component: g.componentFor(model),
 	}
-
-	promise, err := g.executor.Dispatch(r.Context(), task)
+	promise, err := g.executor.Dispatch(ctx, task)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
-		return
+		return contract.ComputeResult{}, err
 	}
-	result, err := g.executor.Resolve(r.Context(), promise)
+	res, err := g.executor.Resolve(ctx, promise)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
-		return
+		return contract.ComputeResult{}, err
 	}
-
-	resp := ChatResponse{
-		ID:      "chatcmpl-cerberus",
-		Object:  "chat.completion",
-		Created: time.Now().Unix(),
-		Model:   req.Model,
-		Choices: []ChatChoice{{
-			Index:   0,
-			Message: ChatMessage{Role: "assistant", Content: string(result.Output)},
-		}},
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	// Record settlement for a completed, priced task (no-op unless a real
+	// settler was wired). Never fails the request: settlement is a side effect
+	// of a successful compute, not part of the response contract.
+	g.recordSettlement(ctx, task, subject, res)
+	return res, nil
 }
 
 // Handler returns the gateway's HTTP mux (the OpenAI-compatible routes).
 func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", g.HandleChatCompletions)
+	mux.HandleFunc("/v1/completions", g.HandleCompletions)
+	mux.HandleFunc("/v1/models", g.HandleModels)
 	return mux
 }
 
@@ -193,13 +201,17 @@ func (g *Gateway) Handler() http.Handler {
 // (e.g. "127.0.0.1:8080") — the gateway is not a remote admin surface
 // (vertical 10 §7). Timeouts are set so a slow/stalled client can't pin a
 // connection indefinitely.
+//
+// WriteTimeout bounds a whole response including a streamed SSE body, so it is
+// set generously; a client that holds a stream open past it is cut off by
+// design (a localhost gateway is not a long-poll server).
 func (g *Gateway) Start(addr string) error {
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           g.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       120 * time.Second,
 	}
 	return srv.ListenAndServe()
