@@ -430,10 +430,8 @@ mod tests {
     // A module exporting `run` that never returns: `(loop (br 0))` is an unconditional
     // backward branch to itself, spinning forever with no host-visible progress.
     fn infinite_loop_wasm() -> Vec<u8> {
-        wat::parse_str(
-            r#"(module (func (export "run") (result i32) (loop (br 0)) i32.const 0))"#,
-        )
-        .unwrap()
+        wat::parse_str(r#"(module (func (export "run") (result i32) (loop (br 0)) i32.const 0))"#)
+            .unwrap()
     }
 
     #[test]
@@ -473,7 +471,11 @@ mod tests {
         // memory.grow returns -1 (does not trap) when the limiter denies growth, so the
         // guest's `run` still returns cleanly with -1 rather than the host OOM-ing.
         let r = WasmExecutor.run(&Task::wasm(vec![10], memory_hog_wasm()));
-        assert!(r.ok, "grow-denied is a clean -1 return, not an executor error: {}", r.error);
+        assert!(
+            r.ok,
+            "grow-denied is a clean -1 return, not an executor error: {}",
+            r.error
+        );
         assert_eq!(
             r.as_i32(),
             Some(-1),

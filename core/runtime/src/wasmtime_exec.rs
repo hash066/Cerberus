@@ -156,9 +156,11 @@ impl WasmtimeExecutor {
 
         if self.imports == HostImport::Input {
             linker
-                .func_wrap("host", "input", |caller: wasmtime::Caller<'_, ExecState>| {
-                    caller.data().input
-                })
+                .func_wrap(
+                    "host",
+                    "input",
+                    |caller: wasmtime::Caller<'_, ExecState>| caller.data().input,
+                )
                 .map_err(|e| format!("link host.input: {e}"))?;
         }
 
@@ -370,10 +372,8 @@ mod tests {
     // A module exporting `run` that never returns: `(loop (br 0))` is an unconditional
     // backward branch to itself.
     fn infinite_loop_wasm() -> Vec<u8> {
-        wat::parse_str(
-            r#"(module (func (export "run") (result i32) (loop (br 0)) i32.const 0))"#,
-        )
-        .unwrap()
+        wat::parse_str(r#"(module (func (export "run") (result i32) (loop (br 0)) i32.const 0))"#)
+            .unwrap()
     }
 
     // A module with a 1-page memory (no declared maximum) whose `run` tries to grow it

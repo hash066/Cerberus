@@ -49,6 +49,19 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 	if err != nil {
 		return nil, fmt.Errorf("mesh: %w", err)
 	}
+	// composeOK guards the deferred teardown below: it stays false (so every
+	// subsystem constructed so far is torn down) until the very last line of
+	// Compose, right before the success return. Without this, an error on any
+	// later step (mint, listen, dfs store init) returned nil/err while leaking
+	// the already-constructed libp2p host / QUIC listener / tracer — harmless
+	// once, but on a daemon that retries Compose after a transient failure this
+	// leaks a socket and a goroutine per attempt.
+	composeOK := false
+	defer func() {
+		if !composeOK {
+			_ = fab.Close()
+		}
+	}()
 
 	// A topic capability authorizes telemetry publication.
 	topicCap, err := kernel.Mint(
@@ -61,6 +74,11 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 	// Real OpenTelemetry tracing, opt-in via CERBERUS_TRACE so the default daemon
 	// stays quiet but operators get exported spans when they want them.
 	tracer, traceShutdown := telemetry.NewTracerProvider(os.Getenv("CERBERUS_TRACE") != "")
+	defer func() {
+		if !composeOK {
+			_ = traceShutdown(context.Background())
+		}
+	}()
 
 	var self contract.PeerID
 	pub, err := telemetry.New(telemetry.Config{
@@ -73,7 +91,6 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 		Tracer: tracer,
 	})
 	if err != nil {
-		_ = traceShutdown(context.Background())
 		return nil, fmt.Errorf("telemetry: %w", err)
 	}
 
@@ -95,6 +112,11 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 	if err := dp.Listen("127.0.0.1:0"); err != nil {
 		return nil, fmt.Errorf("dataplane listen: %w", err)
 	}
+	defer func() {
+		if !composeOK {
+			_ = dp.Close()
+		}
+	}()
 
 	// The daemon's single data-plane Sink: a router that dispatches each authorized
 	// inbound transfer by id. FS writes register a per-transfer handler that pipes
@@ -157,6 +179,11 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 	if err != nil {
 		return nil, fmt.Errorf("9p listen: %w", err)
 	}
+	defer func() {
+		if !composeOK {
+			_ = nineLn.Close()
+		}
+	}()
 	wire := ninep.NewWireServer(ns)
 
 	// Seed the scheduler with the local node so it can place work.
@@ -182,6 +209,7 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string) (*Syst
 		return nil
 	}))
 
+	composeOK = true
 	return &System{
 		Kernel:        kernel,
 		Fabric:        fab,
