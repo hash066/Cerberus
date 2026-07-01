@@ -21,6 +21,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -206,13 +207,26 @@ func (g *Gateway) Handler() http.Handler {
 // set generously; a client that holds a stream open past it is cut off by
 // design (a localhost gateway is not a long-poll server).
 func (g *Gateway) Start(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return g.Serve(ln)
+}
+
+// Serve is like Start but serves on an already-bound net.Listener instead of
+// calling http.Server.ListenAndServe internally. This lets a caller bind the
+// listener itself first (net.Listen), inspect/react to a bind failure (e.g.
+// fall back to an ephemeral port on a conflict), and log the real bound
+// address — none of which is observable through the opaque ListenAndServe
+// path. Start is kept as a thin wrapper over this for backward compatibility.
+func (g *Gateway) Serve(ln net.Listener) error {
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           g.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       120 * time.Second,
 	}
-	return srv.ListenAndServe()
+	return srv.Serve(ln)
 }

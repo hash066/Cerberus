@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -171,5 +172,37 @@ func TestGatewayValidationRunsAfterAuth(t *testing.T) {
 	gw.HandleChatCompletions(w, newReqBody("", `{garbage`))
 	if w.Result().StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 (auth first), got %d", w.Result().StatusCode)
+	}
+}
+
+// TestServeOverListener covers the Serve(net.Listener) variant cerberusd's
+// main() now uses: the caller binds the listener itself first (so a bind
+// conflict on the configured address is visible and can fall back to an
+// ephemeral port), then hands the listener to Serve instead of letting
+// Start's internal ListenAndServe swallow the bind step silently.
+func TestServeOverListener(t *testing.T) {
+	iss, tok := execToken(t)
+	gw := gateway.NewGateway(&mockExecutor{}, iss)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- gw.Serve(ln) }()
+	defer ln.Close()
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/v1/models", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/models over bound listener: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/v1/models over Serve(ln) should be 200, got %d", resp.StatusCode)
 	}
 }

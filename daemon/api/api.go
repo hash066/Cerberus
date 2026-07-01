@@ -14,6 +14,7 @@ package api
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"time"
 
@@ -220,15 +221,27 @@ func (s *Server) Handler() http.Handler {
 // this same process's /healthz — a trivial Slowloris would otherwise make a
 // healthy node look dead to anything polling liveness.
 func (s *Server) Start(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return s.Serve(ln)
+}
+
+// Serve is like Start but serves on an already-bound net.Listener instead of
+// calling net.Listen internally, so a caller can bind the listener itself
+// first, react to a bind failure (e.g. fall back to an ephemeral port on
+// conflict), and log the real bound address. Start is a thin wrapper over
+// this for backward compatibility. Timeouts mirror daemon/gateway's Start.
+func (s *Server) Serve(ln net.Listener) error {
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	return srv.ListenAndServe()
+	return srv.Serve(ln)
 }
 
 // requireRead wraps a handler with capability auth (Bearer token granting "read").

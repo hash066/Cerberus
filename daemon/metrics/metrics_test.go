@@ -1,6 +1,7 @@
 package metrics_test
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -199,5 +200,31 @@ func TestMetricsEndpointAuthGated(t *testing.T) {
 	srv.Handler().ServeHTTP(w, req)
 	if w.Result().StatusCode != http.StatusOK {
 		t.Fatalf("metrics with valid token should be 200, got %d", w.Result().StatusCode)
+	}
+}
+
+// TestServeOverListener covers the Serve(net.Listener) variant cerberusd's
+// main() now uses: the caller binds the listener itself first (so a bind
+// conflict on the configured address is visible and can fall back to an
+// ephemeral port), then hands the listener to Serve instead of letting
+// Start's internal ListenAndServe swallow the bind step silently.
+func TestServeOverListener(t *testing.T) {
+	srv := metrics.New(metrics.NewMetrics().Registry, nil, nil)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ln) }()
+	defer ln.Close()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz over bound listener: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz over Serve(ln) should be 200, got %d", resp.StatusCode)
 	}
 }

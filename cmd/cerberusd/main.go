@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -18,6 +19,7 @@ import (
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/api"
 	"github.com/hash066/cerberus/daemon/auth"
+	"github.com/hash066/cerberus/daemon/discovery"
 	"github.com/hash066/cerberus/daemon/ffi"
 	"github.com/hash066/cerberus/daemon/gateway"
 	"github.com/hash066/cerberus/daemon/ledger"
@@ -100,6 +102,19 @@ func main() {
 		}
 		return
 	}
+
+	// Single-instance guard: a second cerberusd on this machine must not
+	// silently race the first for the same ports (the exact failure mode this
+	// whole change closes). AcquireLock rejects with ErrAlreadyRunning only
+	// when the lock names a PID that is still alive; a stale lock (prior
+	// daemon crashed) is reclaimed automatically.
+	if lerr := discovery.AcquireLock(); lerr != nil {
+		if errors.Is(lerr, discovery.ErrAlreadyRunning) {
+			log.Fatalf("cerberusd: another instance is already running (see %s) — refusing to start a second daemon that would silently race it for ports", discovery.LockPath())
+		}
+		log.Fatalf("cerberusd: could not acquire single-instance lock: %v", lerr)
+	}
+	defer discovery.Remove()
 
 	k := ffi.NewKernel()
 	h, err := k.Mint(
@@ -227,13 +242,26 @@ func main() {
 	localExec := wasm.NewExecutor(e2enode.HelloShardWASM())
 
 	// Start Gateway with the real executor (no mock), auth-gated.
+	//
+	// Bind happens HERE, synchronously, before the goroutine — not inside
+	// Gateway.Start — so a conflict on *gwAddr (another process, or a second
+	// cerberusd instance racing this one) is visible immediately and falls
+	// back to an OS-assigned ephemeral port instead of the historical failure
+	// mode: Start's internal http.ListenAndServe fails deep in a goroutine, the
+	// error is merely logged, and the daemon carries on with the gateway
+	// silently unreachable.
 	gw := gateway.NewGateway(localExec, issuer)
-	go func() {
-		log.Printf("Starting Gateway on %s (Bearer token required)", *gwAddr)
-		if err := gw.Start(*gwAddr); err != nil {
-			log.Printf("Gateway error: %v", err)
-		}
-	}()
+	gwLn := bindWithFallback("gateway", *gwAddr)
+	gwActualAddr := ""
+	if gwLn != nil {
+		gwActualAddr = gwLn.Addr().String()
+		go func() {
+			log.Printf("Starting Gateway on %s (Bearer token required)", gwActualAddr)
+			if err := gw.Serve(gwLn); err != nil {
+				log.Printf("Gateway error: %v", err)
+			}
+		}()
+	}
 
 	// Start the status API the desktop tray/dashboard consumes (token-gated).
 	started := time.Now()
@@ -262,27 +290,37 @@ func main() {
 			},
 		}
 	})
-	go func() {
-		log.Printf("Starting status API on %s (Bearer token required)", *apiAddr)
-		if err := apiSrv.Start(*apiAddr); err != nil {
-			log.Printf("API error: %v", err)
-		}
-	}()
+	apiLn := bindWithFallback("status API", *apiAddr)
+	apiActualAddr := ""
+	if apiLn != nil {
+		apiActualAddr = apiLn.Addr().String()
+		go func() {
+			log.Printf("Starting status API on %s (Bearer token required)", apiActualAddr)
+			if err := apiSrv.Serve(apiLn); err != nil {
+				log.Printf("API error: %v", err)
+			}
+		}()
+	}
 
 	// Observability: Prometheus /metrics (token-gated) + /healthz + /readyz.
 	met := metrics.NewMetrics()
-	go func() {
-		ms := metrics.New(met.Registry, issuer, func() (bool, string) {
-			if fabric == nil {
-				return false, "mesh down"
+	metricsLn := bindWithFallback("metrics", *metricsAddr)
+	metricsActualAddr := ""
+	if metricsLn != nil {
+		metricsActualAddr = metricsLn.Addr().String()
+		go func() {
+			ms := metrics.New(met.Registry, issuer, func() (bool, string) {
+				if fabric == nil {
+					return false, "mesh down"
+				}
+				return true, ""
+			})
+			log.Printf("Starting metrics on %s (/metrics token-gated; /healthz /readyz open)", metricsActualAddr)
+			if err := ms.Serve(metricsLn); err != nil {
+				log.Printf("metrics error: %v", err)
 			}
-			return true, ""
-		})
-		log.Printf("Starting metrics on %s (/metrics token-gated; /healthz /readyz open)", *metricsAddr)
-		if err := ms.Start(*metricsAddr); err != nil {
-			log.Printf("metrics error: %v", err)
-		}
-	}()
+		}()
+	}
 	// Keep the peer gauge live from the real fabric.
 	if fabric != nil {
 		go func() {
@@ -324,16 +362,74 @@ func main() {
 	if err != nil {
 		log.Fatalf("RPC listen error: %v", err)
 	}
+	rpcActualAddr := l.Addr().String()
 	go func() {
-		log.Printf("Starting RPC server on %s", *rpcAddr)
+		log.Printf("Starting RPC server on %s", rpcActualAddr)
 		rpc.Accept(l)
 	}()
+
+	// Now that every subsystem has attempted to bind (RPC hard-fails above on
+	// conflict; gateway/API/metrics fall back to an ephemeral port and log
+	// clearly instead), publish what this instance ACTUALLY bound to. Any
+	// client (cerberus CLI, the tray, a third-party tool) reads this instead of
+	// assuming the hardcoded defaults agree with what's really listening.
+	manifest := discovery.Manifest{
+		Version:     contract.ContractVersion,
+		PID:         os.Getpid(),
+		StartedAt:   started.UTC(),
+		Profile:     *profile,
+		GatewayAddr: gwActualAddr,
+		APIAddr:     apiActualAddr,
+		MetricsAddr: metricsActualAddr,
+		RPCAddr:     rpcActualAddr,
+		TokenPath:   tokenPath,
+	}
+	if meshFabric != nil {
+		manifest.Site = "local"
+	}
+	if werr := discovery.Write(manifest); werr != nil {
+		log.Printf("cerberusd: warning: could not write discovery manifest: %v", werr)
+	} else {
+		log.Printf("cerberusd: discovery manifest written to %s", discovery.Path())
+	}
 
 	// Wait for termination
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	<-sigs
 	fmt.Println("\ncerberusd shutting down...")
+}
+
+// bindWithFallback binds addr with net.Listen("tcp", addr). If that fails
+// (most commonly EADDRINUSE — another process, or a second cerberusd, already
+// holds the port), it retries once against the same host with port 0 (an
+// OS-assigned ephemeral port) and logs the fallback clearly, instead of the
+// historical behavior of silently giving up and leaving the subsystem
+// unreachable. name is used only for the log line (e.g. "gateway").
+//
+// Returns the listener actually bound (nil if even the ephemeral retry
+// failed, which should now be rare — e.g. the interface itself is gone).
+func bindWithFallback(name, addr string) net.Listener {
+	ln, err := net.Listen("tcp", addr)
+	if err == nil {
+		return ln
+	}
+	log.Printf("%s: %s unavailable (%v); falling back to an OS-assigned ephemeral port", name, addr, err)
+
+	host, _, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		// addr had no port (or was malformed) — nothing sensible to keep as the
+		// host, so let the OS pick an all-interfaces ephemeral port.
+		host = ""
+	}
+	fallbackAddr := net.JoinHostPort(host, "0")
+	ln, err = net.Listen("tcp", fallbackAddr)
+	if err != nil {
+		log.Printf("%s: ephemeral-port fallback also failed: %v — this subsystem will be unreachable", name, err)
+		return nil
+	}
+	log.Printf("%s: %s unavailable, falling back to ephemeral port %s", name, addr, ln.Addr().String())
+	return ln
 }
 
 func splitCSV(s string) []string {
