@@ -120,30 +120,54 @@ func Remove() {
 // already holds the lock file.
 var ErrAlreadyRunning = errors.New("discovery: another cerberusd instance is already running")
 
-// AcquireLock is the single-instance guard. It is a best-effort PID-file lock
-// (no cross-platform flock in the standard library): if LockPath() exists and
-// names a PID that is still alive, AcquireLock fails with ErrAlreadyRunning
-// rather than letting a second daemon silently race the first for the same
-// ports. If the lock file is stale (process no longer exists -- e.g. the prior
-// daemon crashed), it is reclaimed automatically.
+// AcquireLock is the single-instance guard. Winning is decided by an atomic
+// O_CREATE|O_EXCL file create, not by a separate read-then-write: two
+// processes racing to start at the same instant can't both observe "no live
+// holder" and both proceed, because only one O_EXCL create can ever succeed
+// for a given path. (An earlier version of this function did read-then-write,
+// which had exactly that TOCTOU window -- fixed here.)
 //
-// A live PID always rejects, even the caller's own -- cerberusd calls this
+// If the lock file already exists, its PID is checked: a live PID rejects
+// with ErrAlreadyRunning (even the caller's own -- cerberusd calls this
 // exactly once at startup, so there is no legitimate "reacquire my own lock"
-// case, and treating one uniformly as "already running" keeps the guard
-// simple and means a real second instance (a genuinely different PID) is
-// rejected by the exact same code path this is tested against.
+// case). A stale lock (unreadable PID, or the process no longer exists -- the
+// prior daemon crashed) is removed and the create is retried; if that retry
+// races with another reclaimer, the loop simply tries again.
 func AcquireLock() error {
 	if err := os.MkdirAll(dir(), 0o700); err != nil {
 		return fmt.Errorf("discovery: mkdir: %w", err)
 	}
-	if b, err := os.ReadFile(LockPath()); err == nil {
+	for {
+		f, err := os.OpenFile(LockPath(), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, werr := f.WriteString(fmt.Sprintf("%d", os.Getpid()))
+			cerr := f.Close()
+			if werr != nil {
+				return fmt.Errorf("discovery: write lock: %w", werr)
+			}
+			if cerr != nil {
+				return fmt.Errorf("discovery: close lock: %w", cerr)
+			}
+			return nil
+		}
+		if !os.IsExist(err) {
+			return fmt.Errorf("discovery: create lock: %w", err)
+		}
+
+		b, rerr := os.ReadFile(LockPath())
+		if rerr != nil {
+			// Lost a race with a concurrent reclaim (the file vanished between
+			// our failed create and this read) -- just retry from the top.
+			continue
+		}
 		var pid int
 		if _, scanErr := fmt.Sscanf(string(b), "%d", &pid); scanErr == nil && pid > 0 && IsRunning(pid) {
 			return ErrAlreadyRunning
 		}
-		// Stale lock (unreadable PID, or process no longer exists): reclaim it.
+		// Stale: reclaim and retry the exclusive create. If another process
+		// reclaims first, our next O_EXCL attempt simply fails and loops again.
+		_ = os.Remove(LockPath())
 	}
-	return os.WriteFile(LockPath(), []byte(fmt.Sprintf("%d", os.Getpid())), 0o600)
 }
 
 // IsRunning reports whether a process with the given PID currently exists.

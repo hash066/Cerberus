@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -53,6 +54,51 @@ func TestAcquireLockRejectsSecondLiveHolder(t *testing.T) {
 	// rejected rather than silently racing the first for the same ports.
 	if err := AcquireLock(); err != ErrAlreadyRunning {
 		t.Fatalf("second AcquireLock: got %v, want ErrAlreadyRunning", err)
+	}
+}
+
+// TestAcquireLockIsRaceFree proves the TOCTOU window a prior read-then-write
+// implementation had is actually closed: many goroutines race to call
+// AcquireLock at the same instant (all sharing this process's PID, since
+// that's the only way to exercise the race within a single test binary), and
+// exactly one must win. A read-then-write implementation would let more than
+// one goroutine observe "no live holder" in the same window and both succeed;
+// the O_CREATE|O_EXCL implementation cannot, because only one exclusive
+// create for a given path can ever succeed at the OS level.
+func TestAcquireLockIsRaceFree(t *testing.T) {
+	t.Setenv("AppData", t.TempDir())
+	const n = 64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	results := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- AcquireLock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes, alreadyRunning := 0, 0
+	for err := range results {
+		switch err {
+		case nil:
+			successes++
+		case ErrAlreadyRunning:
+			alreadyRunning++
+		default:
+			t.Fatalf("unexpected error from a racing AcquireLock: %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("expected exactly 1 winner among %d racing callers, got %d (successes=%d, rejected=%d)", n, successes, successes, alreadyRunning)
+	}
+	if alreadyRunning != n-1 {
+		t.Fatalf("expected the other %d callers to be rejected, got %d", n-1, alreadyRunning)
 	}
 }
 

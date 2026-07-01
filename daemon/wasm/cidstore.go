@@ -8,10 +8,13 @@ package wasm
 // worker cannot be fed an unverifiable payload"). It mirrors the SHA-256 CIDv1
 // content store in core/runtime (Phase E2, Rust) on the Go control-plane side.
 //
-// The store is in-memory: correct and sufficient for v0.1 (both demo nodes embed
-// the hello-shard bytes and register them by CID, so the worker looks the
-// component up by CID). A persistent / peer-to-peer IPLD fetch is the documented
-// next step (HANDOFF.md Phase E roadmap item 2), not faked here.
+// The store itself is in-memory and local-only -- correct as a per-node cache,
+// but not persistent across a restart. Peer-to-peer fetch on a local miss is
+// real and lives one layer up: daemon/mesh/component.go's ServeComponentFetch/
+// RequestComponent asks a mesh peer for the bytes (re-verifying the CID before
+// accepting them) and populates this store on success. A persistent (on-disk)
+// cache is the remaining documented next step; the peer-fetch half is not a
+// stub anymore.
 
 import (
 	"fmt"
