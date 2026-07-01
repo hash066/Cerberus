@@ -14,8 +14,15 @@ import (
 func isolateConfigDir(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
-	t.Setenv("AppData", dir)
+	// os.UserConfigDir() reads a different var per OS. Overriding only XDG/AppData
+	// leaves macOS ($HOME/Library/Application Support) pointed at the real user
+	// dir, where a concurrently-running package's test (e.g. cmd/cerberus's
+	// discovery_test) may have left a daemon.json manifest — which resolveAddrs()
+	// would then read instead of the intended default. Set HOME too so this test
+	// is isolated on every OS.
+	t.Setenv("XDG_CONFIG_HOME", dir) // Linux
+	t.Setenv("AppData", dir)         // Windows
+	t.Setenv("HOME", dir)            // macOS (and Linux fallback when XDG unset)
 }
 
 func TestResolveAddrs_HardcodedDefaultsWhenNothingElsePresent(t *testing.T) {

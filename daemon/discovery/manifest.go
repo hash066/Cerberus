@@ -120,12 +120,14 @@ func Remove() {
 // already holds the lock file.
 var ErrAlreadyRunning = errors.New("discovery: another cerberusd instance is already running")
 
-// AcquireLock is the single-instance guard. Winning is decided by an atomic
-// O_CREATE|O_EXCL file create, not by a separate read-then-write: two
-// processes racing to start at the same instant can't both observe "no live
-// holder" and both proceed, because only one O_EXCL create can ever succeed
-// for a given path. (An earlier version of this function did read-then-write,
-// which had exactly that TOCTOU window -- fixed here.)
+// AcquireLock is the single-instance guard. Winning is decided by atomically
+// hard-linking a temp file (already containing our PID) onto LockPath: like
+// O_CREATE|O_EXCL, only one linker can win for a given path, so two processes
+// racing to start can't both proceed -- but unlike O_EXCL it never exposes a
+// created-but-not-yet-written empty file that a concurrent caller could misread
+// as stale and unlink out from under the winner (that window let two callers
+// both win on POSIX; see the loop body). An even earlier version did
+// read-then-write, which had a plain TOCTOU window -- both are fixed here.
 //
 // If the lock file already exists, its PID is checked: a live PID rejects
 // with ErrAlreadyRunning (even the caller's own -- cerberusd calls this
@@ -138,26 +140,48 @@ func AcquireLock() error {
 		return fmt.Errorf("discovery: mkdir: %w", err)
 	}
 	for {
-		f, err := os.OpenFile(LockPath(), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			_, werr := f.WriteString(fmt.Sprintf("%d", os.Getpid()))
-			cerr := f.Close()
+		// Publish the lock atomically WITH its content. A plain
+		// O_CREATE|O_EXCL create makes an EMPTY file first and writes the PID as
+		// a separate step; a racer that observes that momentarily-empty file
+		// reads an unparseable PID, judges the lock stale, and unlinks it -- and
+		// on POSIX unlinking a file another process still holds open SUCCEEDS --
+		// so a second caller then wins its own create too, yielding TWO owners.
+		// (Windows happens to mask this because it refuses to unlink an open
+		// file; Linux/macOS do not -- which is why the race-free test caught 2
+		// winners only off Windows.) Writing the PID into a unique temp file and
+		// hard-linking it into place means LockPath, the instant it exists,
+		// already carries a valid PID -- there is no empty window to misjudge.
+		tmp, err := os.CreateTemp(dir(), "daemon.lock.*.tmp")
+		if err != nil {
+			return fmt.Errorf("discovery: create temp lock: %w", err)
+		}
+		tmpName := tmp.Name()
+		_, werr := tmp.WriteString(fmt.Sprintf("%d", os.Getpid()))
+		cerr := tmp.Close()
+		if werr != nil || cerr != nil {
+			_ = os.Remove(tmpName)
 			if werr != nil {
 				return fmt.Errorf("discovery: write lock: %w", werr)
 			}
-			if cerr != nil {
-				return fmt.Errorf("discovery: close lock: %w", cerr)
-			}
+			return fmt.Errorf("discovery: close lock: %w", cerr)
+		}
+
+		// os.Link fails with an IsExist error if LockPath already exists, giving
+		// the same "exactly one creator wins" guarantee O_EXCL did, but for a
+		// file that is already fully populated.
+		linkErr := os.Link(tmpName, LockPath())
+		_ = os.Remove(tmpName) // drop the temp name either way (the inode lives on via LockPath if we won)
+		if linkErr == nil {
 			return nil
 		}
-		if !os.IsExist(err) {
-			return fmt.Errorf("discovery: create lock: %w", err)
+		if !os.IsExist(linkErr) {
+			return fmt.Errorf("discovery: create lock: %w", linkErr)
 		}
 
 		b, rerr := os.ReadFile(LockPath())
 		if rerr != nil {
 			// Lost a race with a concurrent reclaim (the file vanished between
-			// our failed create and this read) -- just retry from the top.
+			// our failed link and this read) -- just retry from the top.
 			continue
 		}
 		var pid int
@@ -165,7 +189,7 @@ func AcquireLock() error {
 			return ErrAlreadyRunning
 		}
 		// Stale: reclaim and retry the exclusive create. If another process
-		// reclaims first, our next O_EXCL attempt simply fails and loops again.
+		// reclaims first, our next Link attempt simply fails and loops again.
 		_ = os.Remove(LockPath())
 	}
 }

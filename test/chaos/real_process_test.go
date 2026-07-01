@@ -369,11 +369,26 @@ func dialRPC(ctx context.Context, addr string) (*rpc.Client, error) {
 	}
 }
 
+// nodeConfigDir returns the directory the CHILD cerberusd actually derives from
+// os.UserConfigDir() given this test's env overrides (AppData=XDG_CONFIG_HOME=
+// HOME=configDir). On Windows (%AppData%) and Linux ($XDG_CONFIG_HOME) that IS
+// configDir, but on macOS os.UserConfigDir() ignores both and returns
+// $HOME/Library/Application Support — so the daemon's token and persistence
+// live one level deeper there. The test must read the SAME path the daemon
+// wrote, or it waits forever for a token that was written elsewhere (this is
+// what timed the test out on the macOS CI runner, and only there).
+func nodeConfigDir(configDir string) string {
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(configDir, "Library", "Application Support")
+	}
+	return configDir
+}
+
 // operatorToken reads the token cerberusd wrote to THIS node's isolated config
-// dir (auth.OperatorTokenPath under the overridden AppData/XDG_CONFIG_HOME),
+// dir (auth.OperatorTokenPath under the overridden AppData/XDG_CONFIG_HOME/HOME),
 // retrying since the daemon writes it slightly after the RPC listener opens.
 func operatorToken(ctx context.Context, configDir string) (string, error) {
-	path := filepath.Join(configDir, "cerberus", "operator.token")
+	path := filepath.Join(nodeConfigDir(configDir), "cerberus", "operator.token")
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {

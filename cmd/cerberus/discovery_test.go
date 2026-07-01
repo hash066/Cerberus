@@ -19,8 +19,15 @@ import (
 // duration of the test, mirroring daemon/discovery's own test helper.
 func isolateManifestDir(t *testing.T) {
 	t.Helper()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("AppData", t.TempDir())
+	// One temp dir for all three vars: os.UserConfigDir() reads %AppData% on
+	// Windows, $XDG_CONFIG_HOME on Linux, and $HOME/Library/Application Support
+	// on macOS. Setting only XDG/AppData left this test writing manifests into
+	// the REAL macOS user config dir, polluting it for other packages' tests
+	// (cmd/cerberus-mcp read a leftover manifest from here). Override all three.
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp) // Linux
+	t.Setenv("AppData", tmp)         // Windows
+	t.Setenv("HOME", tmp)            // macOS (and Linux fallback when XDG unset)
 }
 
 func TestResolveAddr_EnvOverridesManifest(t *testing.T) {

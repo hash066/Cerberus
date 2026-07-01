@@ -154,9 +154,10 @@ func TestConcurrentPublishSubscribeNoCorruption(t *testing.T) {
 	// gossipsub, so we drive this with a distinct key per subscriber and count
 	// via the local dispatch fan-out, which is what actually races on subs).
 	type sub struct {
-		key string
-		ch  <-chan contract.Sample
-		got int32
+		key      string
+		ch       <-chan contract.Sample
+		got      int32
+		wrongKey int32 // samples delivered for a key this sub did not subscribe to
 	}
 	subs := make([]*sub, nSubs)
 	var subWG sync.WaitGroup
@@ -173,9 +174,12 @@ func TestConcurrentPublishSubscribeNoCorruption(t *testing.T) {
 			defer subWG.Done()
 			for {
 				select {
-				case _, ok := <-s.ch:
+				case sample, ok := <-s.ch:
 					if !ok {
 						return
+					}
+					if sample.Key != s.key {
+						atomic.AddInt32(&s.wrongKey, 1)
 					}
 					atomic.AddInt32(&s.got, 1)
 				case <-ctx.Done():
@@ -238,11 +242,33 @@ func TestConcurrentPublishSubscribeNoCorruption(t *testing.T) {
 	cancel()
 	subWG.Wait()
 
+	// dispatch() applies drop-on-full back-pressure (see mesh.go: a non-blocking
+	// send that "drops for slow consumers rather than block the bus"), so when a
+	// burst outruns a subscription's 64-deep buffer some samples are
+	// INTENTIONALLY dropped — that is the documented contract, not corruption,
+	// and exactly how many are dropped depends on goroutine scheduling, so an
+	// exact received-count is inherently racy across platforms (it happened to
+	// hold on Linux but not macOS/Windows). What must ALWAYS hold, even under the
+	// concurrent Subscribe/unsubscribe churn above, is that every long-lived
+	// subscriber: (a) only ever sees samples for its OWN key — a sample for a
+	// different key would mean the shared subs slice got corrupted into
+	// cross-talk; (b) stays registered and keeps receiving (got > 0); and (c)
+	// never receives MORE than was published to its key (duplicate delivery would
+	// likewise indicate a dispatch/subs race). Assert those invariants rather
+	// than exact-once delivery, which the lossy bus does not promise.
 	wantPerSub := int32(nPublishers * nPubsPerGoroutine)
 	for i, s := range subs {
+		if wrong := atomic.LoadInt32(&s.wrongKey); wrong != 0 {
+			t.Errorf("subscriber %d (%s): received %d sample(s) for a DIFFERENT key — dispatch delivered cross-talk (corrupted subs slice)",
+				i, s.key, wrong)
+		}
 		got := atomic.LoadInt32(&s.got)
-		if got != wantPerSub {
-			t.Errorf("subscriber %d (%s): got %d messages, want %d — possible lost update or dispatch race on Fabric.subs",
+		if got <= 0 {
+			t.Errorf("subscriber %d (%s): received 0 messages — subscription appears lost under concurrent churn",
+				i, s.key)
+		}
+		if got > wantPerSub {
+			t.Errorf("subscriber %d (%s): got %d messages, want at most %d — duplicate delivery indicates a dispatch/subs race",
 				i, s.key, got, wantPerSub)
 		}
 	}
