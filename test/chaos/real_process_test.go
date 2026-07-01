@@ -491,6 +491,19 @@ func TestRealProcessKillAndRestartConvergesRevocation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real-process chaos test in -short mode (spawns real cerberusd OS processes; takes real wall-clock time for mDNS discovery)")
 	}
+	if runtime.GOOS == "darwin" && os.Getenv("GITHUB_ACTIONS") != "" {
+		// GitHub-hosted macOS runners restrict the UDP multicast that libp2p's
+		// mDNS peer discovery relies on, so two real cerberusd processes on the
+		// same runner never discover each other: the daemons come up fine (this
+		// test reaches "both daemons ready" in ~60ms) but waitMeshConverged then
+		// exhausts its full 60s budget. This is a limitation of that CI
+		// environment, not of the mesh — the SAME real-mDNS path converges on
+		// the Linux and Windows runners (and on a real macOS dev box, where
+		// GITHUB_ACTIONS is unset, this test still runs). Skipping here keeps the
+		// signal honest instead of asserting a network capability the runner
+		// does not provide.
+		t.Skip("GitHub-hosted macOS runners restrict multicast; libp2p mDNS cannot converge there (covered on the Linux/Windows runners and on real macOS)")
+	}
 
 	testStart := time.Now()
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
