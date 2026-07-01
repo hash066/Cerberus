@@ -1,6 +1,155 @@
 # Cerberus
 
-> **Volume II (latest):** The hardened, zero-trust production spec is [ARCHITECTURE.md](ARCHITECTURE.md) (canonical). Start with [ideadumpp2.md](docs/research/ideadumpp2.md) for the narrative debate and Go-To-Market; deep dives per-vertical under [docs/verticals/](docs/verticals/). Below is **Volume I** (the original P2P hyper-computer spec).
+**A zero-trust, masterless distributed hypervisor for your own machines.**
+
+Launch one small daemon on each Mac, PC, or Linux box you own. They discover each
+other on your LAN with zero configuration and become a single private mesh that
+runs sandboxed workloads — where software can only touch a resource if it holds an
+unforgeable **capability** for it. No master node, no cloud account, no ambient
+authority.
+
+<p>
+  <img alt="status: v0.1" src="https://img.shields.io/badge/status-v0.1-blue">
+  <img alt="Go 1.22+" src="https://img.shields.io/badge/Go-1.22%2B-00ADD8">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-orange">
+  <img alt="platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey">
+  <img alt="license" src="https://img.shields.io/badge/license-TBD-lightgrey">
+</p>
+
+## Why Cerberus
+
+- **Masterless & zero-config** — nodes auto-discover over mDNS on the LAN and
+  coordinate directly over libp2p/QUIC. Any node can drop without killing the mesh.
+- **Zero-trust by construction** — no passwords or roles. Every action presents an
+  Ed25519 capability you can narrow, delegate, and revoke; revocations gossip
+  mesh-wide and survive restart.
+- **Heterogeneous by default** — workloads compile to **WebAssembly** components,
+  so an ARM Mac and an x86 PC run the same shard. No cross-compiling native binaries.
+- **OpenAI-compatible gateway** — point any OpenAI SDK at `http://localhost:8080/v1`
+  with your token and dispatch compute to the mesh.
+- **Two profiles, one binary** — `open_mesh` (compute economy on) and `sealed`
+  (economy off, attestation on), a boot-time switch.
+
+> **Maturity, honestly.** v0.1 has a real capability kernel, real WASM execution, a
+> real libp2p/QUIC mesh, durable state, and a working gateway path. Hardware/OS
+> edges (GPU dispatch, FUSE/WinFsp mounts, OS audio capture, the Tauri GUI) and
+> Frontier bets (zk-WASM, host-TEE, RDMA) are **documented stubs, never faked**.
+> See [VISION-AND-ROADMAP.md](VISION-AND-ROADMAP.md).
+
+---
+
+## 5-minute Quickstart
+
+**Prerequisites:** Go 1.22+ (required). Rust/cargo recommended. The default build
+is pure-Go — no C toolchain needed.
+
+```bash
+# 1. Clone and build
+git clone https://github.com/hash066/Cerberus.git
+cd Cerberus
+go build ./...            # or: task build
+
+# 2. Prove it works end-to-end: two daemons discover each other and run a
+#    WASM shard remotely (prints "... returned 1337.")
+go run ./test/e2e        # or: task demo
+
+# 3. Start the daemon (leave it running)
+go run ./cmd/cerberusd
+#   → serves gateway :8080, status API 127.0.0.1:7777,
+#     metrics 127.0.0.1:7779, RPC 127.0.0.1:9092
+#   → writes an operator token to your OS config dir
+```
+
+In a **second terminal**, load the operator token and talk to the daemon:
+
+```bash
+# Load the token the daemon wrote (Linux/macOS shown; see docs for Windows)
+export CERBERUS_TOKEN="$(cat ~/.config/cerberus/operator.token)"
+
+# Check status (talks RPC on :9092)
+go run ./cmd/cerberus status
+#   Cerberus Daemon Status
+#   Version: 0.1.0
+#   State:   Running (Power: AC, Battery: 100.0%)
+#   Auth:    authenticated as "operator"
+
+# Call the OpenAI-compatible gateway (Bearer token required)
+curl -sS http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $CERBERUS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"cerberus-shard","messages":[{"role":"user","content":"hello"}]}'
+
+# View health + metrics
+curl -sS http://127.0.0.1:7779/healthz                        # → ok
+curl -sS http://127.0.0.1:7779/metrics -H "Authorization: Bearer $CERBERUS_TOKEN"
+```
+
+**Add a second node:** run `go run ./cmd/cerberusd` on another machine on the same
+LAN. Within seconds they discover each other — confirm via the `peers` array:
+
+```bash
+curl -sS http://127.0.0.1:7777/api/v1/status -H "Authorization: Bearer $CERBERUS_TOKEN"
+#   → "mesh_up": true, "peers": ["<peer addr>", ...]
+```
+
+> The gateway in v0.1 dispatches through the **real WASM executor**, but the wired
+> component is the demo shard — the request/response *shape* is genuine OpenAI, the
+> *model* behind it is not yet an LLM. See [docs/gateway.md](docs/gateway.md).
+
+Full walkthrough (operator token per-OS, profiles, troubleshooting):
+**[docs/getting-started.md](docs/getting-started.md)**.
+
+---
+
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| **[Getting Started](docs/getting-started.md)** | install/build, first run, the operator token, profiles, a 2nd node, first workload, troubleshooting |
+| **[CLI Reference](docs/cli.md)** | every `cerberus` command with examples and output |
+| **[Gateway API](docs/gateway.md)** | the OpenAI-compatible API — curl + Python `openai` client, endpoints, errors |
+| **[User Guide](docs/user-guide.md)** | capabilities & security model, the two profiles, peripheral pooling, the desktop app, the economy |
+| **[Architecture](ARCHITECTURE.md)** | the canonical system specification (Volume II) |
+| **[Vision & Roadmap](VISION-AND-ROADMAP.md)** | where it's going, what's real vs stub, ownership |
+| **[Handoff](HANDOFF.md)** | the deep technical "where things actually stand" |
+| **[Contributing conventions](CLAUDE.md)** | build rules, lanes, the frozen contract |
+
+## Repository layout
+
+```
+cmd/        cerberusd (daemon), cerberus (CLI)
+daemon/     Go control plane: auth gateway api mesh scheduler ninep dataplane
+            audio telemetry metrics lifecycle economy ledger state store system
+core/       Rust core: ocap crdt runtime identity economy cabi (C-ABI for cgo)
+contract/   frozen integration types (Go + Rust)  — do not edit casually
+proto/ components/wit/ schemas/   frozen contract sources
+tray/       Tauri v2 desktop app
+test/e2e    2-process acceptance demo (prints 1337)
+docs/       getting-started, cli, gateway, user-guide, verticals/, ARCHITECTURE refs
+```
+
+## Commands
+
+```bash
+task build   # build Go + Rust   (raw: go build ./... && cargo build)
+task test    # unit tests        (raw: go test ./... && cargo test)
+task demo    # 2-node WASM-exec acceptance demo (raw: go run ./test/e2e)
+task lint    # golangci-lint + clippy
+```
+
+If `task` isn't installed: `go install github.com/go-task/task/v3/cmd/task@latest`,
+or run the raw commands shown above / in [Taskfile.yml](Taskfile.yml).
+
+---
+
+<details>
+<summary><strong>Volume I — the original P2P hyper-computer spec</strong> (historical; the canonical spec is now <a href="ARCHITECTURE.md">ARCHITECTURE.md</a>)</summary>
+
+> **Note:** The section below is the original narrative specification, retained for
+> provenance. The hardened, zero-trust production spec is
+> [ARCHITECTURE.md](ARCHITECTURE.md) (canonical); the narrative debate and
+> Go-To-Market live in [docs/research/ideadumpp2.md](docs/research/ideadumpp2.md),
+> with per-vertical deep dives under [docs/verticals/](docs/verticals/).
 
 # Project Cerberus (Voltron): Production-Grade Architecture & Technical Specification
 
@@ -310,3 +459,6 @@ To get that "all resources combined" feel for hardware like mics, speakers, and 
 Audio Pooling (Mics/Speakers): Tools like Audio Relay or Jack Audio Connection Kit (JACK) allow you to route audio seamlessly over a local network, turning one laptop's mic into the input for another laptop, or playing audio out of 4 different devices simultaneously.
 
 Storage Pooling: Ceph or GlusterFS allow you to take the hard drives of multiple different machines and pool them into one giant, distributed virtual hard drive.
+
+</details>
+
