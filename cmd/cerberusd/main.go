@@ -22,7 +22,9 @@ import (
 	"github.com/hash066/cerberus/daemon/gateway"
 	"github.com/hash066/cerberus/daemon/ledger"
 	"github.com/hash066/cerberus/daemon/lifecycle"
+	"github.com/hash066/cerberus/daemon/mesh"
 	"github.com/hash066/cerberus/daemon/metrics"
+	"github.com/hash066/cerberus/daemon/scheduler"
 	"github.com/hash066/cerberus/daemon/state"
 	"github.com/hash066/cerberus/daemon/store"
 	"github.com/hash066/cerberus/daemon/system"
@@ -66,31 +68,9 @@ func (r storeRevocations) Revoked(id string) bool {
 }
 func (r storeRevocations) Add(id string) error { return r.s.Put("revocations", id, []byte{1}) }
 
-// DaemonRPC is the RPC service exposed to the CLI and tray. Every method
-// requires a capability token, so the control socket is not an open backdoor.
-type DaemonRPC struct {
-	lifecycle *lifecycle.Monitor
-	authz     auth.Authorizer
-}
-
-type StatusRequest struct{ Token string }
-type StatusResponse struct {
-	Version string
-	State   string
-	Subject string
-}
-
-func (d *DaemonRPC) Status(req *StatusRequest, resp *StatusResponse) error {
-	claims, err := d.authz.Authorize(req.Token, "read", "")
-	if err != nil {
-		return fmt.Errorf("unauthorized: %w", err)
-	}
-	resp.Version = contract.ContractVersion
-	resp.Subject = claims.Subject
-	st := d.lifecycle.State()
-	resp.State = fmt.Sprintf("Running (Power: %v, Battery: %.1f%%)", st.Src, st.BatteryPct)
-	return nil
-}
+// The DaemonRPC service and its Status/Run/Nodes/Devices/Wallet/Caps/Conflicts
+// methods live in rpc.go. Every method is capability/token-gated so the control
+// socket is not an open backdoor.
 
 func main() {
 	profile := flag.String("profile", "open_mesh", "open_mesh | sealed")
@@ -98,6 +78,13 @@ func main() {
 	e2eID := flag.String("e2e-id", "node", "E2E demo node ID")
 	e2eListen := flag.String("e2e-listen", "127.0.0.1:0", "E2E demo listen address")
 	e2ePeers := flag.String("e2e-peer", "", "comma-separated E2E peer base URLs")
+	// Bind-address overrides. Defaults preserve the historical fixed ports, so
+	// existing deployments are unaffected; overrides let a second instance run on
+	// the same box (e.g. for a local demo or a per-user daemon).
+	gwAddr := flag.String("gateway-addr", ":8080", "gateway listen address")
+	apiAddr := flag.String("api-addr", "127.0.0.1:7777", "status API listen address")
+	metricsAddr := flag.String("metrics-addr", "127.0.0.1:7779", "metrics/health listen address")
+	rpcAddr := flag.String("rpc-addr", "127.0.0.1:9092", "control-plane RPC listen address")
 	flag.Parse()
 
 	if *e2eNode {
@@ -165,10 +152,22 @@ func main() {
 	// Compose the real control plane: OCap kernel + libp2p/QUIC mesh + telemetry
 	// + scheduler + 9P namespace, under one supervision tree.
 	var fabric contract.Fabric
+	var meshFabric *mesh.Fabric    // concrete type for RequestCompute / PeerID
+	var sched *scheduler.Scheduler // the live placement brain
+	var devices []deviceInfo       // the 9P devices Compose registered (for `cerberus devices`)
 	if sys, serr := system.Compose(ctx, k, "local"); serr != nil {
 		log.Printf("cerberusd: compose system failed: %v", serr)
 	} else {
 		fabric = sys.Fabric
+		sched = sys.Scheduler
+		if mf, ok := sys.Fabric.(*mesh.Fabric); ok {
+			meshFabric = mf
+		}
+		// Mirror the devices system.Compose registers in the 9P namespace so the
+		// CLI can enumerate them (the ninep.Server keeps its table private).
+		devices = []deviceInfo{
+			{Path: "/cer/dev/vram/local/0", Kind: string(contract.KindVRAM), QuotaBytes: 2 * 1024 * 1024 * 1024},
+		}
 		// Wire the lid-drop choreography: SLEEP_IMMINENT -> checkpoint -> promote
 		// standbys for this node's shards (ARCHITECTURE §4.2).
 		mon.SetCoordinator(lidDropCoordinator{sched: sys.Scheduler})
@@ -221,11 +220,17 @@ func main() {
 	}
 	log.Printf("operator token written to %s (CLI reads it; or set CERBERUS_TOKEN)", tokenPath)
 
-	// Start Gateway with the real wazero-backed executor (no mock), auth-gated.
-	gw := gateway.NewGateway(wasm.NewExecutor(e2enode.HelloShardWASM()), issuer)
+	// Real wazero-backed executor, shared by the gateway and the CLI's `run`
+	// command. It runs whatever WASM bytes the task carries (falling back to the
+	// embedded hello-shard when a task carries none), so `cerberus run` executes
+	// real WebAssembly and returns the real i32 result.
+	localExec := wasm.NewExecutor(e2enode.HelloShardWASM())
+
+	// Start Gateway with the real executor (no mock), auth-gated.
+	gw := gateway.NewGateway(localExec, issuer)
 	go func() {
-		log.Println("Starting Gateway on :8080 (Bearer token required)")
-		if err := gw.Start(":8080"); err != nil {
+		log.Printf("Starting Gateway on %s (Bearer token required)", *gwAddr)
+		if err := gw.Start(*gwAddr); err != nil {
 			log.Printf("Gateway error: %v", err)
 		}
 	}()
@@ -258,8 +263,8 @@ func main() {
 		}
 	})
 	go func() {
-		log.Println("Starting status API on 127.0.0.1:7777 (Bearer token required)")
-		if err := apiSrv.Start("127.0.0.1:7777"); err != nil {
+		log.Printf("Starting status API on %s (Bearer token required)", *apiAddr)
+		if err := apiSrv.Start(*apiAddr); err != nil {
 			log.Printf("API error: %v", err)
 		}
 	}()
@@ -273,8 +278,8 @@ func main() {
 			}
 			return true, ""
 		})
-		log.Println("Starting metrics on 127.0.0.1:7779 (/metrics token-gated; /healthz /readyz open)")
-		if err := ms.Start("127.0.0.1:7779"); err != nil {
+		log.Printf("Starting metrics on %s (/metrics token-gated; /healthz /readyz open)", *metricsAddr)
+		if err := ms.Start(*metricsAddr); err != nil {
 			log.Printf("metrics error: %v", err)
 		}
 	}()
@@ -294,15 +299,33 @@ func main() {
 		}()
 	}
 
-	// Start RPC server (token-gated)
-	rpcService := &DaemonRPC{lifecycle: mon, authz: issuer}
+	// Start RPC server (token-gated). Every method presents the operator token
+	// and is authorized before touching a subsystem. The service borrows the
+	// already-composed objects: mesh fabric, scheduler, wazero executor, durable
+	// ledger + CRDT engine, the metric set, and the 9P device list.
+	rpcService := &DaemonRPC{
+		authz:     issuer,
+		lifecycle: mon,
+		fabric:    meshFabric,
+		sched:     sched,
+		exec:      localExec,
+		ledger:    lg,
+		crdt:      crdtEngine,
+		metrics:   met,
+		daemonDoc: []byte("daemon-doc"),
+		devices:   devices,
+		caps:      newCapRegistry(),
+		profile:   *profile,
+		kernel:    ffi.Backend(),
+		started:   started,
+	}
 	rpc.Register(rpcService)
-	l, err := net.Listen("tcp", "127.0.0.1:9092") // TCP instead of UDS for Windows simplicity in skeleton
+	l, err := net.Listen("tcp", *rpcAddr) // TCP instead of UDS for Windows simplicity in skeleton
 	if err != nil {
 		log.Fatalf("RPC listen error: %v", err)
 	}
 	go func() {
-		log.Println("Starting RPC server on 127.0.0.1:9092")
+		log.Printf("Starting RPC server on %s", *rpcAddr)
 		rpc.Accept(l)
 	}()
 
