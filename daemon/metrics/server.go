@@ -14,6 +14,7 @@ package metrics
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/hash066/cerberus/daemon/auth"
 )
@@ -51,8 +52,20 @@ func (s *Server) Handler() http.Handler {
 }
 
 // Start serves on addr (blocking). Callers bind 127.0.0.1 to keep it local.
+// Timeouts mirror daemon/gateway's Start: an unbounded server lets a slow or
+// stalled client (even against the unauthenticated /healthz) pin a
+// connection's goroutine/fd forever — enough of those exhaust the daemon and
+// make liveness/readiness probes fail even though the daemon is otherwise fine.
 func (s *Server) Start(addr string) error {
-	return http.ListenAndServe(addr, s.Handler())
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	return srv.ListenAndServe()
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {

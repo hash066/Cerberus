@@ -15,6 +15,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/hash066/cerberus/daemon/auth"
 )
@@ -213,9 +214,21 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// Start serves the API on addr (blocking).
+// Start serves the API on addr (blocking). Timeouts mirror daemon/gateway's
+// Start: without them a client that opens a connection and never finishes
+// sending (or reading) ties up a goroutine/fd indefinitely, which can starve
+// this same process's /healthz — a trivial Slowloris would otherwise make a
+// healthy node look dead to anything polling liveness.
 func (s *Server) Start(addr string) error {
-	return http.ListenAndServe(addr, s.Handler())
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	return srv.ListenAndServe()
 }
 
 // requireRead wraps a handler with capability auth (Bearer token granting "read").

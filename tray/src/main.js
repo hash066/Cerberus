@@ -25,8 +25,7 @@ const clipboard = window.__TAURI__?.clipboardManager;
 
 const POLL_MS = 2000;
 let connected = false;
-let lastMetrics = {}; // name -> value, for delta/sparkline history
-const metricHistory = {}; // name -> [values]
+let lastMetrics = {}; // name -> value, for delta history
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -114,11 +113,11 @@ function setConnected(state, detail) {
   const banner = $("banner");
   if (state) {
     dot.className = "dot ok";
-    txt.textContent = "connected";
+    txt.textContent = "Engine running";
     banner.classList.remove("show");
   } else {
     dot.className = "dot bad";
-    txt.textContent = "disconnected";
+    txt.textContent = "Engine stopped";
     banner.classList.add("show");
     if (detail) setText("banner-detail", detail);
   }
@@ -184,14 +183,17 @@ function renderStatus(s) {
   if (!peerCount) {
     renderEmpty(pc, "⬡", "No peers yet — this node is alone on the mesh.");
   } else {
-    pc.innerHTML = "";
+    const tbl = el("table", "tbl");
+    tbl.innerHTML = "<thead><tr><th>Peer</th><th>Address</th><th>Status</th></tr></thead><tbody></tbody>";
+    const tb = tbl.querySelector("tbody");
     (s.peers || []).forEach((addr, i) => {
-      const row = el("div", "peerrow");
-      row.innerHTML =
-        `<span class="dot ok"></span><span class="id">${esc(addr)}</span>` +
-        `<span class="meta"><span class="chip ok">peer ${i + 1}</span></span>`;
-      pc.appendChild(row);
+      const tr = el("tr");
+      tr.innerHTML =
+        `<td>peer ${i + 1}</td><td class="id-cell">${esc(addr)}</td><td><span class="chip ok">connected</span></td>`;
+      tb.appendChild(tr);
     });
+    pc.innerHTML = "";
+    pc.appendChild(tbl);
   }
 }
 
@@ -214,16 +216,10 @@ function renderMetrics(m) {
     const prev = lastMetrics[name];
     const delta = prev != null && v != null && v > prev ? `+${fmtNum(v - prev)}` : "";
     const tile = el("div", "stat");
-    // track history for sparkline
-    metricHistory[name] = (metricHistory[name] || []).concat([v || 0]).slice(-24);
-    const bars = metricHistory[name];
-    const max = Math.max(1, ...bars);
-    const spark = bars.map((b) => `<i style="height:${Math.max(2, (b / max) * 100)}%"></i>`).join("");
     tile.innerHTML =
       `<div class="label">${icon} ${esc(label)}</div>` +
       `<div class="value small">${v != null ? fmtNum(v) : "—"}</div>` +
-      `<div class="delta ${delta ? "up" : ""}">${delta || "steady"}</div>` +
-      `<div class="spark">${spark}</div>`;
+      `<div class="delta ${delta ? "up" : ""}">${delta || "steady"}</div>`;
     tc.appendChild(tile);
   });
 
@@ -277,15 +273,19 @@ async function refreshDevices() {
       list = null;
     }
     if (Array.isArray(list) && list.length) {
-      c.innerHTML = "";
+      const tbl = el("table", "tbl");
+      tbl.innerHTML = "<thead><tr><th>Path</th><th>Kind</th><th>Rights</th></tr></thead><tbody></tbody>";
+      const tb = tbl.querySelector("tbody");
       list.forEach((d) => {
-        const row = el("div", "devrow");
-        row.innerHTML =
-          `<span class="id">${esc(d.path || d)}</span>` +
-          `<span class="meta"><span class="chip info">${esc(d.kind || "device")}</span>` +
-          `<span class="chip">${esc((d.rights || []).join(", ") || "read")}</span></span>`;
-        c.appendChild(row);
+        const tr = el("tr");
+        tr.innerHTML =
+          `<td class="id-cell">${esc(d.path || d)}</td>` +
+          `<td><span class="chip info">${esc(d.kind || "device")}</span></td>` +
+          `<td>${esc((d.rights || []).join(", ") || "read")}</td>`;
+        tb.appendChild(tr);
       });
+      c.innerHTML = "";
+      c.appendChild(tbl);
     } else {
       renderEmpty(c, "▤", "No devices in the namespace yet.");
     }
@@ -344,9 +344,7 @@ async function refreshConflicts() {
     if (Array.isArray(list) && list.length) {
       c.innerHTML = "";
       list.forEach((cf) => {
-        const card = el("div", "peerrow");
-        card.style.flexDirection = "column";
-        card.style.alignItems = "stretch";
+        const card = el("div", "list-row");
         const opts = (cf.values || cf.candidates || [])
           .map((v) => `<option value="${esc(v)}">${esc(v)}</option>`)
           .join("");
