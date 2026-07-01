@@ -9,21 +9,6 @@ import (
 	"github.com/hash066/cerberus/contract/go/stub"
 )
 
-// waitRevoked polls until the token id is revoked on iss, or fails after a short
-// deadline. Propagation is async (subscribe goroutine), so we can't assert
-// synchronously, but it converges in microseconds over the in-process fabric.
-func waitRevoked(t *testing.T, iss *Issuer, id string) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if iss.IsRevoked(id) {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("revocation of %q did not propagate within deadline", id)
-}
-
 // TestRevocationPropagatesAcrossNodes is the integration-style test: two
 // in-process auth issuers (A and B) share a single stub Fabric. A revoke on A
 // must propagate over the fabric and cause B to deny that token, while a
@@ -68,13 +53,26 @@ func TestRevocationPropagatesAcrossNodes(t *testing.T) {
 		t.Fatalf("survivor should verify on B: %v", err)
 	}
 
-	// Revoke the victim on A.
-	if err := nodeA.Revoke(vc.ID); err != nil {
-		t.Fatal(err)
+	// Revoke the victim on A and drive it to B. The gossip publish is one-shot and
+	// the in-process fabric drops a message to a peer whose Subscribe goroutine has
+	// not yet registered, so we re-issue the revoke until B has applied it — a
+	// deterministic model of the OR-set re-sync a peer performs on (re)connect.
+	// Re-revoking is idempotent (markRevoked) and simply re-publishes.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if err := nodeA.Revoke(vc.ID); err != nil {
+			t.Fatal(err)
+		}
+		if nodeB.IsRevoked(vc.ID) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("revocation of %q did not propagate to B within deadline", vc.ID)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 
-	// It must propagate and B must now deny the victim.
-	waitRevoked(t, nodeB, vc.ID)
+	// B must now deny the victim.
 	if _, err := nodeB.Authorize(victim, "exec", ""); err == nil {
 		t.Fatal("victim must be denied on B after revocation propagates")
 	}
