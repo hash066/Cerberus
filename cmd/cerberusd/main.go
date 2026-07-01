@@ -155,7 +155,7 @@ func main() {
 	var meshFabric *mesh.Fabric    // concrete type for RequestCompute / PeerID
 	var sched *scheduler.Scheduler // the live placement brain
 	var devices []deviceInfo       // the 9P devices Compose registered (for `cerberus devices`)
-	if sys, serr := system.Compose(ctx, k, "local"); serr != nil {
+	if sys, serr := system.Compose(ctx, k, "local", db); serr != nil {
 		log.Printf("cerberusd: compose system failed: %v", serr)
 	} else {
 		fabric = sys.Fabric
