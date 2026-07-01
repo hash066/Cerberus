@@ -67,32 +67,16 @@ func (s *ChannelSource) Push(ev PowerEvent) { s.ch <- ev }
 func (s *ChannelSource) Events(ctx context.Context) <-chan PowerEvent { return s.ch }
 
 // ---------------------------------------------------------------------------
-// OS-backed source: STUB (the only OS-integration point in this package).
+// OS-backed source: the per-platform hook lives in source_windows.go on
+// Windows (real Win32 APIs: GetSystemPowerStatus + RegisterSuspendResume-
+// Notification + RegisterPowerSettingNotification — see that file for the
+// design rationale) and in source_stub.go on every other GOOS (vertical 09 §6):
+//   - macOS: IOKit / IOPMPowerSource + thermal-pressure notifications — not yet
+//     wired (MATURITY HONESTY: documented stub, not a faked backend).
+//   - Linux: /sys/class/power_supply, /sys/class/thermal, systemd-logind sleep
+//     inhibitors — not yet wired (same honesty note).
 //
-// osEventSource is where real OS power/thermal hooks belong (vertical 09 §6):
-//   - macOS:   IOKit / IOPMPowerSource + thermal-pressure notifications
-//   - Windows: RegisterPowerSettingNotification / GetSystemPowerStatus, WM_POWERBROADCAST
-//   - Linux:   /sys/class/power_supply, /sys/class/thermal, systemd-logind sleep inhibitors
-//
-// None of those are wired here — doing so portably needs cgo/platform code that
-// is explicitly out of scope for v0.1 (MATURITY HONESTY: this is a documented
-// stub, not a faked working implementation). For now it produces no events; the
-// daemon drives lifecycle through the injectable ChannelSource / PrepareSleep.
+// Both files expose the same NewOSEventSource() EventSource entry point so
+// NewMonitor (lifecycle.go) is identical on every platform; only the source
+// behind it differs.
 // ---------------------------------------------------------------------------
-
-type osEventSource struct{}
-
-// NewOSEventSource returns the (stub) OS-backed source. It currently emits
-// nothing; swap in real platform hooks here to make lifecycle OS-driven.
-func NewOSEventSource() EventSource { return osEventSource{} }
-
-func (osEventSource) Events(ctx context.Context) <-chan PowerEvent {
-	ch := make(chan PowerEvent)
-	go func() {
-		// STUB: no real OS power/thermal hooks yet. Block until cancellation so
-		// the monitor's drain loop has a well-behaved channel to select on.
-		<-ctx.Done()
-		close(ch)
-	}()
-	return ch
-}
