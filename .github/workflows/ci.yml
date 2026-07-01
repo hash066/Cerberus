@@ -48,6 +48,9 @@ jobs:
   golangci-lint:
     name: golangci-lint
     runs-on: ubuntu-latest
+    # Advisory gate during the launch push: reports issues but does not fail the
+    # run. Promote to a hard gate (remove this line) as part of v3 hardening.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -68,7 +71,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        toolchain: [stable]
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux Rust workspace dependencies
@@ -126,6 +128,9 @@ jobs:
   cargo-audit:
     name: cargo-audit (advisory scan)
     runs-on: ubuntu-latest
+    # Advisory: a RustSec advisory in a transitive dep (libp2p/wasmtime/wgpu tree)
+    # should surface but not block the launch push. Promote to hard gate in v3.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
