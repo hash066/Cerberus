@@ -19,7 +19,12 @@ func newTestNodeNoSeed(t *testing.T, ctx context.Context, id string) *server {
 	// newTestNode already seeded the store; rebuild a fresh, empty one in its
 	// place so this node genuinely starts without the component.
 	s.store = wasm.NewContentStore()
-	s.fabric.ServeComponentFetch(s.store)
+	s.fabric.ServeComponentFetch(
+		s.store,
+		s.resolveIssuerKey,
+		func() int64 { return time.Now().Unix() },
+		nil,
+	)
 	return s
 }
 
