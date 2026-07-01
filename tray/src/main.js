@@ -1,54 +1,539 @@
-// Cerberus dashboard. Calls the Rust `daemon_status` command (which performs the
-// authenticated HTTP request to the daemon's status API) and renders the live
-// snapshot. The webview never touches the network itself.
-const { invoke } = window.__TAURI__.core;
+// Cerberus desktop dashboard — v3 webview controller.
+//
+// This file NEVER makes a network request. It calls Rust Tauri commands (defined
+// in src-tauri/src/lib.rs) which perform the authenticated fetches to the
+// daemon's localhost surfaces and hand back JSON. The webview only renders.
+//
+// Data sources (all via Rust commands):
+//   daemon_status()        -> live Snapshot (version, profile, mesh, peers, power, balance)
+//   daemon_health()        -> { healthz, readyz, reason }
+//   daemon_metrics()       -> { <prom_name>: number, ... }  (parsed from /metrics)
+//   run_workload(model,p)  -> gateway output (the "run a workload" action)
+//   belief_conflicts()     -> conflicts JSON  (PENDING_DAEMON until route exists)
+//   workloads()            -> workloads JSON  (PENDING_DAEMON until route exists)
+//   devices()              -> device namespace (PENDING_DAEMON until route exists)
+//   resolve_conflict / revoke_capability / grant_device  -> action POSTs
+//   operator_token_value() / operator_token_file()       -> for copy actions
+//
+// The dashboard degrades honestly: when the daemon is down, a disconnected
+// banner shows and panels blank out; when a subsystem exists in Go but has no
+// HTTP route yet, the command returns "PENDING_DAEMON: …" and the UI renders a
+// calm "pending daemon support" note instead of pretending it works.
 
-function set(id, value) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = value;
+const invoke = window.__TAURI__?.core?.invoke;
+const clipboard = window.__TAURI__?.clipboardManager;
+
+const POLL_MS = 2000;
+let connected = false;
+let lastMetrics = {}; // name -> value, for delta/sparkline history
+const metricHistory = {}; // name -> [values]
+
+// ---- helpers ----------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, html) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (html != null) e.innerHTML = html;
+  return e;
+};
+const esc = (s) =>
+  String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function setText(id, v) {
+  const e = $(id);
+  if (e) e.textContent = v;
+}
+
+function isPending(errStr) {
+  return typeof errStr === "string" && errStr.startsWith("PENDING_DAEMON");
 }
 
 function fmtUptime(sec) {
-  const h = Math.floor(sec / 3600);
+  sec = Math.max(0, Math.floor(sec || 0));
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
   const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
-  return `${h}h ${m}m ${s}s`;
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
 }
 
-async function refresh() {
-  const dot = document.getElementById("conn");
-  const connText = document.getElementById("conn-text");
+function fmtNum(n) {
+  if (n == null || Number.isNaN(n)) return "—";
+  return Number(n).toLocaleString();
+}
+
+function toast(msg, kind = "info") {
+  const wrap = $("toasts");
+  if (!wrap) return;
+  const t = el("div", `toast ${kind}`, esc(msg));
+  wrap.appendChild(t);
+  setTimeout(() => {
+    t.style.opacity = "0";
+    setTimeout(() => t.remove(), 250);
+  }, 3200);
+}
+
+// Render a "pending daemon support" note into a container from a PENDING error.
+function renderPending(container, errStr, subsystem) {
+  container.innerHTML = "";
+  const note = el(
+    "div",
+    "pending-note",
+    `<span class="ico">◷</span><div><b>${esc(subsystem)}</b> is implemented in the daemon but not yet exposed over the status API. ` +
+      `The dashboard is wired to the intended endpoint and will light up the moment the daemon serves it. ` +
+      `<div class="muted mono" style="margin-top:6px">${esc(errStr)}</div></div>`
+  );
+  container.appendChild(note);
+}
+
+function renderEmpty(container, icon, msg) {
+  container.innerHTML = "";
+  container.appendChild(el("div", "empty", `<div class="big">${icon}</div>${esc(msg)}`));
+}
+
+// Safely invoke a Rust command; returns { ok, data, err }.
+async function call(cmd, args) {
+  if (!invoke) return { ok: false, err: "Tauri bridge unavailable (open in the desktop app)" };
   try {
-    const raw = await invoke("daemon_status");
-    const s = JSON.parse(raw);
-
-    dot.className = "dot ok";
-    connText.textContent = "connected";
-
-    set("version", s.version);
-    set("profile", s.profile);
-    set("kernel", s.kernel);
-    set("uptime", fmtUptime(s.uptime_sec));
-
-    set("mesh", s.mesh_up ? "up" : "down");
-    set("peers", String((s.peers || []).length));
-    set("peerlist", (s.peers && s.peers.length) ? s.peers.join(", ") : "no peers yet");
-
-    set("psource", s.power.source);
-    set("battery", `${Math.round(s.power.battery_pct)}%`);
-    set("lid", s.power.lid);
-    set("hint", s.power.hint);
-
-    set("balance", Number(s.operator_balance).toLocaleString());
-    set("err", "");
+    const raw = await invoke(cmd, args);
+    return { ok: true, data: raw };
   } catch (e) {
-    dot.className = "dot bad";
-    connText.textContent = "disconnected";
-    set("err", String(e));
+    return { ok: false, err: String(e) };
   }
 }
 
+// ---- connection state -------------------------------------------------------
+
+function setConnected(state, detail) {
+  connected = state;
+  const dot = $("conn-dot");
+  const txt = $("conn-text");
+  const banner = $("banner");
+  if (state) {
+    dot.className = "dot ok";
+    txt.textContent = "connected";
+    banner.classList.remove("show");
+  } else {
+    dot.className = "dot bad";
+    txt.textContent = "disconnected";
+    banner.classList.add("show");
+    if (detail) setText("banner-detail", detail);
+  }
+}
+
+// ---- view routing -----------------------------------------------------------
+
+const VIEW_META = {
+  overview: ["Overview", "Live node & mesh status"],
+  mesh: ["Mesh peers", "Connected nodes on the capability-secured fabric"],
+  devices: ["Devices", "9P device namespace — grant & pool hardware"],
+  workloads: ["Workloads", "Run components across the mesh via the gateway"],
+  metrics: ["Metrics", "Live counters from /metrics"],
+  wallet: ["Wallet", "Compute credits & operator capability"],
+  conflicts: ["Conflicts", "CRDT belief-conflicts awaiting human resolution"],
+};
+
+function switchView(name) {
+  document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.view === name));
+  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
+  const [title, sub] = VIEW_META[name] || [name, ""];
+  setText("view-title", title);
+  setText("view-sub", sub);
+  // Refresh the on-demand views immediately on entry.
+  if (name === "devices") refreshDevices();
+  if (name === "workloads") refreshWorkloads();
+  if (name === "conflicts") refreshConflicts();
+}
+
+// ---- renderers --------------------------------------------------------------
+
+function renderStatus(s) {
+  // Overview stat tiles
+  setText("ov-mesh", s.mesh_up ? "up" : "down");
+  setText("ov-mesh-sub", s.mesh_up ? "libp2p / QUIC" : "fabric down");
+  const peerCount = (s.peers || []).length;
+  setText("ov-peers", String(peerCount));
+  setText("ov-balance", fmtNum(s.operator_balance));
+
+  // Daemon card
+  setText("d-version", s.version || "—");
+  setText("d-profile", s.profile || "—");
+  setText("d-kernel", s.kernel || "—");
+  setText("d-uptime", fmtUptime(s.uptime_sec));
+  setText("profile-chip", `profile · ${s.profile || "—"}`);
+
+  // Power card
+  const p = s.power || {};
+  setText("p-source", p.source || "—");
+  setText("p-battery", p.battery_pct != null ? `${Math.round(p.battery_pct)}%` : "—");
+  setText("p-lid", p.lid || "—");
+  setText("p-hint", p.hint || "—");
+
+  // Wallet
+  setText("w-balance", fmtNum(s.operator_balance));
+
+  // Nav peer badge
+  setText("nav-peers", String(peerCount));
+
+  // Mesh view
+  setText("m-fabric-state", s.mesh_up ? "up" : "down");
+  const pc = $("peer-container");
+  if (!peerCount) {
+    renderEmpty(pc, "⬡", "No peers yet — this node is alone on the mesh.");
+  } else {
+    pc.innerHTML = "";
+    (s.peers || []).forEach((addr, i) => {
+      const row = el("div", "peerrow");
+      row.innerHTML =
+        `<span class="dot ok"></span><span class="id">${esc(addr)}</span>` +
+        `<span class="meta"><span class="chip ok">peer ${i + 1}</span></span>`;
+      pc.appendChild(row);
+    });
+  }
+}
+
+function renderMetrics(m) {
+  // Tiles: the headline counters the brief calls out.
+  const tiles = [
+    ["cerberus_tasks_placed_total", "Tasks placed", "◇"],
+    ["cerberus_transfers_total", "Transfers", "⇄"],
+    ["cerberus_bytes_transferred_total", "Bytes moved", "≡"],
+    ["cerberus_peers", "Peers", "⬡"],
+    ["cerberus_gateway_requests_total", "Gateway reqs", "▷"],
+    ["cerberus_wasm_execs_total", "WASM execs", "⚙"],
+    ["cerberus_revocations_total", "Revocations", "⊘"],
+    ["cerberus_tasks_failed_total", "Tasks failed", "✕"],
+  ];
+  const tc = $("metric-tiles");
+  tc.innerHTML = "";
+  tiles.forEach(([name, label, icon]) => {
+    const v = m[name];
+    const prev = lastMetrics[name];
+    const delta = prev != null && v != null && v > prev ? `+${fmtNum(v - prev)}` : "";
+    const tile = el("div", "stat");
+    // track history for sparkline
+    metricHistory[name] = (metricHistory[name] || []).concat([v || 0]).slice(-24);
+    const bars = metricHistory[name];
+    const max = Math.max(1, ...bars);
+    const spark = bars.map((b) => `<i style="height:${Math.max(2, (b / max) * 100)}%"></i>`).join("");
+    tile.innerHTML =
+      `<div class="label">${icon} ${esc(label)}</div>` +
+      `<div class="value small">${v != null ? fmtNum(v) : "—"}</div>` +
+      `<div class="delta ${delta ? "up" : ""}">${delta || "steady"}</div>` +
+      `<div class="spark">${spark}</div>`;
+    tc.appendChild(tile);
+  });
+
+  // Full table.
+  const tbody = $("metric-table").querySelector("tbody");
+  tbody.innerHTML = "";
+  const HELP = {
+    cerberus_tasks_placed_total: "Tasks placed on a node by the scheduler",
+    cerberus_tasks_failed_total: "Placements that could not be satisfied",
+    cerberus_transfers_total: "Data-plane transfers started",
+    cerberus_transfers_rejected_total: "Transfers rejected (no cap / over quota)",
+    cerberus_bytes_transferred_total: "Total bytes moved over the data plane",
+    cerberus_revocations_total: "Capabilities revoked (local + gossip)",
+    cerberus_peers: "Currently connected mesh peers",
+    cerberus_gateway_requests_total: "Gateway requests accepted",
+    cerberus_gateway_rejected_total: "Gateway requests rejected",
+    cerberus_wasm_execs_total: "WASM component executions run",
+    cerberus_build_info: "Daemon up marker",
+  };
+  Object.keys(m)
+    .sort()
+    .forEach((name) => {
+      const tr = el("tr");
+      tr.innerHTML =
+        `<td class="mono">${esc(name)}</td>` +
+        `<td class="muted">${esc(HELP[name] || "")}</td>` +
+        `<td class="num">${fmtNum(m[name])}</td>`;
+      tbody.appendChild(tr);
+    });
+
+  setText("ov-tasks", fmtNum(m["cerberus_tasks_placed_total"]));
+  lastMetrics = { ...m };
+}
+
+function renderHealth(h) {
+  setText("h-live", h.healthz ? "ok" : "down");
+  setText("h-ready", h.readyz ? "ready" : "not ready");
+  setText("h-reason", h.reason || (h.readyz ? "—" : "—"));
+}
+
+// ---- on-demand loaders (PENDING-aware) -------------------------------------
+
+async function refreshDevices() {
+  const c = $("dev-container");
+  const r = await call("devices");
+  if (r.ok) {
+    let list;
+    try {
+      list = JSON.parse(r.data);
+    } catch {
+      list = null;
+    }
+    if (Array.isArray(list) && list.length) {
+      c.innerHTML = "";
+      list.forEach((d) => {
+        const row = el("div", "devrow");
+        row.innerHTML =
+          `<span class="id">${esc(d.path || d)}</span>` +
+          `<span class="meta"><span class="chip info">${esc(d.kind || "device")}</span>` +
+          `<span class="chip">${esc((d.rights || []).join(", ") || "read")}</span></span>`;
+        c.appendChild(row);
+      });
+    } else {
+      renderEmpty(c, "▤", "No devices in the namespace yet.");
+    }
+  } else if (isPending(r.err)) {
+    renderPending(c, r.err, "Device namespace (9P)");
+  } else {
+    renderEmpty(c, "▤", connected ? "Could not read the device namespace." : "Daemon offline.");
+  }
+}
+
+async function refreshWorkloads() {
+  const c = $("wl-container");
+  const r = await call("workloads");
+  if (r.ok) {
+    let list;
+    try {
+      list = JSON.parse(r.data);
+    } catch {
+      list = null;
+    }
+    if (Array.isArray(list) && list.length) {
+      const tbl = el("table", "tbl");
+      tbl.innerHTML =
+        "<thead><tr><th>Task</th><th>Model</th><th>Node</th><th>State</th></tr></thead><tbody></tbody>";
+      const tb = tbl.querySelector("tbody");
+      list.forEach((w) => {
+        const tr = el("tr");
+        tr.innerHTML =
+          `<td class="mono">${esc(w.id || "")}</td><td>${esc(w.model || "")}</td>` +
+          `<td class="mono">${esc(w.node || "")}</td><td><span class="chip ${w.state === "done" ? "ok" : "info"}">${esc(w.state || "")}</span></td>`;
+        tb.appendChild(tr);
+      });
+      c.innerHTML = "";
+      c.appendChild(tbl);
+    } else {
+      renderEmpty(c, "▷", "No workloads recorded yet — run one above.");
+    }
+  } else if (isPending(r.err)) {
+    renderPending(c, r.err, "Workload history");
+  } else {
+    renderEmpty(c, "▷", connected ? "Could not read workloads." : "Daemon offline.");
+  }
+}
+
+async function refreshConflicts() {
+  const c = $("conf-container");
+  const badge = $("nav-conflicts");
+  const r = await call("belief_conflicts");
+  if (r.ok) {
+    let list;
+    try {
+      list = JSON.parse(r.data);
+    } catch {
+      list = null;
+    }
+    if (Array.isArray(list) && list.length) {
+      c.innerHTML = "";
+      list.forEach((cf) => {
+        const card = el("div", "peerrow");
+        card.style.flexDirection = "column";
+        card.style.alignItems = "stretch";
+        const opts = (cf.values || cf.candidates || [])
+          .map((v) => `<option value="${esc(v)}">${esc(v)}</option>`)
+          .join("");
+        card.innerHTML =
+          `<div style="display:flex;gap:10px;align-items:center">` +
+          `<span class="chip warn">conflict</span><b class="mono">${esc(cf.subject || cf.key || "")}</b></div>` +
+          `<div class="muted" style="margin:6px 0">${esc((cf.values || cf.candidates || []).join("   vs  "))}</div>` +
+          `<div class="form-row"><label class="field"><span>Winning value</span><select class="inp conf-pick">${opts}</select></label>` +
+          `<button class="btn primary small conf-resolve" data-subject="${esc(cf.subject || cf.key || "")}">Resolve</button></div>`;
+        card.querySelector(".conf-resolve").addEventListener("click", async (ev) => {
+          const subject = ev.target.dataset.subject;
+          const winning = card.querySelector(".conf-pick").value;
+          const res = await call("resolve_conflict", { subject, winning });
+          if (res.ok) {
+            toast(`Resolved ${subject} → ${winning}`, "ok");
+            refreshConflicts();
+          } else if (isPending(res.err)) {
+            toast("Resolve endpoint not yet exposed by the daemon", "info");
+          } else {
+            toast(res.err, "bad");
+          }
+        });
+        c.appendChild(card);
+      });
+      badge.style.display = "grid";
+      badge.textContent = String(list.length);
+    } else {
+      renderEmpty(c, "✓", "No open belief-conflicts. Beliefs are consistent across the mesh.");
+      badge.style.display = "none";
+    }
+  } else if (isPending(r.err)) {
+    renderPending(c, r.err, "Belief-conflict resolution");
+    badge.style.display = "none";
+  } else {
+    renderEmpty(c, "⚠", connected ? "Could not read conflicts." : "Daemon offline.");
+    badge.style.display = "none";
+  }
+}
+
+// ---- actions ----------------------------------------------------------------
+
+function wireActions() {
+  // nav
+  $("nav").addEventListener("click", (e) => {
+    const item = e.target.closest(".nav-item");
+    if (item) switchView(item.dataset.view);
+  });
+  $("btn-refresh").addEventListener("click", () => poll());
+
+  // run workload
+  $("btn-run").addEventListener("click", async () => {
+    const model = $("wl-model").value;
+    const prompt = $("wl-prompt").value;
+    const out = $("run-result");
+    out.className = "result";
+    out.textContent = "running…";
+    const r = await call("run_workload", { model, prompt });
+    if (r.ok) {
+      out.className = "result ok";
+      out.textContent = r.data;
+      toast("Workload completed", "ok");
+      refreshWorkloads();
+    } else {
+      out.className = isPending(r.err) ? "result pending" : "result bad";
+      out.textContent = r.err;
+    }
+  });
+
+  // grant device
+  $("btn-grant").addEventListener("click", async () => {
+    const path = $("grant-path").value;
+    const rights = $("grant-rights").value;
+    const out = $("grant-result");
+    out.className = "result";
+    out.textContent = "granting…";
+    const r = await call("grant_device", { path, rights });
+    if (r.ok) {
+      out.className = "result ok";
+      out.textContent = r.data;
+      toast("Device granted", "ok");
+      refreshDevices();
+    } else {
+      out.className = isPending(r.err) ? "result pending" : "result bad";
+      out.textContent = r.err;
+    }
+  });
+
+  // revoke capability
+  $("btn-revoke").addEventListener("click", async () => {
+    const capId = $("revoke-id").value;
+    const out = $("revoke-result");
+    out.className = "result";
+    out.textContent = "revoking…";
+    const r = await call("revoke_capability", { capId });
+    if (r.ok) {
+      out.className = "result ok";
+      out.textContent = r.data;
+      toast("Capability revoked", "ok");
+    } else {
+      out.className = isPending(r.err) ? "result pending" : "result bad";
+      out.textContent = r.err;
+    }
+  });
+
+  // copy operator token
+  $("btn-copy-token").addEventListener("click", async () => {
+    const r = await call("operator_token_value");
+    if (!r.ok) {
+      toast(r.err, "bad");
+      return;
+    }
+    const out = $("token-result");
+    try {
+      if (clipboard?.writeText) await clipboard.writeText(r.data);
+      else if (navigator.clipboard) await navigator.clipboard.writeText(r.data);
+      toast("Operator token copied to clipboard", "ok");
+      out.className = "result ok";
+      out.textContent = "Token copied. (Kept out of the DOM otherwise.)";
+    } catch (e) {
+      out.className = "result bad";
+      out.textContent = "clipboard error: " + String(e);
+    }
+  });
+
+  // copy token path
+  $("btn-copy-path").addEventListener("click", async () => {
+    const r = await call("operator_token_file");
+    if (!r.ok) return toast(r.err, "bad");
+    try {
+      if (clipboard?.writeText) await clipboard.writeText(r.data);
+      else if (navigator.clipboard) await navigator.clipboard.writeText(r.data);
+      toast("Token path copied", "ok");
+    } catch {
+      toast("clipboard unavailable", "bad");
+    }
+  });
+}
+
+// ---- poll loop --------------------------------------------------------------
+
+async function poll() {
+  // status
+  const st = await call("daemon_status");
+  if (st.ok) {
+    try {
+      const s = JSON.parse(st.data);
+      setConnected(true);
+      renderStatus(s);
+    } catch (e) {
+      setConnected(false, "malformed status payload");
+    }
+  } else {
+    setConnected(false, st.err);
+  }
+
+  // health (independent of status auth path)
+  const h = await call("daemon_health");
+  if (h.ok) {
+    try {
+      renderHealth(JSON.parse(h.data));
+    } catch {
+      /* ignore */
+    }
+  } else {
+    renderHealth({ healthz: false, readyz: false, reason: "unreachable" });
+  }
+
+  // metrics
+  const m = await call("daemon_metrics");
+  if (m.ok) {
+    try {
+      renderMetrics(JSON.parse(m.data));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // token path (cheap, static)
+  const tp = await call("operator_token_file");
+  if (tp.ok) setText("w-tokenpath", tp.data);
+}
+
+// ---- boot -------------------------------------------------------------------
+
 window.addEventListener("DOMContentLoaded", () => {
-  refresh();
-  setInterval(refresh, 2000);
+  wireActions();
+  poll();
+  refreshConflicts();
+  setInterval(poll, POLL_MS);
 });

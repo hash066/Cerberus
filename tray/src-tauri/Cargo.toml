@@ -1,3 +1,10 @@
+# The tray is built with its own toolchain (Tauri CLI) and is deliberately kept
+# out of the repo's Cargo workspace (see the root Cargo.toml `exclude`). Declaring
+# an empty `[workspace]` here makes this crate its own workspace root, so it
+# builds standalone regardless of where the tree is checked out (e.g. a git
+# worktree whose path no longer matches the root's relative `exclude`).
+[workspace]
+
 [package]
 name = "tray"
 version = "0.1.0"
@@ -20,10 +27,14 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+# Native clipboard access so "copy operator token" goes through the OS clipboard
+# via the Rust core (the webview asks; Rust writes) rather than a browser API.
+tauri-plugin-clipboard-manager = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Rust performs the HTTP call to the daemon status API (the webview never makes
-# network calls). http-only; no TLS needed for localhost.
-ureq = { version = "2", default-features = false }
+# Rust performs every HTTP call to the daemon's localhost surfaces (status API,
+# metrics, gateway) — the webview never makes network calls. http-only; no TLS
+# needed for localhost. `json` feature enables send_json for the gateway POST.
+ureq = { version = "2", default-features = false, features = ["json"] }
 dirs = "5"
 
