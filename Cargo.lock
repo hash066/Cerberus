@@ -279,6 +279,7 @@ name = "cerberus-identity"
 version = "0.1.0"
 dependencies = [
  "cerberus-contract",
+ "cerberus-crdt",
  "ciborium",
  "ed25519-dalek",
  "getrandom",

@@ -459,10 +459,39 @@ pub unsafe extern "C" fn cerberus_is_revoked(cap_id: *const u8) -> c_int {
     })
 }
 
+/// Upper bound on how many cap ids a single [`cerberus_revocations_merge`] call
+/// may fold in. `RevocationSet` is a monotone (add-only) OR-set by design — see
+/// the "sticky" note on `core/crdt::RevocationSet` — so we can never fix the DoS
+/// vector of unbounded growth by capping the *set's* total size or by silently
+/// dropping entries past some threshold: that could discard a genuine revocation
+/// and quietly resurrect a capability that must stay revoked, which is strictly
+/// worse than the DoS. Instead we bound how many ids we accept from any single
+/// call. A real gossip message on `sys/revocations` carries a bounded batch of
+/// revocations, so a legitimate caller will never be anywhere near this; a peer
+/// trying to flood the process-wide set with junk ids across many calls is
+/// still bounded per-call, capping the blast radius of any one message.
+///
+/// This is defense-in-depth at the FFI boundary only. The real fix for "a
+/// malicious peer can call this at all" belongs one layer up, at the Go
+/// mesh/gossip layer: `sys/revocations` should be gated behind a capability (per
+/// `daemon/auth`'s gossip design) and/or rate-limited per peer, so untrusted
+/// peers can't reach this FFI entry point with arbitrary frequency in the first
+/// place. This constant does not substitute for that.
+const MAX_REVOCATIONS_PER_MERGE: usize = 100_000;
+
 /// Fold another replica's serialized revocation set (a concatenation of 16-byte
 /// cap ids — see the module note) into the local set. `len` must be a multiple of
-/// 16. Returns the number of ids merged (>= 0), or -1 if `data` is null or `len`
-/// is not a whole number of cap ids. Convergent and idempotent.
+/// 16. Returns the number of ids merged (>= 0), or -1 if `data` is null, `len` is
+/// not a whole number of cap ids, or the call presents more than
+/// [`MAX_REVOCATIONS_PER_MERGE`] ids in one shot. Convergent and idempotent.
+///
+/// An oversized call is rejected *in full* (all-or-nothing), not truncated to
+/// the first `MAX_REVOCATIONS_PER_MERGE` ids: silently applying only a prefix
+/// would be another form of silently dropping revocations (whichever ids landed
+/// past the cut point), which we must never do to a monotone revocation set. A
+/// legitimate caller that hits this should split the batch into multiple calls,
+/// each of which fully applies (or fully rejects, on malformed input) — no
+/// partial state is ever produced by one call.
 ///
 /// # Safety
 /// `data` must point to `len` readable bytes.
@@ -475,8 +504,11 @@ pub unsafe extern "C" fn cerberus_revocations_merge(data: *const u8, len: usize)
         if data.is_null() || !len.is_multiple_of(CAP_ID_LEN) {
             return -1;
         }
-        let buf = slice::from_raw_parts(data, len);
         let count = len / CAP_ID_LEN;
+        if count > MAX_REVOCATIONS_PER_MERGE {
+            return -1;
+        }
+        let buf = slice::from_raw_parts(data, len);
         // Build the peer's set from the wire bytes, then merge it (set union). Using
         // the engine's own `merge` keeps the CRDT join semantics exactly.
         let mut peer = RevocationSet::new();
@@ -759,5 +791,61 @@ mod tests {
         let h = cerberus_cap_mint(0, RIGHT_READ, 0, 0, 0, 0);
         assert!(h > 0); // success path unaffected by the guard wrapper
         assert_eq!(cerberus_cap_attenuate(0, 0, 0), 0); // unknown parent -> documented 0
+    }
+
+    #[test]
+    fn revocations_merge_rejects_oversized_call_without_partial_apply() {
+        // A single call presenting more than MAX_REVOCATIONS_PER_MERGE ids must be
+        // rejected outright (the -1 error sentinel), not truncated to the first N —
+        // this is a DoS bound at the FFI boundary, and it must never let a peer
+        // silently drop (or silently partially-accept) revocations, since the set
+        // is a monotone/sticky "once revoked, always revoked" registry.
+        let over = MAX_REVOCATIONS_PER_MERGE + 1;
+        let mut wire = vec![0u8; over * CAP_ID_LEN];
+        // Give every id a distinct, non-zero value so we can positively confirm
+        // none of them were merged (a partial-apply bug would show up here).
+        for (i, chunk) in wire.chunks_exact_mut(CAP_ID_LEN).enumerate() {
+            chunk[0] = 0xC0;
+            chunk[1] = (i & 0xFF) as u8;
+            chunk[2] = ((i >> 8) & 0xFF) as u8;
+        }
+
+        // SAFETY: wire is a readable buffer of `over * CAP_ID_LEN` bytes.
+        unsafe {
+            assert_eq!(
+                cerberus_revocations_merge(wire.as_ptr(), wire.len()),
+                -1,
+                "a call exceeding the per-call cap must be rejected wholesale"
+            );
+
+            // Spot-check: none of the oversized batch's ids made it into the set,
+            // i.e. rejection is all-or-nothing, not "apply the first N and drop
+            // the rest".
+            for (i, chunk) in wire.chunks_exact(CAP_ID_LEN).enumerate().take(64) {
+                let _ = i;
+                assert_eq!(
+                    cerberus_is_revoked(chunk.as_ptr()),
+                    0,
+                    "rejected call must not partially apply any of its ids"
+                );
+            }
+        }
+
+        // A call right AT the cap is accepted in full (boundary check).
+        let mut exact = vec![0u8; MAX_REVOCATIONS_PER_MERGE * CAP_ID_LEN];
+        for (i, chunk) in exact.chunks_exact_mut(CAP_ID_LEN).enumerate().take(1) {
+            // Only need to distinguish the first id from the oversized batch above;
+            // the rest can be zeroed (duplicates of each other are fine for a set).
+            chunk[0] = 0xD0;
+            let _ = i;
+        }
+        // SAFETY: exact is a readable buffer of `MAX_REVOCATIONS_PER_MERGE * CAP_ID_LEN` bytes.
+        unsafe {
+            let merged = cerberus_revocations_merge(exact.as_ptr(), exact.len());
+            assert!(
+                merged >= 0,
+                "a call exactly at the per-call cap must be accepted, not rejected"
+            );
+        }
     }
 }
