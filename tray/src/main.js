@@ -1,4 +1,4 @@
-// Cerberus desktop dashboard — v3 webview controller.
+// Cerberus desktop dashboard — v5 webview controller.
 //
 // This file NEVER makes a network request. It calls Rust Tauri commands (defined
 // in src-tauri/src/lib.rs) which perform the authenticated fetches to the
@@ -11,7 +11,9 @@
 //   run_workload(model,p)  -> gateway output (the "run a workload" action)
 //   belief_conflicts()     -> conflicts JSON  (PENDING_DAEMON until route exists)
 //   workloads()            -> workloads JSON  (PENDING_DAEMON until route exists)
-//   devices()              -> device namespace (PENDING_DAEMON until route exists)
+//   devices()              -> device namespace JSON, incl. audio devices once the
+//                             daemon registers them (PENDING_DAEMON until the
+//                             route exists on an older daemon build)
 //   resolve_conflict / revoke_capability / grant_device  -> action POSTs
 //   operator_token_value() / operator_token_file()       -> for copy actions
 //
@@ -19,6 +21,9 @@
 // banner shows and panels blank out; when a subsystem exists in Go but has no
 // HTTP route yet, the command returns "PENDING_DAEMON: …" and the UI renders a
 // calm "pending daemon support" note instead of pretending it works.
+//
+// Theme: light/dark/system, persisted in localStorage — purely a webview-local
+// preference, no daemon round-trip. See initTheme()/applyTheme() below.
 
 const invoke = window.__TAURI__?.core?.invoke;
 const clipboard = window.__TAURI__?.clipboardManager;
@@ -26,6 +31,7 @@ const clipboard = window.__TAURI__?.clipboardManager;
 const POLL_MS = 2000;
 let connected = false;
 let lastMetrics = {}; // name -> value, for delta history
+let lastDevices = []; // cached devices() list so the Audio view can filter it
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -104,6 +110,73 @@ async function call(cmd, args) {
   }
 }
 
+// ---- theme (light / dark / system) ------------------------------------------
+
+const THEME_KEY = "cerberus-theme";
+const systemPrefersDark = () => window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+
+function applyTheme(choice) {
+  const resolved = choice === "system" ? (systemPrefersDark() ? "dark" : "light") : choice;
+  document.documentElement.setAttribute("data-theme", resolved);
+  document.querySelectorAll(".theme-pill").forEach((p) => p.classList.toggle("active", p.dataset.themeChoice === choice));
+}
+
+function setTheme(choice) {
+  localStorage.setItem(THEME_KEY, choice);
+  applyTheme(choice);
+}
+
+function initTheme() {
+  const saved = localStorage.getItem(THEME_KEY) || "system";
+  applyTheme(saved);
+  if (window.matchMedia) {
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      if ((localStorage.getItem(THEME_KEY) || "system") === "system") applyTheme("system");
+    });
+  }
+}
+
+// ---- settings panel ----------------------------------------------------------
+
+function openSettings() {
+  $("settings-scrim").classList.add("show");
+}
+function closeSettings() {
+  $("settings-scrim").classList.remove("show");
+}
+
+// ---- search (Ctrl/Cmd+K focuses; typing filters the active table) -----------
+
+function initSearch() {
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+  setText("search-kbd", isMac ? "⌘K" : "Ctrl K");
+  document.addEventListener("keydown", (e) => {
+    const combo = isMac ? e.metaKey : e.ctrlKey;
+    if (combo && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      $("search-input").focus();
+      $("search-input").select();
+    }
+    if (e.key === "Escape" && document.activeElement === $("search-input")) {
+      $("search-input").value = "";
+      filterActiveTable("");
+      $("search-input").blur();
+    }
+  });
+  $("search-input").addEventListener("input", (e) => filterActiveTable(e.target.value));
+}
+
+// Filters visible rows of whichever .tbl is inside the currently-active .view
+// by plain text match — a lightweight client-side filter, not a daemon query.
+function filterActiveTable(q) {
+  const active = document.querySelector(".view.active");
+  if (!active) return;
+  const needle = q.trim().toLowerCase();
+  active.querySelectorAll("table.tbl tbody tr").forEach((tr) => {
+    tr.style.display = !needle || tr.textContent.toLowerCase().includes(needle) ? "" : "none";
+  });
+}
+
 // ---- connection state -------------------------------------------------------
 
 function setConnected(state, detail) {
@@ -129,6 +202,7 @@ const VIEW_META = {
   overview: ["Overview", "Live node & mesh status"],
   mesh: ["Mesh peers", "Connected nodes on the capability-secured fabric"],
   devices: ["Devices", "9P device namespace — grant & pool hardware"],
+  audio: ["Audio devices", "Microphones & speakers this node can capture/play"],
   workloads: ["Workloads", "Run components across the mesh via the gateway"],
   metrics: ["Metrics", "Live counters from /metrics"],
   wallet: ["Wallet", "Compute credits & operator capability"],
@@ -141,18 +215,42 @@ function switchView(name) {
   const [title, sub] = VIEW_META[name] || [name, ""];
   setText("view-title", title);
   setText("view-sub", sub);
+  $("search-input").value = "";
   // Refresh the on-demand views immediately on entry.
-  if (name === "devices") refreshDevices();
+  if (name === "devices" || name === "audio") refreshDevices();
   if (name === "workloads") refreshWorkloads();
   if (name === "conflicts") refreshConflicts();
+}
+
+// ---- shared table-row helpers (checkbox + name-cell + actions, Docker style) -
+
+let rowSeq = 0;
+function nameCell(icon, primary, secondary) {
+  const id = `chk-${++rowSeq}`;
+  return (
+    `<td class="chk-col"><input type="checkbox" class="chk" id="${id}"></td>` +
+    `<td class="name-cell"><span class="row-icon">${icon}</span>` +
+    `<span class="name-stack"><span class="primary">${esc(primary)}</span>` +
+    (secondary ? `<span class="secondary">${esc(secondary)}</span>` : "") +
+    `</span></td>`
+  );
+}
+function actionIcon(title, glyph, onClick) {
+  const btn = el("button", "icon-btn", glyph);
+  btn.title = title;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+async function copyToClipboard(text) {
+  if (clipboard?.writeText) await clipboard.writeText(text);
+  else if (navigator.clipboard) await navigator.clipboard.writeText(text);
 }
 
 // ---- renderers --------------------------------------------------------------
 
 function renderStatus(s) {
-  // Overview stat tiles
+  // Overview summary bar
   setText("ov-mesh", s.mesh_up ? "up" : "down");
-  setText("ov-mesh-sub", s.mesh_up ? "libp2p / QUIC" : "fabric down");
   const peerCount = (s.peers || []).length;
   setText("ov-peers", String(peerCount));
   setText("ov-balance", fmtNum(s.operator_balance));
@@ -163,6 +261,11 @@ function renderStatus(s) {
   setText("d-kernel", s.kernel || "—");
   setText("d-uptime", fmtUptime(s.uptime_sec));
   setText("profile-chip", `profile · ${s.profile || "—"}`);
+
+  // Settings panel daemon info (mirrors the overview card, shown in the gear panel)
+  setText("s-version", s.version || "—");
+  setText("s-profile", s.profile || "—");
+  setText("s-kernel", s.kernel || "—");
 
   // Power card
   const p = s.power || {};
@@ -178,22 +281,28 @@ function renderStatus(s) {
   setText("nav-peers", String(peerCount));
 
   // Mesh view
-  setText("m-fabric-state", s.mesh_up ? "up" : "down");
   const pc = $("peer-container");
   if (!peerCount) {
     renderEmpty(pc, "⬡", "No peers yet — this node is alone on the mesh.");
   } else {
     const tbl = el("table", "tbl");
-    tbl.innerHTML = "<thead><tr><th>Peer</th><th>Address</th><th>Status</th></tr></thead><tbody></tbody>";
+    tbl.innerHTML =
+      `<thead><tr><th class="chk-col"><input type="checkbox" class="chk" id="chk-all-peers"></th>` +
+      `<th>Peer</th><th>Status</th><th class="actions-col"></th></tr></thead><tbody></tbody>`;
     const tb = tbl.querySelector("tbody");
     (s.peers || []).forEach((addr, i) => {
       const tr = el("tr");
-      tr.innerHTML =
-        `<td>peer ${i + 1}</td><td class="id-cell">${esc(addr)}</td><td><span class="chip ok">connected</span></td>`;
+      tr.innerHTML = nameCell("⬡", `peer ${i + 1}`, addr) + `<td><span class="chip ok">connected</span></td><td class="actions-col"></td>`;
+      const actions = el("div", "row-actions");
+      actions.appendChild(actionIcon("Copy address", "⧉", async () => { await copyToClipboard(addr); toast("Peer address copied", "ok"); }));
+      tr.querySelector("td.actions-col").appendChild(actions);
       tb.appendChild(tr);
     });
     pc.innerHTML = "";
     pc.appendChild(tbl);
+    tb.closest("table").querySelector("#chk-all-peers")?.addEventListener("change", (e) => {
+      tb.querySelectorAll("input.chk").forEach((c) => (c.checked = e.target.checked));
+    });
   }
 }
 
@@ -262,8 +371,40 @@ function renderHealth(h) {
 
 // ---- on-demand loaders (PENDING-aware) -------------------------------------
 
+// True for a device path this dashboard treats as an audio peripheral (mic or
+// speaker) rather than a generic 9P device (VRAM, etc.) — see view-audio.
+function isAudioDevice(d) {
+  const path = d.path || d;
+  return typeof path === "string" && path.startsWith("/cer/dev/audio/");
+}
+
+function deviceRowHTML(d, kindIcon) {
+  const path = d.path || d;
+  const kind = d.kind || "device";
+  return (
+    nameCell(kindIcon, path.split("/").pop() || path, path) +
+    `<td><span class="chip info">${esc(kind)}</span></td>` +
+    `<td>${esc((d.rights || []).join(", ") || "read")}</td>` +
+    `<td class="actions-col"></td>`
+  );
+}
+
+function wireDeviceRowActions(tr, path) {
+  const actions = el("div", "row-actions");
+  actions.appendChild(
+    actionIcon("Grant this device", "▤", () => {
+      $("grant-path").value = path;
+      switchView("devices");
+      toast("Path filled in below — pick rights and Grant", "info");
+    })
+  );
+  actions.appendChild(actionIcon("Copy path", "⧉", async () => { await copyToClipboard(path); toast("Path copied", "ok"); }));
+  tr.querySelector("td.actions-col").appendChild(actions);
+}
+
 async function refreshDevices() {
-  const c = $("dev-container");
+  const devContainer = $("dev-container");
+  const audioContainer = $("audio-container");
   const r = await call("devices");
   if (r.ok) {
     let list;
@@ -272,28 +413,42 @@ async function refreshDevices() {
     } catch {
       list = null;
     }
-    if (Array.isArray(list) && list.length) {
-      const tbl = el("table", "tbl");
-      tbl.innerHTML = "<thead><tr><th>Path</th><th>Kind</th><th>Rights</th></tr></thead><tbody></tbody>";
-      const tb = tbl.querySelector("tbody");
-      list.forEach((d) => {
-        const tr = el("tr");
-        tr.innerHTML =
-          `<td class="id-cell">${esc(d.path || d)}</td>` +
-          `<td><span class="chip info">${esc(d.kind || "device")}</span></td>` +
-          `<td>${esc((d.rights || []).join(", ") || "read")}</td>`;
-        tb.appendChild(tr);
-      });
-      c.innerHTML = "";
-      c.appendChild(tbl);
-    } else {
-      renderEmpty(c, "▤", "No devices in the namespace yet.");
-    }
+    lastDevices = Array.isArray(list) ? list : [];
+    renderDeviceTable(devContainer, lastDevices.filter((d) => !isAudioDevice(d)), "▤", "No devices in the namespace yet.");
+    renderDeviceTable(audioContainer, lastDevices.filter(isAudioDevice), "♪", "No microphones or speakers found on this host.");
   } else if (isPending(r.err)) {
-    renderPending(c, r.err, "Device namespace (9P)");
+    renderPending(devContainer, r.err, "Device namespace (9P)");
+    renderPending(audioContainer, r.err, "Audio device enumeration");
   } else {
-    renderEmpty(c, "▤", connected ? "Could not read the device namespace." : "Daemon offline.");
+    const msg = connected ? "Could not read the device namespace." : "Daemon offline.";
+    renderEmpty(devContainer, "▤", msg);
+    renderEmpty(audioContainer, "♪", msg);
   }
+}
+
+function renderDeviceTable(container, list, icon, emptyMsg) {
+  if (!container) return;
+  if (!list.length) {
+    renderEmpty(container, icon, emptyMsg);
+    return;
+  }
+  const tbl = el("table", "tbl");
+  tbl.innerHTML =
+    `<thead><tr><th class="chk-col"><input type="checkbox" class="chk"></th>` +
+    `<th>Name</th><th>Kind</th><th>Rights</th><th class="actions-col"></th></tr></thead><tbody></tbody>`;
+  const tb = tbl.querySelector("tbody");
+  list.forEach((d) => {
+    const path = d.path || d;
+    const tr = el("tr");
+    tr.innerHTML = deviceRowHTML(d, icon);
+    wireDeviceRowActions(tr, path);
+    tb.appendChild(tr);
+  });
+  tbl.querySelector("thead .chk")?.addEventListener("change", (e) => {
+    tb.querySelectorAll("input.chk").forEach((c) => (c.checked = e.target.checked));
+  });
+  container.innerHTML = "";
+  container.appendChild(tbl);
 }
 
 async function refreshWorkloads() {
@@ -309,14 +464,19 @@ async function refreshWorkloads() {
     if (Array.isArray(list) && list.length) {
       const tbl = el("table", "tbl");
       tbl.innerHTML =
-        "<thead><tr><th>Task</th><th>Model</th><th>Node</th><th>State</th></tr></thead><tbody></tbody>";
+        `<thead><tr><th class="chk-col"><input type="checkbox" class="chk"></th>` +
+        `<th>Task</th><th>Node</th><th>State</th></tr></thead><tbody></tbody>`;
       const tb = tbl.querySelector("tbody");
       list.forEach((w) => {
         const tr = el("tr");
         tr.innerHTML =
-          `<td class="mono">${esc(w.id || "")}</td><td>${esc(w.model || "")}</td>` +
-          `<td class="mono">${esc(w.node || "")}</td><td><span class="chip ${w.state === "done" ? "ok" : "info"}">${esc(w.state || "")}</span></td>`;
+          nameCell("▷", w.id || "", w.model || "") +
+          `<td class="mono">${esc(w.node || "")}</td>` +
+          `<td><span class="chip ${w.state === "done" ? "ok" : "info"}">${esc(w.state || "")}</span></td>`;
         tb.appendChild(tr);
+      });
+      tbl.querySelector("thead .chk")?.addEventListener("change", (e) => {
+        tb.querySelectorAll("input.chk").forEach((c) => (c.checked = e.target.checked));
       });
       c.innerHTML = "";
       c.appendChild(tbl);
@@ -394,6 +554,23 @@ function wireActions() {
   });
   $("btn-refresh").addEventListener("click", () => poll());
 
+  // settings panel
+  $("btn-settings").addEventListener("click", openSettings);
+  $("btn-close-settings").addEventListener("click", closeSettings);
+  $("settings-scrim").addEventListener("click", (e) => {
+    if (e.target === $("settings-scrim")) closeSettings();
+  });
+  $("theme-pills").addEventListener("click", (e) => {
+    const pill = e.target.closest(".theme-pill");
+    if (pill) setTheme(pill.dataset.themeChoice);
+  });
+  $("btn-settings-copy-token").addEventListener("click", async () => {
+    const r = await call("operator_token_value");
+    if (!r.ok) return toast(r.err, "bad");
+    await copyToClipboard(r.data);
+    toast("Operator token copied to clipboard", "ok");
+  });
+
   // run workload
   $("btn-run").addEventListener("click", async () => {
     const model = $("wl-model").value;
@@ -458,8 +635,7 @@ function wireActions() {
     }
     const out = $("token-result");
     try {
-      if (clipboard?.writeText) await clipboard.writeText(r.data);
-      else if (navigator.clipboard) await navigator.clipboard.writeText(r.data);
+      await copyToClipboard(r.data);
       toast("Operator token copied to clipboard", "ok");
       out.className = "result ok";
       out.textContent = "Token copied. (Kept out of the DOM otherwise.)";
@@ -474,8 +650,7 @@ function wireActions() {
     const r = await call("operator_token_file");
     if (!r.ok) return toast(r.err, "bad");
     try {
-      if (clipboard?.writeText) await clipboard.writeText(r.data);
-      else if (navigator.clipboard) await navigator.clipboard.writeText(r.data);
+      await copyToClipboard(r.data);
       toast("Token path copied", "ok");
     } catch {
       toast("clipboard unavailable", "bad");
@@ -524,12 +699,17 @@ async function poll() {
 
   // token path (cheap, static)
   const tp = await call("operator_token_file");
-  if (tp.ok) setText("w-tokenpath", tp.data);
+  if (tp.ok) {
+    setText("w-tokenpath", tp.data);
+    setText("s-tokenpath", tp.data);
+  }
 }
 
 // ---- boot -------------------------------------------------------------------
 
 window.addEventListener("DOMContentLoaded", () => {
+  initTheme();
+  initSearch();
   wireActions();
   poll();
   refreshConflicts();
