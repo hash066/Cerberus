@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -179,10 +180,19 @@ func main() {
 			meshFabric = mf
 		}
 		// Mirror the devices system.Compose registers in the 9P namespace so the
-		// CLI can enumerate them (the ninep.Server keeps its table private).
+		// CLI (and the status API's /api/v1/devices route) can enumerate them
+		// (the ninep.Server keeps its table private). This is generic over
+		// whatever Compose registered — it automatically includes every real
+		// audio endpoint (sys.AudioDevices) alongside the static VRAM device,
+		// so a new device kind Compose starts registering later shows up here
+		// too without another change at this call site.
 		devices = []deviceInfo{
 			{Path: "/cer/dev/vram/local/0", Kind: string(contract.KindVRAM), QuotaBytes: 2 * 1024 * 1024 * 1024},
 		}
+		for _, ad := range sys.AudioDevices {
+			devices = append(devices, deviceInfo{Path: ad.Path, Kind: string(ad.Kind)})
+		}
+		log.Printf("cerberusd: 9P namespace has %d device(s) (%d audio)", len(devices), len(sys.AudioDevices))
 		// Wire the lid-drop choreography: SLEEP_IMMINENT -> checkpoint -> promote
 		// standbys for this node's shards (ARCHITECTURE §4.2).
 		mon.SetCoordinator(lidDropCoordinator{sched: sys.Scheduler})
@@ -251,6 +261,21 @@ func main() {
 	// error is merely logged, and the daemon carries on with the gateway
 	// silently unreachable.
 	gw := gateway.NewGateway(localExec, issuer)
+
+	// Workload history: a small in-memory ring buffer recording every dispatch
+	// through either surface that can run a workload — the OpenAI-compatible
+	// gateway (what the tray's "run a workload" action and any OpenAI client
+	// use) and DaemonRPC.Run (the CLI's `cerberus run`). Backs the new
+	// /api/v1/workloads route; see cmd/cerberusd/workloads.go.
+	wlog := newWorkloadLog(200)
+	gw.SetOnDispatch(func(ev gateway.DispatchEvent) {
+		state := "done"
+		if !ev.OK {
+			state = "error"
+		}
+		wlog.record(api.WorkloadEntry{ID: ev.TaskID, Model: ev.Model, Node: "local", State: state})
+	})
+
 	gwLn := bindWithFallback("gateway", *gwAddr)
 	gwActualAddr := ""
 	if gwLn != nil {
@@ -263,32 +288,113 @@ func main() {
 		}()
 	}
 
+	// Shared capability catalogue for `caps mint/attenuate/revoke/list` and now
+	// the /api/v1/cap/revoke + /api/v1/devices/grant HTTP routes below — built
+	// once here (rather than inline in the DaemonRPC literal further down) so
+	// both the RPC service and the status API can mint/revoke through the same
+	// registry and see each other's entries.
+	caps := newCapRegistry()
+
+	// Metrics registry, created here (rather than at its historical spot further
+	// down) so the status API's /api/v1/cap/revoke route below can increment the
+	// same cerberus_revocations_total counter DaemonRPC.CapsRevoke does.
+	met := metrics.NewMetrics()
+
 	// Start the status API the desktop tray/dashboard consumes (token-gated).
 	started := time.Now()
-	apiSrv := api.New(issuer, func() api.Snapshot {
-		pw := mon.State()
-		peers := []string{}
-		if fabric != nil {
-			for _, p := range fabric.Peers() {
-				peers = append(peers, p.Addr)
+	apiSrv := api.NewWithGetters(issuer, api.Getters{
+		Version: func() string { return contract.ContractVersion },
+		Profile: func() string { return *profile },
+		Kernel:  func() string { return ffi.Backend() },
+		UptimeSec: func() int64 { return int64(time.Since(started).Seconds()) },
+		MeshUp:    func() bool { return fabric != nil },
+		Peers: func() []string {
+			peers := []string{}
+			if fabric != nil {
+				for _, p := range fabric.Peers() {
+					peers = append(peers, p.Addr)
+				}
 			}
-		}
-		bal, _ := lg.Balance("operator")
-		return api.Snapshot{
-			Version:         contract.ContractVersion,
-			Profile:         *profile,
-			Kernel:          ffi.Backend(),
-			UptimeSec:       int64(time.Since(started).Seconds()),
-			MeshUp:          fabric != nil,
-			Peers:           peers,
-			OperatorBalance: bal,
-			Power: api.PowerView{
+			return peers
+		},
+		OperatorBalance: func() uint64 {
+			bal, _ := lg.Balance("operator")
+			return bal
+		},
+		Power: func() api.PowerView {
+			pw := mon.State()
+			return api.PowerView{
 				Source:     powerSrc(pw.Src),
 				BatteryPct: pw.BatteryPct,
 				Lid:        lidStr(pw.Lid),
 				Hint:       hintStr(pw.Hint),
-			},
-		}
+			}
+		},
+	}).WithListGetters(api.ListGetters{
+		// GET /api/v1/conflicts — backed by the same daemon/state CRDT engine
+		// DaemonRPC.ConflictsList reads (see cmd/cerberusd/rpc.go).
+		Conflicts: func() []api.ConflictView {
+			if crdtEngine == nil {
+				return nil
+			}
+			out := make([]api.ConflictView, 0)
+			for _, c := range crdtEngine.Conflicts([]byte("daemon-doc")) {
+				cv := api.ConflictView{Subject: c.Subject}
+				for _, cand := range c.Candidates {
+					cv.Candidates = append(cv.Candidates, api.ConflictCandidateView{
+						Actor: hex.EncodeToString(peerBytes(cand.Actor)),
+						Value: string(cand.Value),
+					})
+				}
+				out = append(out, cv)
+			}
+			return out
+		},
+		// GET /api/v1/devices — generic over whatever Compose registered into
+		// the 9P namespace (the `devices` mirror list built above), so it
+		// automatically includes the real audio endpoints alongside VRAM.
+		Devices: func() []api.NamespaceDevice {
+			out := make([]api.NamespaceDevice, 0, len(devices))
+			for _, d := range devices {
+				out = append(out, api.NamespaceDevice{Path: d.Path, Kind: d.Kind, Rights: []string{"read"}})
+			}
+			return out
+		},
+		// GET /api/v1/workloads — the ring buffer fed by both the gateway's
+		// OnDispatch hook and DaemonRPC.Run (wired to the same wlog below).
+		Workloads: func() []api.WorkloadEntry { return wlog.list() },
+	}).WithActions(api.Actions{
+		// POST /api/v1/conflicts/resolve — same daemon/state call
+		// DaemonRPC.ConflictsResolve makes.
+		ResolveConflict: func(subject, winning string) (bool, error) {
+			if crdtEngine == nil {
+				return false, fmt.Errorf("conflicts: CRDT engine not available")
+			}
+			var resolver contract.PeerID
+			copy(resolver[:], []byte("operator"))
+			return crdtEngine.Resolve([]byte("daemon-doc"), resolver, subject, winning)
+		},
+		// POST /api/v1/cap/revoke — same auth issuer call DaemonRPC.CapsRevoke
+		// makes.
+		RevokeCap: func(id string) (bool, error) {
+			if err := issuer.Revoke(id); err != nil {
+				return false, err
+			}
+			met.RevocationsTotal.Inc()
+			return true, nil
+		},
+		// POST /api/v1/devices/grant — same auth issuer mint call
+		// DaemonRPC.CapsMint makes, scoped to a device resource.
+		GrantDevice: func(path string, rights []string) (token, id, subject string, err error) {
+			subject = "operator"
+			tok, merr := issuer.Mint(subject, rights, path, 0)
+			if merr != nil {
+				return "", "", "", merr
+			}
+			capID := tokenID(tok)
+			caps.add(mintedToken{ID: capID, Subject: subject, Rights: rights, Resource: path})
+			return tok, capID, subject, nil
+		},
 	})
 	apiLn := bindWithFallback("status API", *apiAddr)
 	apiActualAddr := ""
@@ -303,7 +409,8 @@ func main() {
 	}
 
 	// Observability: Prometheus /metrics (token-gated) + /healthz + /readyz.
-	met := metrics.NewMetrics()
+	// met itself was created earlier (alongside the status API construction)
+	// so /api/v1/cap/revoke could share the same counters.
 	metricsLn := bindWithFallback("metrics", *metricsAddr)
 	metricsActualAddr := ""
 	if metricsLn != nil {
@@ -340,7 +447,9 @@ func main() {
 	// Start RPC server (token-gated). Every method presents the operator token
 	// and is authorized before touching a subsystem. The service borrows the
 	// already-composed objects: mesh fabric, scheduler, wazero executor, durable
-	// ledger + CRDT engine, the metric set, and the 9P device list.
+	// ledger + CRDT engine, the metric set, and the 9P device list. caps and
+	// wlog are shared with the status API (built above) so `cerberus caps
+	// list`/`cerberus workloads` and the HTTP routes see the same state.
 	rpcService := &DaemonRPC{
 		authz:     issuer,
 		lifecycle: mon,
@@ -352,7 +461,8 @@ func main() {
 		metrics:   met,
 		daemonDoc: []byte("daemon-doc"),
 		devices:   devices,
-		caps:      newCapRegistry(),
+		caps:      caps,
+		wlog:      wlog,
 		profile:   *profile,
 		kernel:    ffi.Backend(),
 		started:   started,
