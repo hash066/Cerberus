@@ -7,11 +7,27 @@ import (
 	"time"
 )
 
+// isolateConfigDir points auth.OperatorTokenPath() -- and therefore the
+// discovery manifest/lock directory (dir(), which is filepath.Dir of it) -- at
+// a fresh per-test temp directory, on EVERY OS. os.UserConfigDir() reads a
+// different env var per platform: %AppData% on Windows, $XDG_CONFIG_HOME on
+// Linux, and $HOME/Library/Application Support on macOS. Overriding only one of
+// them isolates the tests on that OS but silently leaves them sharing the real
+// user config dir on the others -- which is exactly how the lock-file tests
+// below leaked state into each other on the Linux/macOS CI runners (one test's
+// AcquireLock left a live lock that the next test then saw), while passing on
+// the Windows dev box. Setting all three points every platform at t.TempDir(),
+// which the test framework also cleans up automatically.
+func isolateConfigDir(t *testing.T) {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("AppData", tmp)         // Windows
+	t.Setenv("XDG_CONFIG_HOME", tmp) // Linux (and other XDG platforms)
+	t.Setenv("HOME", tmp)            // macOS (and Linux fallback when XDG unset)
+}
+
 func TestWriteReadRoundTrip(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	// os.UserConfigDir() on non-Windows honors XDG_CONFIG_HOME; on Windows it
-	// uses %AppData%, so also override that for this test to be isolated.
-	t.Setenv("AppData", t.TempDir())
+	isolateConfigDir(t)
 
 	m := Manifest{
 		Version:     "0.1.0",
@@ -38,14 +54,14 @@ func TestWriteReadRoundTrip(t *testing.T) {
 }
 
 func TestReadMissingManifestErrors(t *testing.T) {
-	t.Setenv("AppData", t.TempDir())
+	isolateConfigDir(t)
 	if _, err := Read(); err == nil {
 		t.Fatal("expected an error reading a manifest that was never written")
 	}
 }
 
 func TestAcquireLockRejectsSecondLiveHolder(t *testing.T) {
-	t.Setenv("AppData", t.TempDir())
+	isolateConfigDir(t)
 	if err := AcquireLock(); err != nil {
 		t.Fatalf("first AcquireLock: %v", err)
 	}
@@ -66,7 +82,7 @@ func TestAcquireLockRejectsSecondLiveHolder(t *testing.T) {
 // the O_CREATE|O_EXCL implementation cannot, because only one exclusive
 // create for a given path can ever succeed at the OS level.
 func TestAcquireLockIsRaceFree(t *testing.T) {
-	t.Setenv("AppData", t.TempDir())
+	isolateConfigDir(t)
 	const n = 64
 	var wg sync.WaitGroup
 	start := make(chan struct{})
@@ -103,7 +119,7 @@ func TestAcquireLockIsRaceFree(t *testing.T) {
 }
 
 func TestAcquireLockReclaimsStaleLock(t *testing.T) {
-	t.Setenv("AppData", t.TempDir())
+	isolateConfigDir(t)
 	// A PID that is vanishingly unlikely to be a live process on this host.
 	const deadPID = 999999
 	if err := os.MkdirAll(dir(), 0o700); err != nil {
@@ -127,7 +143,7 @@ func TestIsRunningTrueForSelf(t *testing.T) {
 }
 
 func TestRemoveDeletesBothFiles(t *testing.T) {
-	t.Setenv("AppData", t.TempDir())
+	isolateConfigDir(t)
 	if err := Write(Manifest{PID: os.Getpid()}); err != nil {
 		t.Fatal(err)
 	}

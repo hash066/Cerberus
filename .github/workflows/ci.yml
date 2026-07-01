@@ -28,6 +28,15 @@ jobs:
   go:
     name: go build/vet/test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # The default Cerberus build is pure-Go (CGO_ENABLED=0): wazero/bbolt/ed25519,
+    # no C toolchain (see HANDOFF.md "Build / run / test" + CLAUDE.md). Pin it here
+    # so the hosted Windows runner — which ships gcc and would otherwise default
+    # CGO on — builds the SAME artifact developers do. In particular ninep's WinFsp
+    # mount then selects cgofuse's no-cgo DLL-loading variant instead of its cgo
+    # path, which #includes the WinFsp SDK header (fuse_common.h) that the runner
+    # does not have. The real cgo path is covered separately by ffi-windows.
+    env:
+      CGO_ENABLED: "0"
     strategy:
       fail-fast: false
       matrix:
