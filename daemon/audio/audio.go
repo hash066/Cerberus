@@ -203,39 +203,28 @@ func (b *BufferSink) WriteFrame(f Frame) error {
 }
 
 // ---------------------------------------------------------------------------
-// OS capture/playback — STUB (the only OS-integration point in this package).
+// OS capture/playback — the OS-integration point in this package.
 //
-// Real microphone capture and speaker playback belong here, behind the same
-// Source/Sink interfaces the synthetic generators implement:
-//   - macOS:   CoreAudio (AudioUnit / AVAudioEngine tap)
-//   - Windows: WASAPI (IAudioClient capture/render)
-//   - Linux:   PipeWire (pw_stream capture/playback node)
+// Real microphone capture and speaker playback are behind the same Source/Sink
+// interfaces the synthetic generators implement:
+//   - Windows: WASAPI (IAudioClient capture/render) — REAL, see os_windows.go.
+//   - macOS:   CoreAudio (AudioUnit / AVAudioEngine tap) — not wired.
+//   - Linux:   PipeWire (pw_stream capture/playback node) — not wired.
 //
-// None of those are wired here — each needs cgo / platform audio frameworks
-// that are out of scope for v0.1 and not verifiable in this environment
-// (MATURITY HONESTY per CLAUDE.md "Maturity honesty": this is a documented
-// stub, not a faked working backend). The constructors below return an error so
-// a caller that asks for a real device on an unsupported build fails loudly
-// instead of silently producing fake audio.
+// The Windows backend is real (go-wca, a pure-Go WASAPI/COM binding — no cgo,
+// see os_windows.go's doc comment for the rationale). macOS/Linux are not
+// verifiable in this environment and remain documented stubs (MATURITY HONESTY
+// per CLAUDE.md "Maturity honesty": this is a documented stub, not a faked
+// working backend, until someone implements + verifies it on that platform).
+// The entry points below (NewOSCaptureSource / NewOSPlaybackSink) are
+// implemented per-platform in os_windows.go / os_other.go; on an unsupported
+// build they return ErrOSAudioUnavailable so a caller that asks for a real
+// device fails loudly instead of silently producing fake audio.
 // ---------------------------------------------------------------------------
 
 // ErrOSAudioUnavailable signals that no real OS audio backend is wired into this
 // build. Use SineSource / BufferSink for tests and the in-memory path.
 var ErrOSAudioUnavailable = errors.New("audio: OS capture/playback backend not implemented in this build (stub)")
-
-// NewOSCaptureSource is the entry point for a real OS microphone-capture Source.
-// TODO(F-real): implement CoreAudio / WASAPI / PipeWire capture behind this.
-// Until then it returns ErrOSAudioUnavailable so nothing fakes a working mic.
-func NewOSCaptureSource(_ Format) (Source, error) {
-	return nil, ErrOSAudioUnavailable
-}
-
-// NewOSPlaybackSink is the entry point for a real OS speaker-playback Sink.
-// TODO(F-real): implement CoreAudio / WASAPI / PipeWire playback behind this.
-// Until then it returns ErrOSAudioUnavailable so nothing fakes a working speaker.
-func NewOSPlaybackSink(_ Format) (Sink, error) {
-	return nil, ErrOSAudioUnavailable
-}
 
 // silentFrame returns a zero-filled (silence) frame sized for the format. Used
 // by the Receiver to gap-fill a lost packet when no last frame is available.
