@@ -113,11 +113,12 @@ type node struct {
 	templatefs.NilCloser
 	templatefs.NotLockable
 
-	ns   *Server
-	cap  contract.CapHandle
-	path string
-	dir  bool
-	data []byte // populated on Open for openable leaves
+	ns     *Server
+	cap    contract.CapHandle
+	path   string
+	dir    bool
+	fsFile bool   // a /cer/fs file leaf (openable to a write endpoint, see Open)
+	data   []byte // populated on Open for openable leaves
 }
 
 // qid derives a stable QID from the path. Path uniqueness is best-effort (FNV
@@ -133,6 +134,11 @@ func (n *node) qid() p9.QID {
 func (n *node) mode() p9.FileMode {
 	if n.dir {
 		return p9.ModeDirectory | 0o555
+	}
+	if n.fsFile {
+		// A /cer/fs file is writable (open-for-write → dfs.Put via the data plane);
+		// the bytes never traverse 9P, only the endpoint descriptor does.
+		return p9.ModeRegular | 0o644
 	}
 	return p9.ModeRegular | 0o444
 }
@@ -176,6 +182,17 @@ func (n *node) Walk(names []string) ([]p9.QID, p9.File, error) {
 		leaf := isLeaf(name)
 		next.dir = !leaf
 		switch {
+		case isFSPath(next.path):
+			// The /cer/fs subtree is served by the namespace's WalkFS/OpenFS*
+			// methods, not the device path. Every hop into a file is cap-checked
+			// (WalkFS uses "read"); the /cer/fs root itself is a structural dir.
+			// A /cer/fs file node is a leaf whose Open hands back a data-plane
+			// endpoint (write) — bulk bytes ride the data plane, never 9P.
+			next.dir = strings.TrimRight(next.path, "/") == FSRoot
+			next.fsFile = !next.dir
+			if err := n.ns.WalkFS(next.path, n.cap); err != nil {
+				return nil, nil, toErrno(err)
+			}
 		case leaf:
 			// ctl/info/alloc are leaves; the parent must be a registered device
 			// and the cap must authorize read on it (Server.Walk = "read"
@@ -213,6 +230,31 @@ func (n *node) Walk(names []string) ([]p9.QID, p9.File, error) {
 func (n *node) Open(mode p9.OpenFlags) (p9.QID, uint32, error) {
 	if n.dir {
 		return p9.QID{}, 0, linux.EISDIR
+	}
+	// /cer/fs file: opening it hands back a data-plane endpoint (the file bytes
+	// ride the data plane, never 9P). A write open (WriteOnly/ReadWrite) allocates
+	// a send endpoint the caller streams the file into (→ dfs.Put). A read open
+	// needs the caller's own receiver endpoint, which a plain 9P Open cannot carry;
+	// the read path is exposed through the Server API (Server.OpenFSRead), which
+	// the CLI/gateway drive — so a bare read-open over the wire is refused here
+	// with a clear errno rather than silently returning nothing.
+	if n.fsFile {
+		switch mode.Mode() {
+		case p9.WriteOnly, p9.ReadWrite:
+			ep, err := n.ns.OpenFSWrite(n.path, n.cap)
+			if err != nil {
+				return p9.QID{}, 0, toErrno(err)
+			}
+			b, err := json.Marshal(ep)
+			if err != nil {
+				return p9.QID{}, 0, linux.EIO
+			}
+			n.data = b
+			return n.qid(), 0, nil
+		default:
+			// Read requires an out-of-band receiver endpoint (see Server.OpenFSRead).
+			return p9.QID{}, 0, linux.ENOSYS
+		}
 	}
 	switch basePath(n.path) {
 	case "ctl":
