@@ -12,6 +12,7 @@
 //	devices                         list 9P namespace devices
 //	wallet [owner]                  compute-credit balance from the durable ledger
 //	caps mint|attenuate|revoke|list capability-token lifecycle
+//	components add|list            local named-component registry (name -> CID)
 //	conflicts list|resolve …        CRDT belief-conflict inspection / resolution
 //	metrics                         fetch the local Prometheus /metrics text
 //	version                         print the client + contract version
@@ -28,12 +29,15 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/auth"
+	"github.com/hash066/cerberus/daemon/components"
+	"github.com/hash066/cerberus/daemon/store"
 )
 
 const (
@@ -106,6 +110,8 @@ func run(args []string) int {
 		return cmdWallet(rest, jsonOut)
 	case "caps":
 		return cmdCaps(rest, jsonOut)
+	case "components":
+		return cmdComponents(rest, jsonOut)
 	case "conflicts":
 		return cmdConflicts(rest, jsonOut)
 	case "metrics":
@@ -133,6 +139,8 @@ Commands:
   caps attenuate --parent TOKEN --rights r,r [--resource path] [--ttl dur]
   caps revoke  <token-id>
   caps list                           List tokens this daemon minted
+  components add <name> <path.wasm>   Register a local component under a name
+  components list                     List registered components (name, CID, size)
   conflicts list [--doc <hex>]        Open CRDT belief conflicts
   conflicts resolve <subject> <value> [--doc <hex>]
   metrics                             Fetch the local Prometheus /metrics text
@@ -462,6 +470,94 @@ func cmdCaps(args []string, jsonOut bool) int {
 		return exitUsage
 	}
 }
+
+// ---- components (local named-component registry) --------------------------
+//
+// This is a purely LOCAL, on-disk convenience — a name -> CID catalogue for
+// components you have on this machine, backed by daemon/store (bbolt) in its
+// own file so it never contends with a running cerberusd for the daemon's own
+// database. It is NOT gated by the daemon's capability-token RPC (there is no
+// daemon subsystem here to authorize against) and it is NOT synced across the
+// mesh — see daemon/components's package doc for the explicit non-goals.
+
+// componentsDBPath returns the local bbolt file the registry lives in:
+// alongside the operator token, in the OS config dir, as its own file (so it
+// never lock-contends with cerberusd's cerberus.db).
+func componentsDBPath() string {
+	return filepath.Join(filepath.Dir(auth.OperatorTokenPath()), "components.db")
+}
+
+func openComponentsRegistry() (*components.Registry, *store.Store, int) {
+	s, err := store.Open(componentsDBPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "components: open registry: %v\n", err)
+		return nil, nil, exitErr
+	}
+	return components.Open(s), s, exitOK
+}
+
+func cmdComponents(args []string, jsonOut bool) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "components: need a subcommand: add | list")
+		return exitUsage
+	}
+	sub := args[0]
+	rest := args[1:]
+
+	reg, s, code := openComponentsRegistry()
+	if code != exitOK {
+		return code
+	}
+	defer s.Close()
+
+	switch sub {
+	case "add":
+		if len(rest) < 2 {
+			fmt.Fprintln(os.Stderr, "components add: need <name> <path-to-wasm>")
+			fmt.Fprintln(os.Stderr, "usage: cerberus components add <name> <path-to-wasm>")
+			return exitUsage
+		}
+		name, path := rest[0], rest[1]
+		entry, err := reg.Add(name, path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "components add: %v\n", err)
+			return exitErr
+		}
+		if jsonOut {
+			return printJSON(entry)
+		}
+		fmt.Printf("Registered %q\n", entry.Name)
+		fmt.Printf("  CID:  %s\n", entry.CID)
+		fmt.Printf("  Path: %s\n", entry.Path)
+		fmt.Printf("  Size: %s\n", humanBytes(uint64(entry.Size)))
+		fmt.Println("  (run it with: cerberus run " + entry.Path + ")")
+		return exitOK
+
+	case "list":
+		list, err := reg.List()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "components list: %v\n", err)
+			return exitErr
+		}
+		if jsonOut {
+			return printJSON(list)
+		}
+		if len(list) == 0 {
+			fmt.Println("No components registered. Use: cerberus components add <name> <path.wasm>")
+			return exitOK
+		}
+		fmt.Printf("Registered components (%d):\n", len(list))
+		for _, e := range list {
+			fmt.Printf("  %-20s %-64s %s\n", e.Name, e.CID, humanBytes(uint64(e.Size)))
+		}
+		return exitOK
+
+	default:
+		fmt.Fprintf(os.Stderr, "components: unknown subcommand %q (add | list)\n", sub)
+		return exitUsage
+	}
+}
+
 
 func cmdConflicts(args []string, jsonOut bool) int {
 	if len(args) == 0 {

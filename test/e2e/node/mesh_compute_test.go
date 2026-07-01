@@ -78,6 +78,9 @@ func newTestNode(t *testing.T, ctx context.Context, id string) *server {
 		nil,
 		contract.RightExec,
 	)
+	// Mirror Run(): answer peer component-fetch requests from our own store, so
+	// tests built on this helper can exercise the peer-fetch fallback path.
+	fab.ServeComponentFetch(cstore)
 	return s
 }
 
