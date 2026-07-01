@@ -34,6 +34,7 @@ import (
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/auth"
+	"github.com/hash066/cerberus/daemon/discovery"
 )
 
 const (
@@ -41,12 +42,24 @@ const (
 	defaultMetricsAddr = "127.0.0.1:7779"
 )
 
-// resolved bind addresses (overridable via --rpc/--metrics flags or the
-// $CERBERUS_RPC_ADDR / $CERBERUS_METRICS_ADDR env vars, so the CLI can target a
-// non-default daemon on the same box).
+// resolved bind addresses. Resolution order (highest priority first):
+//
+//  1. An explicit --rpc / --metrics-addr flag (handled in run(), which
+//     overwrites these vars after this initialization).
+//  2. $CERBERUS_RPC_ADDR / $CERBERUS_METRICS_ADDR env vars.
+//  3. The running daemon's discovery manifest (daemon.json), if present and
+//     its PID is still alive — this is what lets the CLI find a daemon that
+//     fell back to an ephemeral port after a bind conflict, instead of
+//     silently talking to the wrong (or no) port.
+//  4. The hardcoded default constants above (today's behavior, unchanged).
+//
+// So: flag/env > manifest > hardcoded default. A missing or stale manifest
+// (no daemon.json, or its PID is dead) is not an error here — it just means
+// step 3 contributes nothing and we fall through to step 4, exactly like
+// before this change existed.
 var (
-	rpcAddr     = envOr("CERBERUS_RPC_ADDR", defaultRPCAddr)
-	metricsAddr = envOr("CERBERUS_METRICS_ADDR", defaultMetricsAddr)
+	rpcAddr     = resolveAddr("CERBERUS_RPC_ADDR", defaultRPCAddr, func(m discovery.Manifest) string { return m.RPCAddr })
+	metricsAddr = resolveAddr("CERBERUS_METRICS_ADDR", defaultMetricsAddr, func(m discovery.Manifest) string { return m.MetricsAddr })
 )
 
 func envOr(key, def string) string {
@@ -54,6 +67,39 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// resolveAddr implements the env > manifest > default priority described
+// above for one address field. pick extracts the relevant field from a
+// manifest (empty string if that subsystem never bound).
+func resolveAddr(envKey, def string, pick func(discovery.Manifest) string) string {
+	if v := os.Getenv(envKey); v != "" {
+		return v
+	}
+	if addr, ok := liveManifestAddr(pick); ok {
+		return addr
+	}
+	return def
+}
+
+// liveManifestAddr reads the discovery manifest and returns the field pick
+// selects, but only when the manifest is readable, names a PID that is still
+// alive, AND the requested field is non-empty (a subsystem that failed to
+// bind at all leaves its field empty — falling back to the hardcoded default
+// is still the right move there, same as a missing manifest).
+func liveManifestAddr(pick func(discovery.Manifest) string) (string, bool) {
+	m, err := discovery.Read()
+	if err != nil {
+		return "", false
+	}
+	if m.PID == 0 || !discovery.IsRunning(m.PID) {
+		return "", false
+	}
+	addr := pick(m)
+	if addr == "" {
+		return "", false
+	}
+	return addr, true
 }
 
 // exit codes
@@ -110,6 +156,8 @@ func run(args []string) int {
 		return cmdConflicts(rest, jsonOut)
 	case "metrics":
 		return cmdMetrics(rest, jsonOut)
+	case "doctor":
+		return cmdDoctor(rest, jsonOut)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)
 		usage(os.Stderr)
@@ -136,6 +184,7 @@ Commands:
   conflicts list [--doc <hex>]        Open CRDT belief conflicts
   conflicts resolve <subject> <value> [--doc <hex>]
   metrics                             Fetch the local Prometheus /metrics text
+  doctor                              Diagnose daemon discovery + reachability
   version                             Print client + contract version
 
 Global flags:
@@ -558,6 +607,154 @@ func cmdMetrics(_ []string, jsonOut bool) int {
 	}
 	os.Stdout.Write(body)
 	return exitOK
+}
+
+// ---- doctor -----------------------------------------------------------------
+
+// doctorReport is the machine-readable shape `cerberus doctor --json` prints.
+// Every field is filled in best-effort: a probe that could not run at all
+// (e.g. no manifest to read an address from) is simply omitted/zero rather
+// than aborting the rest of the report — the whole point of `doctor` is to
+// show what IS and ISN'T reachable, not to require everything to work first.
+type doctorReport struct {
+	ManifestPath  string `json:"manifest_path"`
+	ManifestFound bool   `json:"manifest_found"`
+	ManifestError string `json:"manifest_error,omitempty"`
+
+	PID      int  `json:"pid,omitempty"`
+	PIDAlive bool `json:"pid_alive"`
+
+	RPCAddr     string `json:"rpc_addr"`
+	MetricsAddr string `json:"metrics_addr"`
+
+	Healthz    bool   `json:"healthz"`
+	HealthzErr string `json:"healthz_error,omitempty"`
+	Readyz     bool   `json:"readyz"`
+	ReadyzErr  string `json:"readyz_error,omitempty"`
+
+	RPCReachable bool            `json:"rpc_reachable"`
+	RPCErr       string          `json:"rpc_error,omitempty"`
+	StatusResp   *StatusResponse `json:"status,omitempty"`
+}
+
+// cmdDoctor is "is my setup correctly wired" — the first thing a user or an
+// AI coding assistant should run when something seems off. It reads the
+// discovery manifest, reports whether the PID it names is alive, and probes
+// the metrics /healthz + /readyz endpoints and a trivial RPC (Status) call —
+// then prints a clear human-readable (or --json) report of what's reachable.
+func cmdDoctor(_ []string, jsonOut bool) int {
+	rep := &doctorReport{ManifestPath: discovery.Path()}
+
+	m, merr := discovery.Read()
+	if merr != nil {
+		rep.ManifestError = merr.Error()
+	} else {
+		rep.ManifestFound = true
+		rep.PID = m.PID
+		rep.PIDAlive = m.PID != 0 && discovery.IsRunning(m.PID)
+	}
+
+	// Effective addresses: same priority order as the rest of the CLI (flag/env
+	// already applied to the package vars by run(); manifest only if live).
+	rep.RPCAddr = rpcAddr
+	rep.MetricsAddr = metricsAddr
+
+	// Probe /healthz and /readyz on the metrics address (unauthenticated).
+	probeClient := &http.Client{Timeout: 5 * time.Second}
+	if res, err := probeClient.Get("http://" + rep.MetricsAddr + "/healthz"); err != nil {
+		rep.HealthzErr = err.Error()
+	} else {
+		res.Body.Close()
+		rep.Healthz = res.StatusCode == http.StatusOK
+		if !rep.Healthz {
+			rep.HealthzErr = res.Status
+		}
+	}
+	if res, err := probeClient.Get("http://" + rep.MetricsAddr + "/readyz"); err != nil {
+		rep.ReadyzErr = err.Error()
+	} else {
+		res.Body.Close()
+		rep.Readyz = res.StatusCode == http.StatusOK
+		if !rep.Readyz {
+			rep.ReadyzErr = res.Status
+		}
+	}
+
+	// Probe the RPC server with a trivial authenticated call (Status).
+	if token := auth.LoadToken(); token == "" {
+		rep.RPCErr = "no capability token available (set $CERBERUS_TOKEN or start cerberusd)"
+	} else if client, err := rpc.Dial("tcp", rep.RPCAddr); err != nil {
+		rep.RPCErr = err.Error()
+	} else {
+		defer client.Close()
+		var resp StatusResponse
+		if err := client.Call("DaemonRPC.Status", &StatusRequest{Token: token}, &resp); err != nil {
+			rep.RPCErr = err.Error()
+		} else {
+			rep.RPCReachable = true
+			rep.StatusResp = &resp
+		}
+	}
+
+	if jsonOut {
+		return printJSON(rep)
+	}
+	printDoctorReport(rep)
+	if !rep.Healthz || !rep.RPCReachable {
+		return exitErr
+	}
+	return exitOK
+}
+
+func printDoctorReport(rep *doctorReport) {
+	fmt.Println("Cerberus Doctor")
+	fmt.Println()
+	fmt.Println("Discovery manifest:")
+	fmt.Printf("  Path:       %s\n", rep.ManifestPath)
+	if !rep.ManifestFound {
+		fmt.Printf("  Status:     MISSING (%s)\n", rep.ManifestError)
+		fmt.Println("              No daemon.json — either cerberusd has never run on this")
+		fmt.Println("              machine, or it predates this feature. The CLI is falling back")
+		fmt.Println("              to hardcoded default addresses (or --flag/$ENV overrides).")
+	} else {
+		fmt.Printf("  Status:     found\n")
+		fmt.Printf("  PID:        %d (alive=%v)\n", rep.PID, rep.PIDAlive)
+		if !rep.PIDAlive {
+			fmt.Println("              Manifest is STALE (PID not running) — a prior daemon likely")
+			fmt.Println("              crashed without cleaning up. Falling back to hardcoded")
+			fmt.Println("              defaults (or --flag/$ENV overrides) until a new daemon starts.")
+		}
+	}
+	fmt.Println()
+	fmt.Println("Effective addresses (flag/env > live manifest > hardcoded default):")
+	fmt.Printf("  RPC:        %s\n", rep.RPCAddr)
+	fmt.Printf("  Metrics:    %s\n", rep.MetricsAddr)
+	fmt.Println()
+	fmt.Println("Reachability:")
+	fmt.Printf("  /healthz:   %s\n", okOrErr(rep.Healthz, rep.HealthzErr))
+	fmt.Printf("  /readyz:    %s\n", okOrErr(rep.Readyz, rep.ReadyzErr))
+	if rep.RPCReachable {
+		fmt.Printf("  RPC Status: ok (version=%s profile=%s mesh_up=%v peers=%d)\n",
+			rep.StatusResp.Version, rep.StatusResp.Profile, rep.StatusResp.MeshUp, rep.StatusResp.PeerCount)
+	} else {
+		fmt.Printf("  RPC Status: FAILED (%s)\n", rep.RPCErr)
+	}
+	fmt.Println()
+	if rep.Healthz && rep.RPCReachable {
+		fmt.Println("Overall: cerberusd looks reachable and correctly wired.")
+	} else {
+		fmt.Println("Overall: one or more daemon surfaces are NOT reachable — see above.")
+	}
+}
+
+func okOrErr(ok bool, errMsg string) string {
+	if ok {
+		return "ok"
+	}
+	if errMsg == "" {
+		errMsg = "unreachable"
+	}
+	return "FAILED (" + errMsg + ")"
 }
 
 // ---- shared plumbing -------------------------------------------------------

@@ -26,9 +26,18 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ---- daemon endpoints -------------------------------------------------------
+//
+// These constants are the fallback only. The v3 audit found that cerberusd and
+// every client (this tray, the `cerberus` CLI, an MCP server) each hardcoded
+// the SAME default ports independently and hoped they'd agree — silently
+// wrong on any bind conflict. The Go side now writes a discovery manifest
+// (`daemon.json`, next to the operator token) with the addresses it ACTUALLY
+// bound to; `daemon_urls()` below reads that manifest first and only falls
+// back to these hardcoded constants when it can't (no manifest, unparsable,
+// or a field the daemon never bound is empty).
 
 const STATUS_URL: &str = "http://127.0.0.1:7777/api/v1/status";
 const METRICS_URL: &str = "http://127.0.0.1:7779/metrics";
@@ -39,14 +48,125 @@ const GATEWAY_CHAT_URL: &str = "http://127.0.0.1:8080/v1/chat/completions";
 // Intended (not-yet-served) routes for actions the daemon has not surfaced over
 // HTTP. Kept here so that the day the Go side adds them, the desktop lights up
 // with zero UI changes. Until then these 404 and we report PENDING_DAEMON.
-const CONFLICTS_URL: &str = "http://127.0.0.1:7777/api/v1/conflicts";
-const RESOLVE_URL: &str = "http://127.0.0.1:7777/api/v1/conflicts/resolve";
-const DEVICES_URL: &str = "http://127.0.0.1:7777/api/v1/devices";
-const WORKLOADS_URL: &str = "http://127.0.0.1:7777/api/v1/workloads";
-const REVOKE_URL: &str = "http://127.0.0.1:7777/api/v1/cap/revoke";
-const GRANT_DEVICE_URL: &str = "http://127.0.0.1:7777/api/v1/devices/grant";
+//
+// These all live under the status API's address, so they participate in the
+// same manifest-first resolution as STATUS_URL (see conflicts_url() etc.
+// below) rather than staying hardcoded to 127.0.0.1:7777.
+const CONFLICTS_PATH: &str = "/api/v1/conflicts";
+const RESOLVE_PATH: &str = "/api/v1/conflicts/resolve";
+const DEVICES_PATH: &str = "/api/v1/devices";
+const WORKLOADS_PATH: &str = "/api/v1/workloads";
+const REVOKE_PATH: &str = "/api/v1/cap/revoke";
+const GRANT_DEVICE_PATH: &str = "/api/v1/devices/grant";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+// ---- discovery manifest ------------------------------------------------------
+
+/// Mirrors the JSON shape `daemon/discovery.Manifest` (Go) writes to
+/// `daemon.json`. Field names match the Go struct's `json:"..."` tags exactly
+/// -- this is plain JSON, no shared Rust/Go type, by design (the frozen
+/// contract is the only cross-language type surface; this manifest is not
+/// part of it). Every *_addr field is a bare "host:port" address (NOT a full
+/// URL), same as the Go side documents.
+///
+/// `pid` and `rpc_addr` are deserialized for completeness (they round-trip
+/// the full manifest shape and are cheap to keep) but unused today: this
+/// binary only ever talks to the daemon's HTTP surfaces (gateway/api/metrics),
+/// never the net/rpc control socket, and per the task's guidance we
+/// deliberately do NOT add PID-liveness checking in Rust (no cheap
+/// cross-platform way to do it without a new dependency) -- a stale manifest
+/// just means the addresses we read are wrong, and the existing
+/// PENDING_DAEMON / unreachable error handling already reports "daemon down"
+/// correctly in that case.
+#[derive(Deserialize, Default, Clone)]
+#[allow(dead_code)]
+struct Manifest {
+    #[serde(default)]
+    pid: i64,
+    #[serde(default)]
+    gateway_addr: String,
+    #[serde(default)]
+    api_addr: String,
+    #[serde(default)]
+    metrics_addr: String,
+    #[serde(default)]
+    rpc_addr: String,
+}
+
+/// Absolute path of the discovery manifest (OS config dir / cerberus /
+/// daemon.json). Mirrors `daemon/discovery.Path()` (Go): same directory as
+/// the operator token, so the tray needs only `dirs::config_dir()` to find
+/// everything.
+fn manifest_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("cerberus").join("daemon.json"))
+}
+
+/// Best-effort manifest read. Returns None on any failure (file missing,
+/// unreadable, malformed JSON) -- the caller treats that exactly like "no
+/// manifest" and falls back to the hardcoded constants. We deliberately do
+/// NOT attempt PID-liveness checking here (no cheap cross-platform way to do
+/// it from Rust without a new dependency): a stale manifest just means the
+/// addresses we read are wrong, and the existing PENDING_DAEMON / unreachable
+/// error handling in daemon_status/daemon_metrics/etc. already reports
+/// "daemon down" correctly when that happens.
+fn read_manifest() -> Option<Manifest> {
+    let path = manifest_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Build "http://{addr}{path}" from a manifest address field, or None if the
+/// field is empty (that subsystem never bound, per the Go side's contract).
+fn url_from_addr(addr: &str, path: &str) -> Option<String> {
+    if addr.is_empty() {
+        None
+    } else {
+        Some(format!("http://{addr}{path}"))
+    }
+}
+
+/// Resolve one daemon URL: manifest's address for `path` if the manifest is
+/// readable and that field is non-empty, else the hardcoded fallback.
+fn resolve_url(pick: impl Fn(&Manifest) -> &str, path: &str, fallback: &str) -> String {
+    read_manifest()
+        .and_then(|m| url_from_addr(pick(&m), path))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn status_url() -> String {
+    resolve_url(|m| &m.api_addr, "/api/v1/status", STATUS_URL)
+}
+fn metrics_url() -> String {
+    resolve_url(|m| &m.metrics_addr, "/metrics", METRICS_URL)
+}
+fn healthz_url() -> String {
+    resolve_url(|m| &m.metrics_addr, "/healthz", HEALTHZ_URL)
+}
+fn readyz_url() -> String {
+    resolve_url(|m| &m.metrics_addr, "/readyz", READYZ_URL)
+}
+fn gateway_chat_url() -> String {
+    resolve_url(|m| &m.gateway_addr, "/v1/chat/completions", GATEWAY_CHAT_URL)
+}
+fn conflicts_url() -> String {
+    resolve_url(|m| &m.api_addr, CONFLICTS_PATH, &format!("http://127.0.0.1:7777{CONFLICTS_PATH}"))
+}
+fn resolve_conflict_url() -> String {
+    resolve_url(|m| &m.api_addr, RESOLVE_PATH, &format!("http://127.0.0.1:7777{RESOLVE_PATH}"))
+}
+fn devices_url() -> String {
+    resolve_url(|m| &m.api_addr, DEVICES_PATH, &format!("http://127.0.0.1:7777{DEVICES_PATH}"))
+}
+fn workloads_url() -> String {
+    resolve_url(|m| &m.api_addr, WORKLOADS_PATH, &format!("http://127.0.0.1:7777{WORKLOADS_PATH}"))
+}
+fn revoke_url() -> String {
+    resolve_url(|m| &m.api_addr, REVOKE_PATH, &format!("http://127.0.0.1:7777{REVOKE_PATH}"))
+}
+fn grant_device_url() -> String {
+    resolve_url(|m| &m.api_addr, GRANT_DEVICE_PATH, &format!("http://127.0.0.1:7777{GRANT_DEVICE_PATH}"))
+}
 
 /// Sentinel prefix a command returns when it hit a daemon route that isn't
 /// served yet (HTTP 404) or a feature that has no live endpoint. The webview
@@ -122,7 +242,7 @@ fn auth_get(url: &str, context: &str) -> Result<String, String> {
 /// power/lid, operator balance). Real endpoint, token-gated.
 #[tauri::command]
 fn daemon_status() -> Result<String, String> {
-    auth_get(STATUS_URL, "status API")
+    auth_get(&status_url(), "status API")
 }
 
 /// Liveness + readiness probes (unauthenticated). Returns a small JSON object
@@ -131,8 +251,8 @@ fn daemon_status() -> Result<String, String> {
 #[tauri::command]
 fn daemon_health() -> Result<String, String> {
     let a = agent();
-    let healthz = a.get(HEALTHZ_URL).call().is_ok();
-    let (readyz, reason) = match a.get(READYZ_URL).call() {
+    let healthz = a.get(&healthz_url()).call().is_ok();
+    let (readyz, reason) = match a.get(&readyz_url()).call() {
         Ok(_) => (true, String::new()),
         Err(ureq::Error::Status(503, resp)) => (
             false,
@@ -159,7 +279,7 @@ fn daemon_health() -> Result<String, String> {
 /// to parse Prometheus itself. Real endpoint, token-gated.
 #[tauri::command]
 fn daemon_metrics() -> Result<String, String> {
-    let text = auth_get(METRICS_URL, "metrics")?;
+    let text = auth_get(&metrics_url(), "metrics")?;
     let parsed = parse_prometheus(&text);
     serde_json::to_string(&parsed).map_err(|e| e.to_string())
 }
@@ -212,7 +332,7 @@ fn run_workload(model: String, prompt: String) -> Result<String, String> {
         "messages": [{ "role": "user", "content": prompt }],
     });
     let resp = agent()
-        .post(GATEWAY_CHAT_URL)
+        .post(&gateway_chat_url())
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
         .send_json(body)
@@ -251,21 +371,21 @@ fn operator_token_file() -> Result<String, String> {
 /// returns PENDING_DAEMON when the route 404s — surfaced calmly in the UI.
 #[tauri::command]
 fn belief_conflicts() -> Result<String, String> {
-    auth_get(CONFLICTS_URL, "belief-conflicts")
+    auth_get(&conflicts_url(), "belief-conflicts")
 }
 
 /// Running / recent workloads. Same posture: the scheduler tracks these, but no
 /// HTTP route lists them yet -> PENDING_DAEMON until the daemon exposes it.
 #[tauri::command]
 fn workloads() -> Result<String, String> {
-    auth_get(WORKLOADS_URL, "workloads")
+    auth_get(&workloads_url(), "workloads")
 }
 
 /// Device (9P) namespace listing. Served by `daemon/ninep` over the 9P wire, not
 /// yet mirrored to the status API -> PENDING_DAEMON until exposed.
 #[tauri::command]
 fn devices() -> Result<String, String> {
-    auth_get(DEVICES_URL, "devices")
+    auth_get(&devices_url(), "devices")
 }
 
 /// Resolve a belief-conflict by choosing the winning value. POSTs to the
@@ -275,7 +395,7 @@ fn resolve_conflict(subject: String, winning: String) -> Result<String, String> 
     let token = operator_token()?;
     let body = serde_json::json!({ "subject": subject, "winning": winning });
     let resp = agent()
-        .post(RESOLVE_URL)
+        .post(&resolve_conflict_url())
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
         .send_json(body)
@@ -295,7 +415,7 @@ fn revoke_capability(cap_id: String) -> Result<String, String> {
     let token = operator_token()?;
     let body = serde_json::json!({ "id": cap_id });
     let resp = agent()
-        .post(REVOKE_URL)
+        .post(&revoke_url())
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
         .send_json(body)
@@ -313,7 +433,7 @@ fn grant_device(path: String, rights: String) -> Result<String, String> {
     let token = operator_token()?;
     let body = serde_json::json!({ "path": path, "rights": rights });
     let resp = agent()
-        .post(GRANT_DEVICE_URL)
+        .post(&grant_device_url())
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
         .send_json(body)

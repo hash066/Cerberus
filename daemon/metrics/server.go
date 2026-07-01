@@ -12,6 +12,7 @@ package metrics
 //             true (e.g. mesh up, stores opened); 503 + reason otherwise.
 
 import (
+	"net"
 	"net/http"
 	"strings"
 
@@ -52,7 +53,20 @@ func (s *Server) Handler() http.Handler {
 
 // Start serves on addr (blocking). Callers bind 127.0.0.1 to keep it local.
 func (s *Server) Start(addr string) error {
-	return http.ListenAndServe(addr, s.Handler())
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return s.Serve(ln)
+}
+
+// Serve is like Start but serves on an already-bound net.Listener instead of
+// calling http.ListenAndServe internally, so a caller can bind the listener
+// itself first (net.Listen), react to a bind failure (e.g. fall back to an
+// ephemeral port on conflict), and log the real bound address. Start is a
+// thin wrapper over this for backward compatibility.
+func (s *Server) Serve(ln net.Listener) error {
+	return http.Serve(ln, s.Handler())
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {

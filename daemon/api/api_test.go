@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -58,5 +59,32 @@ func TestStatusWithValidToken(t *testing.T) {
 	}
 	if got.Version != "0.1.0" || got.OperatorBalance != 1000 || !got.MeshUp {
 		t.Fatalf("unexpected snapshot: %+v", got)
+	}
+}
+
+// TestServeOverListener covers the Serve(net.Listener) variant cerberusd's
+// main() now uses: it binds the listener itself (so it can react to a
+// conflict/fall back to an ephemeral port), then hands it to Serve instead of
+// letting Start's internal ListenAndServe swallow the bind step. This checks
+// Serve actually answers HTTP requests on a listener bound out-of-band.
+func TestServeOverListener(t *testing.T) {
+	iss, _ := auth.NewIssuer()
+	srv := api.New(iss, snap)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ln) }()
+	defer ln.Close()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz over bound listener: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz over Serve(ln) should be 200, got %d", resp.StatusCode)
 	}
 }
