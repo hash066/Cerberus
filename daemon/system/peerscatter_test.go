@@ -3,6 +3,8 @@ package system
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"io"
 	"testing"
 	"time"
@@ -202,7 +204,11 @@ func writeFileToSystem(t *testing.T, sys *System, path string, cap contract.CapH
 func readFileFromSystem(t *testing.T, sys *System, path string, cap contract.CapHandle, quota uint64) []byte {
 	t.Helper()
 
-	recvSrv := dataplane.NewServer(sys.Kernel, time.Now().Unix())
+	_, recvPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate receiver identity: %v", err)
+	}
+	recvSrv := dataplane.NewServer(sys.Kernel, time.Now().Unix(), recvPriv)
 	if err := recvSrv.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("recv listen: %v", err)
 	}

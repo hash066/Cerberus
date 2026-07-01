@@ -31,7 +31,7 @@ func TestComposeRevocationTakesEffectEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sys, err := Compose(ctx, kernel, "revoke-test")
+	sys, err := Compose(ctx, kernel, "revoke-test", nil)
 	if err != nil {
 		t.Fatalf("Compose: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestComposeSharesOneKernelAcrossFabricAndNamespace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sys, err := Compose(ctx, kernel, "shared-kernel-test")
+	sys, err := Compose(ctx, kernel, "shared-kernel-test", nil)
 	if err != nil {
 		t.Fatalf("Compose: %v", err)
 	}
@@ -233,7 +233,7 @@ func composeWithoutPanic(t *testing.T, ctx context.Context, k contract.CapKernel
 			t.Fatalf("Compose panicked instead of returning an error: %v", r)
 		}
 	}()
-	return Compose(ctx, k, site)
+	return Compose(ctx, k, site, nil)
 }
 
 // stopSystem cancels the System's context and lets its supervised services
@@ -266,13 +266,13 @@ func TestComposeSecondNodeSameSiteIndependentKernels(t *testing.T) {
 	kA := stub.NewCapKernel()
 	kB := stub.NewCapKernel()
 
-	sysA, err := Compose(ctx, kA, "dup-site")
+	sysA, err := Compose(ctx, kA, "dup-site", nil)
 	if err != nil {
 		t.Fatalf("Compose A: %v", err)
 	}
 	defer stopSystem(t, sysA, cancel)
 
-	sysB, err := Compose(ctx, kB, "dup-site")
+	sysB, err := Compose(ctx, kB, "dup-site", nil)
 	if err != nil {
 		t.Fatalf("Compose B: %v", err)
 	}
