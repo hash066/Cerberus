@@ -55,7 +55,13 @@ func (c *Client) Send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) e
 	}
 	defer st.CancelRead(0)
 
-	if err := writeHeader(st, header{TransferID: ep.TransferID, Cap: ep.Cap, Length: n}); err != nil {
+	if err := writeHeader(st, header{
+		TransferID: ep.TransferID,
+		Cap:        ep.Cap,
+		Length:     n,
+		SignedCap:  ep.SignedCap, // cross-kernel authority; verified before bytes flow
+		Issuer:     ep.Issuer,
+	}); err != nil {
 		return err
 	}
 
