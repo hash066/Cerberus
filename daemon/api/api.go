@@ -185,6 +185,13 @@ func (g Getters) Snapshot() Snapshot {
 type Server struct {
 	authz    auth.Authorizer
 	snapshot func() Snapshot
+
+	// actions and lists back the v3 dashboard action/listing routes (belief
+	// conflicts, devices, workloads, cap revoke, device grant) — see
+	// routes.go. Both are zero-value-safe: an unset closure inside either
+	// makes its route return an empty list / 501, never panic.
+	actions Actions
+	lists   ListGetters
 }
 
 // New builds the API server. snapshot is called per request to produce live
@@ -212,6 +219,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/status", s.requireRead(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, s.snapshot())
 	}))
+	s.registerActionRoutes(mux)
 	return mux
 }
 
@@ -246,18 +254,7 @@ func (s *Server) Serve(ln net.Listener) error {
 
 // requireRead wraps a handler with capability auth (Bearer token granting "read").
 func (s *Server) requireRead(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tok := auth.BearerToken(r.Header.Get("Authorization"))
-		if tok == "" {
-			http.Error(w, "missing bearer token", http.StatusUnauthorized)
-			return
-		}
-		if _, err := s.authz.Authorize(tok, "read", ""); err != nil {
-			http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
-			return
-		}
-		next(w, r)
-	}
+	return s.requireRight("read", next)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

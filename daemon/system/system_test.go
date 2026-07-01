@@ -12,6 +12,8 @@ package system
 import (
 	"context"
 	"errors"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -78,6 +80,72 @@ func TestComposeRevocationTakesEffectEndToEnd(t *testing.T) {
 	if err := sys.Namespace.Walk("/cer/dev/vram/local/0", capH2); err != nil {
 		t.Fatalf("walk with a fresh cap denied after an unrelated cap was revoked: %v", err)
 	}
+}
+
+// TestComposeRegistersRealAudioDevices proves Compose mounts every real OS
+// audio endpoint (daemon/audio.EnumerateEndpoints) into the 9P namespace,
+// alongside the existing static VRAM device, and reports them on
+// sys.AudioDevices so the composition layer (cmd/cerberusd/main.go) can mirror
+// them into the same devices catalogue the new /api/v1/devices HTTP route
+// lists.
+//
+// On Windows (this backend is real, via WASAPI) this asserts each registered
+// path is genuinely walkable/capability-gated through the composed namespace,
+// mirroring TestComposeRevocationTakesEffectEndToEnd's style for VRAM. On any
+// other platform daemon/audio has no backend yet (an honest empty list, see
+// os_other.go), so this just asserts Compose does not fail and reports zero
+// audio devices — never fabricated ones.
+func TestComposeRegistersRealAudioDevices(t *testing.T) {
+	kernel := stub.NewCapKernel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sys, err := Compose(ctx, kernel, "audio-devices-test", nil)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	defer stopSystem(t, sys, cancel)
+
+	if runtime.GOOS != "windows" {
+		if len(sys.AudioDevices) != 0 {
+			t.Fatalf("expected zero audio devices registered on GOOS=%s (no backend yet), got %d: %+v",
+				runtime.GOOS, len(sys.AudioDevices), sys.AudioDevices)
+		}
+		t.Skipf("no audio backend on GOOS=%s; verified Compose registers zero devices honestly", runtime.GOOS)
+	}
+
+	if len(sys.AudioDevices) == 0 {
+		t.Fatalf("expected at least one real audio device registered on Windows (this machine has at least a WASAPI render endpoint), got 0")
+	}
+
+	sawMic, sawSpeaker := false, false
+	for _, d := range sys.AudioDevices {
+		if d.Kind != contract.KindAudio {
+			t.Errorf("device %+v has kind %q, want %q", d, d.Kind, contract.KindAudio)
+		}
+		if !strings.HasPrefix(d.Path, "/cer/dev/audio/") {
+			t.Errorf("device %+v path does not live under /cer/dev/audio/", d)
+		}
+		switch {
+		case strings.Contains(d.Path, "/mic/"):
+			sawMic = true
+		case strings.Contains(d.Path, "/speaker/"):
+			sawSpeaker = true
+		}
+
+		// Confirm it is genuinely mounted in the composed namespace (not just
+		// reported in the slice): mint a capability against the exact path and
+		// walk it, exactly as the VRAM revocation test does.
+		ref := contract.ResourceRef{Kind: contract.KindAudio, Path: d.Path}
+		capH, merr := sys.Kernel.Mint(ref, []contract.Right{contract.RightRead}, nil)
+		if merr != nil {
+			t.Fatalf("mint cap for %s: %v", d.Path, merr)
+		}
+		if werr := sys.Namespace.Walk(d.Path, capH); werr != nil {
+			t.Errorf("walk registered audio device %s through composed namespace: %v", d.Path, werr)
+		}
+	}
+	t.Logf("Compose registered %d real audio device(s) into the namespace: mic=%v speaker=%v", len(sys.AudioDevices), sawMic, sawSpeaker)
 }
 
 // TestComposeSharesOneKernelAcrossFabricAndNamespace proves Compose wires the

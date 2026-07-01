@@ -12,6 +12,7 @@ import (
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
+	"github.com/hash066/cerberus/daemon/audio"
 	"github.com/hash066/cerberus/daemon/dataplane"
 	"github.com/hash066/cerberus/daemon/dfs"
 	"github.com/hash066/cerberus/daemon/mesh"
@@ -41,6 +42,16 @@ type System struct {
 	tree          *supervisor.Tree
 	traceShutdown func(context.Context) error
 
+	// AudioDevices is every audio endpoint Compose discovered and registered
+	// into the namespace (see registerAudioDevices below). Populated
+	// best-effort: on a platform/machine with no real backend or no endpoints
+	// at all, this is simply empty — Compose never fails or fakes a device
+	// for this. Exposed so the composition layer (cmd/cerberusd/main.go) can
+	// mirror these into the same devices catalogue it already builds for VRAM
+	// (the ninep.Server's own device table is private), which is in turn what
+	// the new /api/v1/devices HTTP route lists.
+	AudioDevices []DeviceRef
+
 	// fsStore and localShards are kept for white-box tests (same package) that
 	// need to inspect the /cer/fs Manifest a write produced or a node's own local
 	// shard store directly — e.g. to prove a shard genuinely left this node for a
@@ -48,6 +59,43 @@ type System struct {
 	// pass under an all-local placement bug). Not part of the public API.
 	fsStore     *dfsFSStore
 	localShards *dfs.MemShardStore
+}
+
+// DeviceRef is a namespace device Compose registered, for callers (the
+// composition layer, tests) that need to know what got mounted without
+// reaching into the ninep.Server's private device table.
+type DeviceRef struct {
+	Path string
+	Kind contract.ResourceKind
+}
+
+// registerAudioDevices enumerates every real OS audio endpoint (Windows via
+// WASAPI; an honest empty list on other platforms — see daemon/audio's
+// EnumerateEndpoints doc) and mounts each one into the 9P namespace at
+// /cer/dev/audio/<mic|speaker>/<index>, alongside the existing VRAM device.
+// It never fails Compose: an enumeration error (or zero endpoints) just means
+// zero audio devices are registered, exactly like a machine with no
+// microphone plugged in — maturity honesty, not a hard dependency.
+func registerAudioDevices(ns *ninep.Server) []DeviceRef {
+	endpoints, err := audio.EnumerateEndpoints()
+	if err != nil {
+		// Not fatal: no devices registered, same as an empty list.
+		return nil
+	}
+	counts := map[audio.EndpointKind]int{}
+	var refs []DeviceRef
+	for _, ep := range endpoints {
+		kindDir := "speaker"
+		if ep.Kind == audio.EndpointMic {
+			kindDir = "mic"
+		}
+		idx := counts[ep.Kind]
+		counts[ep.Kind] = idx + 1
+		path := fmt.Sprintf("/cer/dev/audio/%s/%d", kindDir, idx)
+		ns.Register(path, contract.ResourceRef{Kind: contract.KindAudio, Path: path})
+		refs = append(refs, DeviceRef{Path: path, Kind: contract.KindAudio})
+	}
+	return refs
 }
 
 // Compose wires every subsystem together against the frozen contract. The
@@ -146,6 +194,14 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	q := contract.Quota{Bytes: 2 * 1024 * 1024 * 1024}
 	ns.Register("/cer/dev/vram/local/0",
 		contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/local/0", Quota: &q})
+
+	// Real audio devices (Windows: every active WASAPI mic/speaker endpoint;
+	// other platforms: none yet — see daemon/audio.EnumerateEndpoints). Each
+	// discovered endpoint is mounted at /cer/dev/audio/<mic|speaker>/<index>
+	// next to the VRAM device above, so it is capability-gated exactly the
+	// same way and shows up automatically in anything that lists the
+	// namespace (the CLI's `cerberus devices`, and the tray's /api/v1/devices).
+	audioDevices := registerAudioDevices(ns)
 
 	// /cer/fs — the distributed filesystem, backed by the dfs engine (Phase G2). A
 	// write streams the file bytes over the data plane into dfs.Put and durably
@@ -263,6 +319,7 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 		DataPlane:     dp,
 		NinePAddr:     nineLn.Addr().String(),
 		DataPlaneAddr: dp.Addr(),
+		AudioDevices:  audioDevices,
 		tree:          tree,
 		traceShutdown: traceShutdown,
 		fsStore:       fsStore,

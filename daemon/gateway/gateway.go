@@ -58,6 +58,23 @@ type Model struct {
 	Created int64
 }
 
+// DispatchEvent describes one completed (or failed) gateway dispatch, for the
+// optional OnDispatch hook below. It carries just enough for a workload
+// history view (the tray's /api/v1/workloads) without the gateway needing to
+// know anything about how that history is stored.
+type DispatchEvent struct {
+	TaskID string // hex/opaque task identifier, as recorded in the ComputeTask
+	Model  string // the OpenAI-facing model name the client requested
+	OK     bool
+	Error  string
+}
+
+// OnDispatchFunc is called once per gateway dispatch attempt (success or
+// failure). It must not block meaningfully — the gateway calls it inline,
+// synchronously, after resolving (or failing to resolve) the task, before
+// writing the HTTP response.
+type OnDispatchFunc func(DispatchEvent)
+
 // Gateway is the OpenAI-compatible HTTP front door. Every request must present a
 // capability token (Authorization: Bearer <token>) granting "exec" — there is no
 // unauthenticated access, so multiple users/agents can share a daemon safely.
@@ -65,11 +82,12 @@ type Gateway struct {
 	executor contract.Executor
 	authz    auth.Authorizer
 
-	mu      sync.RWMutex
-	models  map[string]Model // keyed by Model.ID
-	settler Settler          // optional; no-op when unset
-	pricing PricingPolicy    // optional; nil = nothing is priced
-	started int64
+	mu         sync.RWMutex
+	models     map[string]Model // keyed by Model.ID
+	settler    Settler          // optional; no-op when unset
+	pricing    PricingPolicy    // optional; nil = nothing is priced
+	onDispatch OnDispatchFunc   // optional; nil = no workload-history hook
+	started    int64
 }
 
 // NewGateway builds a gateway over the given executor and authorizer. It starts
@@ -102,6 +120,18 @@ func (g *Gateway) RegisterModel(m Model) {
 	}
 	g.mu.Lock()
 	g.models[m.ID] = m
+	g.mu.Unlock()
+}
+
+// SetOnDispatch wires an optional workload-history hook, called once per
+// dispatch attempt (success or failure) after the executor has resolved (or
+// failed to resolve) the task. Passing nil disables the hook. This is the
+// seam the composition (cmd/cerberusd/main.go) uses to append to the
+// workload-history log the new /api/v1/workloads route reads — the gateway
+// itself has no notion of "history", it just reports what happened.
+func (g *Gateway) SetOnDispatch(fn OnDispatchFunc) {
+	g.mu.Lock()
+	g.onDispatch = fn
 	g.mu.Unlock()
 }
 
@@ -176,17 +206,35 @@ func (g *Gateway) dispatch(ctx context.Context, subject, model string) (contract
 	}
 	promise, err := g.executor.Dispatch(ctx, task)
 	if err != nil {
+		g.reportDispatch(task, model, false, err.Error())
 		return contract.ComputeResult{}, err
 	}
 	res, err := g.executor.Resolve(ctx, promise)
 	if err != nil {
+		g.reportDispatch(task, model, false, err.Error())
 		return contract.ComputeResult{}, err
 	}
 	// Record settlement for a completed, priced task (no-op unless a real
 	// settler was wired). Never fails the request: settlement is a side effect
 	// of a successful compute, not part of the response contract.
 	g.recordSettlement(ctx, task, subject, res)
+	g.reportDispatch(task, model, res.OK, res.Error)
 	return res, nil
+}
+
+// reportDispatch invokes the optional OnDispatch hook (if one is wired), never
+// blocking the request on it. A panic-free, error-free side channel: the hook
+// itself may do anything (append to a ring buffer, etc.) but a slow/faulty
+// hook is the composition's problem to fix, not something dispatch guards
+// against here (mirrors recordSettlement's "never fails the request" posture).
+func (g *Gateway) reportDispatch(task contract.ComputeTask, model string, ok bool, errMsg string) {
+	g.mu.RLock()
+	hook := g.onDispatch
+	g.mu.RUnlock()
+	if hook == nil {
+		return
+	}
+	hook(DispatchEvent{TaskID: string(task.TaskID), Model: model, OK: ok, Error: errMsg})
 }
 
 // Handler returns the gateway's HTTP mux (the OpenAI-compatible routes).

@@ -86,6 +86,45 @@ func TestWASAPIEnumerationSucceeds(t *testing.T) {
 	t.Logf("WASAPI capture endpoints found: %d", captureCount)
 }
 
+// TestEnumerateEndpointsSucceeds proves the public EnumerateEndpoints
+// function — the one daemon/system.Compose calls to register real devices
+// into the 9P namespace — actually talks to WASAPI successfully on this
+// machine. Mirroring TestWASAPIEnumerationSucceeds above: a render (speaker)
+// endpoint is expected on essentially any Windows machine (even headless), so
+// this asserts the call does not error and that at least one entry comes
+// back, without hardcoding an exact count (this sandboxed environment's exact
+// device set is not something this test should assume).
+func TestEnumerateEndpointsSucceeds(t *testing.T) {
+	endpoints, err := EnumerateEndpoints()
+	if err != nil {
+		if errors.Is(err, ErrNoAudioDevice) {
+			t.Skipf("no WASAPI endpoints (mic or speaker) on this machine: %v", err)
+		}
+		t.Fatalf("EnumerateEndpoints: %v", err)
+	}
+	if len(endpoints) == 0 {
+		t.Fatalf("EnumerateEndpoints returned no error but zero endpoints")
+	}
+	mics, speakers := 0, 0
+	for _, e := range endpoints {
+		if e.Name == "" {
+			t.Errorf("endpoint %+v has an empty Name", e)
+		}
+		switch e.Kind {
+		case EndpointMic:
+			mics++
+		case EndpointSpeaker:
+			speakers++
+		default:
+			t.Errorf("endpoint %+v has unexpected Kind %q", e, e.Kind)
+		}
+	}
+	t.Logf("EnumerateEndpoints: %d mic(s), %d speaker(s)", mics, speakers)
+	if speakers == 0 {
+		t.Errorf("expected at least one render (speaker) endpoint (even headless Windows normally has one); got 0")
+	}
+}
+
 // hasCaptureDevice reports whether at least one active WASAPI capture
 // endpoint exists, so tests that need a real microphone can skip gracefully
 // rather than failing on a sandboxed/headless box with no input device.

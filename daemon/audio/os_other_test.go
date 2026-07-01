@@ -20,3 +20,16 @@ func TestOSBackendsAreStubs(t *testing.T) {
 		t.Fatalf("OS playback should report unavailable, got %v", err)
 	}
 }
+
+// EnumerateEndpoints is a listing query, not a stream open, so on a platform
+// with no backend wired in yet it must return an honest empty list (not an
+// error) — see os_other.go's doc comment.
+func TestEnumerateEndpointsIsEmptyStub(t *testing.T) {
+	endpoints, err := EnumerateEndpoints()
+	if err != nil {
+		t.Fatalf("EnumerateEndpoints should not error on a platform with no backend, got %v", err)
+	}
+	if len(endpoints) != 0 {
+		t.Fatalf("expected an empty list on a platform with no backend, got %d entries", len(endpoints))
+	}
+}

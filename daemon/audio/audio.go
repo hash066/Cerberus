@@ -43,6 +43,30 @@ const SamplesPerFrame = 480
 // rather than an error.
 var ErrSourceDrained = errors.New("audio: source drained")
 
+// EndpointKind distinguishes a capture (microphone) endpoint from a render
+// (speaker) endpoint in an EnumerateEndpoints listing.
+type EndpointKind string
+
+const (
+	EndpointMic     EndpointKind = "mic"
+	EndpointSpeaker EndpointKind = "speaker"
+)
+
+// EndpointInfo describes one OS audio endpoint discovered by
+// EnumerateEndpoints: a friendly name plus whether it is a capture or render
+// device. This is a leaf, platform-independent type (see os_windows.go /
+// os_other.go for the platform-specific enumeration that produces it) so the
+// composition layer (daemon/system) can register these into the 9P namespace
+// without importing anything Windows-specific itself.
+type EndpointInfo struct {
+	// Name is the endpoint's friendly device name (e.g. "Microphone (Realtek
+	// Audio)"), when the platform can resolve one; otherwise a stable
+	// synthetic identifier.
+	Name string
+	// Kind is EndpointMic or EndpointSpeaker.
+	Kind EndpointKind
+}
+
 // Format describes the PCM layout of a stream. It is carried in every packet
 // header so the Receiver can reconstruct timing (samples -> wall-clock) and lay
 // out interleaved channels correctly, exactly like an AES67/SDP descriptor.

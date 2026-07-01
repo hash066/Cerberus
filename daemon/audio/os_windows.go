@@ -169,6 +169,111 @@ func defaultEndpoint(eDataFlow uint32) (*wca.IMMDeviceEnumerator, *wca.IMMDevice
 	return mmde, device, nil
 }
 
+// EnumerateEndpoints lists every ACTIVE WASAPI capture (microphone) and render
+// (speaker) endpoint on this machine — not just the system default one
+// defaultEndpoint resolves. This backs the 9P namespace registration in
+// daemon/system.Compose (each discovered endpoint becomes a
+// /cer/dev/audio/<mic|speaker>/<index> device) and the tray's device list.
+//
+// Each endpoint's friendly name is read from its property store
+// (PKEY_Device_FriendlyName); a device whose name cannot be resolved for any
+// reason still appears in the list with a synthetic name derived from its
+// WASAPI endpoint id, rather than being silently dropped — the daemon should
+// see every real device that exists, even ones Windows cannot fully describe.
+//
+// This performs its own CoInitializeEx and runs entirely on the calling
+// goroutine: unlike the long-lived capture/playback streams, an enumeration
+// call is a short, one-shot COM sequence, so it does not need the dedicated
+// locked-OS-thread pattern the streaming Source/Sink implementations use.
+// Callers running this from a goroutine that may later also open a
+// long-lived stream should still be mindful of COM's thread-affinity rules,
+// but calling it standalone (as daemon/system.Compose and this package's own
+// tests do) is safe.
+//
+// Returns ErrNoAudioDevice only if BOTH capture and render report zero active
+// endpoints (a genuinely audio-less machine); a machine with, say, speakers
+// but no microphone returns just the speaker entries and a nil error.
+func EnumerateEndpoints() ([]EndpointInfo, error) {
+	if err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil {
+		return nil, fmt.Errorf("audio: WASAPI CoInitializeEx: %w", err)
+	}
+	defer ole.CoUninitialize()
+
+	var mmde *wca.IMMDeviceEnumerator
+	if err := wca.CoCreateInstance(wca.CLSID_MMDeviceEnumerator, 0, wca.CLSCTX_ALL, wca.IID_IMMDeviceEnumerator, &mmde); err != nil {
+		return nil, fmt.Errorf("audio: WASAPI CoCreateInstance(MMDeviceEnumerator): %w", err)
+	}
+	defer mmde.Release()
+
+	mics, err := enumerateKind(mmde, wca.ECapture, EndpointMic)
+	if err != nil {
+		return nil, err
+	}
+	speakers, err := enumerateKind(mmde, wca.ERender, EndpointSpeaker)
+	if err != nil {
+		return nil, err
+	}
+	if len(mics) == 0 && len(speakers) == 0 {
+		return nil, ErrNoAudioDevice
+	}
+	out := make([]EndpointInfo, 0, len(mics)+len(speakers))
+	out = append(out, mics...)
+	out = append(out, speakers...)
+	return out, nil
+}
+
+// enumerateKind lists every active endpoint of one eDataFlow (wca.ECapture or
+// wca.ERender), tagging each with kind.
+func enumerateKind(mmde *wca.IMMDeviceEnumerator, eDataFlow uint32, kind EndpointKind) ([]EndpointInfo, error) {
+	var coll *wca.IMMDeviceCollection
+	if err := mmde.EnumAudioEndpoints(eDataFlow, wca.DEVICE_STATE_ACTIVE, &coll); err != nil {
+		return nil, fmt.Errorf("audio: WASAPI EnumAudioEndpoints(%s): %w", kind, err)
+	}
+	defer coll.Release()
+
+	var count uint32
+	if err := coll.GetCount(&count); err != nil {
+		return nil, fmt.Errorf("audio: WASAPI EnumAudioEndpoints(%s).GetCount: %w", kind, err)
+	}
+
+	out := make([]EndpointInfo, 0, count)
+	for i := uint32(0); i < count; i++ {
+		var dev *wca.IMMDevice
+		if err := coll.Item(i, &dev); err != nil {
+			// Skip a single unreadable slot rather than failing the whole
+			// enumeration — the rest of the collection is still good data.
+			continue
+		}
+		out = append(out, EndpointInfo{Name: endpointFriendlyName(dev, kind, i), Kind: kind})
+		dev.Release()
+	}
+	return out, nil
+}
+
+// endpointFriendlyName reads PKEY_Device_FriendlyName from dev's property
+// store. On any failure to open the store or read the key, it falls back to a
+// stable synthetic name (kind + index) rather than dropping the device — a
+// real endpoint the daemon cannot fully describe should still be visible and
+// usable, per CLAUDE.md "maturity honesty" (a missing label is not the same
+// as a fake device).
+func endpointFriendlyName(dev *wca.IMMDevice, kind EndpointKind, index uint32) string {
+	var ps *wca.IPropertyStore
+	if err := dev.OpenPropertyStore(wca.STGM_READ, &ps); err != nil {
+		return fmt.Sprintf("%s %d", kind, index)
+	}
+	defer ps.Release()
+
+	var pv wca.PROPVARIANT
+	if err := ps.GetValue(&wca.PKEY_Device_FriendlyName, &pv); err != nil {
+		return fmt.Sprintf("%s %d", kind, index)
+	}
+	name := pv.String()
+	if name == "" {
+		return fmt.Sprintf("%s %d", kind, index)
+	}
+	return name
+}
+
 // openNegotiatedClient activates an IAudioClient on device and initializes it
 // in shared mode as 16-bit PCM at f's sample rate but the endpoint's native
 // channel count (queried via GetMixFormat) — see the file doc comment for why

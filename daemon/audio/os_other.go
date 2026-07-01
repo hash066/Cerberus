@@ -24,3 +24,16 @@ func NewOSCaptureSource(_ Format) (Source, error) {
 func NewOSPlaybackSink(_ Format) (Sink, error) {
 	return nil, ErrOSAudioUnavailable
 }
+
+// EnumerateEndpoints is the entry point for real OS audio-device enumeration.
+// A real backend exists for Windows (see os_windows.go, WASAPI
+// IMMDeviceEnumerator). No backend is wired in yet on macOS/Linux, so this
+// returns an empty, clearly-labeled list and a nil error rather than
+// fabricating devices — per CLAUDE.md "maturity honesty", an empty list is
+// the honest answer here (unlike NewOSCaptureSource/NewOSPlaybackSink, which
+// fail loudly because a caller asked for a specific stream; enumeration is a
+// listing query, and "no devices known on this platform" is a valid, if
+// disappointing, list rather than an error).
+func EnumerateEndpoints() ([]EndpointInfo, error) {
+	return nil, nil
+}

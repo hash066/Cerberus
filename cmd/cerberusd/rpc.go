@@ -24,6 +24,7 @@ import (
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
+	"github.com/hash066/cerberus/daemon/api"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/economy"
 	"github.com/hash066/cerberus/daemon/ledger"
@@ -103,6 +104,7 @@ type DaemonRPC struct {
 
 	devices []deviceInfo
 	caps    *capRegistry
+	wlog    *workloadLog // recent workload dispatch history for `cerberus workloads` / /api/v1/workloads; nil-safe
 
 	profile string
 	kernel  string
@@ -228,6 +230,7 @@ func (d *DaemonRPC) Run(req *RunRequest, resp *RunResponse) error {
 		}
 		fillRunResult(resp, result)
 		d.countExec()
+		d.recordWorkload(resp, req.On)
 		return nil
 	}
 
@@ -248,7 +251,28 @@ func (d *DaemonRPC) Run(req *RunRequest, resp *RunResponse) error {
 	resp.Where = "local"
 	fillRunResult(resp, result)
 	d.countExec()
+	d.recordWorkload(resp, "local")
 	return nil
+}
+
+// recordWorkload appends a completed dispatch (from the CLI's `cerberus run`
+// path) to the workload-history log, if one is wired. node is "local" or the
+// hex peer id the task ran on. A nil-wired log (e.g. a standalone test that
+// never sets wlog) is a silent no-op, not a panic.
+func (d *DaemonRPC) recordWorkload(resp *RunResponse, node string) {
+	if d.wlog == nil {
+		return
+	}
+	state := "done"
+	if !resp.OK {
+		state = "error"
+	}
+	d.wlog.record(api.WorkloadEntry{
+		ID:    resp.TaskID,
+		Model: resp.CID,
+		Node:  node,
+		State: state,
+	})
 }
 
 func fillRunResult(resp *RunResponse, r contract.ComputeResult) {
