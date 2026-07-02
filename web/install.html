@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Install Cerberus — Windows, macOS, Linux</title>
+  <meta name="description" content="Install the Cerberus beta on Windows, macOS, or Linux, or build from source with Go, Cargo, and Tauri. Installers are unsigned during the beta.">
+  <link rel="icon" href="assets/wolf.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+
+  <header class="site-header">
+    <nav class="nav" aria-label="Primary">
+      <a class="brand" href="index.html">
+        <img src="assets/wolf.svg" alt="">
+        <span>Cerberus</span>
+        <span class="beta-tag">Beta</span>
+      </a>
+      <div class="nav-links">
+        <a href="index.html">Home</a>
+        <a href="install.html" class="active">Install</a>
+        <a href="docs.html">Docs</a>
+        <a class="gh" href="https://github.com/hash066/Cerberus" rel="noopener">GitHub</a>
+        <a class="btn primary small cta" href="#downloads">Download</a>
+        <button class="theme-toggle" type="button" aria-label="Toggle theme">☼</button>
+      </div>
+    </nav>
+  </header>
+
+  <div class="beta-banner" role="note">
+    <div class="inner">
+      <span class="badge">Beta</span>
+      <span><b>Beta installers are unsigned.</b> Windows SmartScreen and macOS Gatekeeper will warn you that the publisher is unknown. Steps to proceed are in each tab below. Run only on machines and networks you trust.</span>
+    </div>
+  </div>
+
+  <main id="main" class="wrap narrow" style="padding-top:32px;padding-bottom:56px">
+    <p class="kicker">Install</p>
+    <h1 style="font-size:32px;margin:0 0 12px">Install Cerberus</h1>
+    <p style="color:var(--text-2);font-size:16px;margin:0 0 8px">
+      Cerberus ships as a desktop app: a background daemon (<code class="inline">cerberusd</code>) and a
+      system-tray dashboard. Install it on every machine you want in the mesh. Pick your OS below,
+      or <a href="#source">build from source</a> — the same code builds on all three.
+    </p>
+
+    <div class="callout warn" id="downloads">
+      <span class="mark" aria-hidden="true">!</span>
+      <span>
+        Signed release binaries don't exist yet. Beta downloads live on the project's
+        <a href="https://github.com/hash066/Cerberus/releases" rel="noopener">GitHub Releases</a> page.
+        If your platform's build isn't posted, use <a href="#source">build from source</a>.
+      </span>
+    </div>
+
+    <!-- OS TABS -->
+    <div data-tabs>
+      <div class="tabs" role="tablist" aria-label="Choose your operating system">
+        <button class="tab" role="tab" id="tab-win" data-os="windows" aria-controls="panel-win" aria-selected="true">Windows</button>
+        <button class="tab" role="tab" id="tab-mac" data-os="macos" aria-controls="panel-mac" aria-selected="false" tabindex="-1">macOS</button>
+        <button class="tab" role="tab" id="tab-linux" data-os="linux" aria-controls="panel-linux" aria-selected="false" tabindex="-1">Linux</button>
+      </div>
+
+      <!-- WINDOWS -->
+      <section class="tabpanel" id="panel-win" role="tabpanel" aria-labelledby="tab-win" tabindex="0">
+        <h2 id="windows" style="font-size:20px;margin:0 0 8px;scroll-margin-top:74px">Windows 10 / 11</h2>
+        <ol style="color:var(--text-2);padding-left:20px">
+          <li>Download the <code class="inline">Cerberus_x.y.z_x64-setup.msi</code> installer (or the standalone <code class="inline">.exe</code>) from <a href="https://github.com/hash066/Cerberus/releases" rel="noopener">GitHub Releases</a>.</li>
+          <li>Run it. Because the build is unsigned, <b>SmartScreen</b> shows “Windows protected your PC.” Click <b>More info → Run anyway</b>.</li>
+          <li>The tray app launches <code class="inline">cerberusd</code> in the background and adds a wolf icon to your system tray. Open it to see the Overview dashboard.</li>
+        </ol>
+        <div class="callout info">
+          <span class="mark" aria-hidden="true">i</span>
+          <span>The daemon binds the mesh on all interfaces by default and writes an operator token to <code class="inline">%AppData%\cerberus\operator.token</code>. Allow it through the Windows Firewall (UDP) when prompted so peers can reach it.</span>
+        </div>
+        <p style="color:var(--text-2)">Prefer the command line? The daemon builds pure-Go — see <a href="#source">Build from source</a>.</p>
+      </section>
+
+      <!-- MACOS -->
+      <section class="tabpanel" id="panel-mac" role="tabpanel" aria-labelledby="tab-mac" tabindex="0" hidden>
+        <h2 id="macos" style="font-size:20px;margin:0 0 8px;scroll-margin-top:74px">macOS (Apple Silicon &amp; Intel)</h2>
+        <ol style="color:var(--text-2);padding-left:20px">
+          <li>Download the <code class="inline">Cerberus_x.y.z_aarch64.dmg</code> (Apple Silicon) or <code class="inline">_x64.dmg</code> (Intel) from <a href="https://github.com/hash066/Cerberus/releases" rel="noopener">GitHub Releases</a>.</li>
+          <li>Open the <code class="inline">.dmg</code> and drag <b>Cerberus</b> to Applications.</li>
+          <li>Because the build is unsigned/un-notarized, <b>Gatekeeper</b> blocks the first launch. <b>Right-click the app → Open</b>, then confirm <b>Open</b> in the dialog. (Or: System Settings → Privacy &amp; Security → “Open Anyway”.)</li>
+        </ol>
+        <div class="callout info">
+          <span class="mark" aria-hidden="true">i</span>
+          <span>If Gatekeeper is stubborn, you can clear the quarantine attribute from a terminal:</span>
+        </div>
+        <div class="codeblock">
+<pre><code>xattr -dr com.apple.quarantine /Applications/Cerberus.app</code></pre>
+        </div>
+        <p style="color:var(--text-2)">The daemon writes its operator token to <code class="inline">~/Library/Application Support/cerberus/operator.token</code>. Approve the local-network prompt so peers can discover this Mac.</p>
+      </section>
+
+      <!-- LINUX -->
+      <section class="tabpanel" id="panel-linux" role="tabpanel" aria-labelledby="tab-linux" tabindex="0" hidden>
+        <h2 id="linux" style="font-size:20px;margin:0 0 8px;scroll-margin-top:74px">Linux</h2>
+        <p style="color:var(--text-2)"><b>AppImage (portable, any distro):</b></p>
+        <div class="codeblock">
+<pre><code><span class="cmt"># download Cerberus_x.y.z_amd64.AppImage from GitHub Releases, then:</span>
+chmod +x Cerberus_x.y.z_amd64.AppImage
+./Cerberus_x.y.z_amd64.AppImage</code></pre>
+        </div>
+        <p style="color:var(--text-2)"><b>Debian / Ubuntu (.deb):</b></p>
+        <div class="codeblock">
+<pre><code>sudo apt install ./cerberus_x.y.z_amd64.deb</code></pre>
+        </div>
+        <div class="callout info">
+          <span class="mark" aria-hidden="true">i</span>
+          <span>The Tauri tray needs a WebKitGTK runtime (e.g. <code class="inline">libwebkit2gtk-4.1</code>) and an app-indicator library. The <code class="inline">.deb</code> declares these; for the AppImage, install them via your package manager if the tray doesn't appear. Headless server? You only need the daemon — see <a href="#source">Build from source</a>.</span>
+        </div>
+        <p style="color:var(--text-2)">The daemon writes its operator token to <code class="inline">$XDG_CONFIG_HOME/cerberus/operator.token</code> (usually <code class="inline">~/.config/cerberus/operator.token</code>).</p>
+      </section>
+    </div>
+
+    <hr>
+
+    <!-- BUILD FROM SOURCE -->
+    <h2 id="source" style="font-size:24px;margin:0 0 8px;scroll-margin-top:74px">Build from source</h2>
+    <p style="color:var(--text-2)">
+      The most reliable path during the beta. The daemon and CLI are one Go module and build
+      <b>pure-Go</b> with no C toolchain. Rust (Cargo) is only needed for the <code class="inline">core/</code>
+      crates and tests; the Tauri toolchain is only needed for the desktop tray app.
+    </p>
+
+    <h3 style="font-size:16px;margin:22px 0 6px">Prerequisites</h3>
+    <div class="table-wrap">
+      <table class="tbl">
+        <thead><tr><th>Tool</th><th>Version</th><th>Needed for</th></tr></thead>
+        <tbody>
+          <tr><td>Go</td><td>1.22+</td><td>the daemon, CLI, gateway, mesh (required)</td></tr>
+          <tr><td>Rust (cargo)</td><td>stable</td><td>the <code>core/</code> crates + <code>cargo test</code> (recommended)</td></tr>
+          <tr><td>git</td><td>any</td><td>cloning the repo</td></tr>
+          <tr><td>Node + Tauri CLI</td><td>Node 18+ / Tauri v2</td><td>only for the desktop tray app</td></tr>
+          <tr><td>task</td><td>v3 (optional)</td><td>the <code>task build / test / demo</code> shortcuts</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="font-size:16px;margin:22px 0 6px">1. Clone and build the daemon + CLI</h3>
+    <div class="codeblock">
+<pre><code>git clone https://github.com/hash066/Cerberus.git
+cd Cerberus
+
+<span class="cmt"># build everything (Go + Rust):</span>
+task build
+<span class="cmt"># …or without the task runner:</span>
+go build ./...        <span class="cmt"># daemon, CLI, gateway, mesh (pure-Go, no C toolchain)</span>
+cargo build           <span class="cmt"># optional; builds the Rust core crates</span></code></pre>
+    </div>
+
+    <h3 style="font-size:16px;margin:22px 0 6px">2. Prove it works, then start a node</h3>
+    <div class="codeblock">
+<pre><code><span class="cmt"># two daemons discover each other and run a WASM shard remotely:</span>
+go run ./test/e2e     <span class="cmt"># or: task demo</span>
+<span class="out">DEMO PASSED: hello-shard.wasm ran remotely on worker and returned 1337.</span>
+
+<span class="cmt"># start the daemon (leave it running):</span>
+go run ./cmd/cerberusd</code></pre>
+    </div>
+    <p style="color:var(--text-2)">On startup the daemon serves the gateway (<code class="inline">:8080</code>), status API (<code class="inline">127.0.0.1:7777</code>), metrics (<code class="inline">127.0.0.1:7779</code>), and RPC (<code class="inline">127.0.0.1:9092</code>), and logs its dialable mesh address(es). See <a href="docs.html#getting-started">Getting Started</a> for the full walkthrough.</p>
+
+    <h3 style="font-size:16px;margin:22px 0 6px">3. Build the desktop tray (optional)</h3>
+    <p style="color:var(--text-2)">The tray is a Tauri v2 app. It needs Node, the Tauri CLI, and a native webview (WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux).</p>
+    <div class="codeblock">
+<pre><code><span class="cmt"># with the daemon running, in another shell:</span>
+cd tray
+npm install
+npm run tauri dev     <span class="cmt"># dev window; use `npm run tauri build` for an installer</span></code></pre>
+    </div>
+    <div class="callout ok">
+      <span class="mark" aria-hidden="true">✓</span>
+      <span>No desktop handy? Open <code class="inline">tray/preview.html</code> in any browser — it's a self-contained static mock of the full dashboard, clearly labelled, so you can see the UI without the Tauri toolchain or a running daemon.</span>
+    </div>
+
+    <hr>
+    <p style="color:var(--text-2)">Next: <a href="docs.html#getting-started">Getting Started</a> · <a href="docs.html#pairing">Pair a second machine</a> · <a href="docs.html#security">Security model</a></p>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <a class="brand" href="index.html"><img src="assets/wolf.svg" alt=""><span>Cerberus</span></a>
+          <p>A zero-trust, masterless distributed hypervisor for multi-agent orchestration. Early beta — LAN-trusted, unsigned builds, no audit yet.</p>
+        </div>
+        <div class="footer-cols">
+          <div class="footer-col">
+            <h4>Product</h4>
+            <a href="index.html">Overview</a>
+            <a href="install.html">Install</a>
+            <a href="install.html#source">Build from source</a>
+          </div>
+          <div class="footer-col">
+            <h4>Docs</h4>
+            <a href="docs.html#getting-started">Getting started</a>
+            <a href="docs.html#pairing">Pairing machines</a>
+            <a href="docs.html#security">Security model</a>
+            <a href="docs.html#cli">CLI reference</a>
+          </div>
+          <div class="footer-col">
+            <h4>Project</h4>
+            <a href="https://github.com/hash066/Cerberus" rel="noopener">GitHub</a>
+            <a href="https://github.com/hash066/Cerberus/releases" rel="noopener">Releases</a>
+            <a href="https://github.com/hash066/Cerberus/blob/main/VISION-AND-ROADMAP.md" rel="noopener">Roadmap</a>
+          </div>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        Cerberus is beta software. Run it only on machines and networks you trust; not for sensitive or production workloads.
+      </div>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

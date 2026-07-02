@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cerberus Docs — Getting Started, Pairing, Security, CLI</title>
+  <meta name="description" content="Cerberus documentation: get a node running, pair machines on the same LAN or across networks with Tailscale, the capability security model, and the cerberus CLI reference.">
+  <link rel="icon" href="assets/wolf.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+
+  <header class="site-header">
+    <nav class="nav" aria-label="Primary">
+      <a class="brand" href="index.html">
+        <img src="assets/wolf.svg" alt="">
+        <span>Cerberus</span>
+        <span class="beta-tag">Beta</span>
+      </a>
+      <div class="nav-links">
+        <a href="index.html">Home</a>
+        <a href="install.html">Install</a>
+        <a href="docs.html" class="active">Docs</a>
+        <a class="gh" href="https://github.com/hash066/Cerberus" rel="noopener">GitHub</a>
+        <a class="btn primary small cta" href="install.html">Download</a>
+        <button class="theme-toggle" type="button" aria-label="Toggle theme">☼</button>
+      </div>
+    </nav>
+  </header>
+
+  <div class="beta-banner" role="note">
+    <div class="inner">
+      <span class="badge">Beta</span>
+      <span><b>Early beta.</b> These docs describe the daemon's real, current behavior. Some subsystems are labelled stubs — each is called out honestly rather than faked.</span>
+    </div>
+  </div>
+
+  <main id="main" class="wrap">
+    <div class="docs-layout">
+      <!-- SIDEBAR -->
+      <nav class="docs-nav" aria-label="Documentation">
+        <div class="group">
+          <div class="group-title">Start</div>
+          <a href="#getting-started">Getting started</a>
+          <a href="#first-run">First run</a>
+          <a href="#operator-token">Operator token</a>
+        </div>
+        <div class="group">
+          <div class="group-title">Mesh</div>
+          <a href="#pairing">Pairing machines</a>
+          <a href="#pair-lan">Same LAN</a>
+          <a href="#pair-remote">Different networks</a>
+          <a href="#pair-verify">Verify convergence</a>
+        </div>
+        <div class="group">
+          <div class="group-title">Reference</div>
+          <a href="#security">Security model</a>
+          <a href="#cli">CLI reference</a>
+        </div>
+      </nav>
+
+      <!-- CONTENT -->
+      <article class="docs-content">
+        <!-- GETTING STARTED -->
+        <h2 id="getting-started">Getting started</h2>
+        <p>
+          Cerberus is a zero-trust, masterless distributed hypervisor. You run a small daemon
+          (<code class="inline">cerberusd</code>) on each machine you own; they discover each other on
+          your LAN with no configuration and become a single private mesh. Software on the mesh can
+          only touch a resource it has been handed an unforgeable <b>capability</b> for.
+        </p>
+        <p>
+          If you haven't installed yet, start with the <a href="install.html">install guide</a>.
+          The rest of this page assumes you can run <code class="inline">cerberusd</code> (from an
+          installed build or a source checkout).
+        </p>
+
+        <h3 id="first-run">First run: start the daemon</h3>
+        <div class="codeblock">
+<pre><code>go run ./cmd/cerberusd
+<span class="cmt"># or run an installed binary: cerberusd</span></code></pre>
+        </div>
+        <p>On startup you'll see the daemon compose the mesh and bring up its surfaces:</p>
+        <div class="codeblock">
+<pre><code><span class="out">cerberusd v0.1.0  profile=open_mesh  kernel=pure-go-stub  sample-cap=1
+cerberusd: composed system up (mesh + telemetry + scheduler + 9P under supervisor)
+mesh: dialable at /ip4/192.168.1.24/udp/54613/quic-v1/p2p/12D3KooW...
+Starting Gateway on :8080 (Bearer token required)
+Starting status API on 127.0.0.1:7777 (Bearer token required)
+Starting metrics on 127.0.0.1:7779 (/metrics token-gated; /healthz /readyz open)
+Starting RPC server on 127.0.0.1:9092</span></code></pre>
+        </div>
+        <p>What just came up on this node:</p>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead><tr><th>Surface</th><th>Address</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td>Gateway</td><td><code>:8080</code></td><td>OpenAI-compatible HTTP front door (Bearer <code>exec</code>)</td></tr>
+              <tr><td>Status API</td><td><code>127.0.0.1:7777</code></td><td>live JSON status for the tray/dashboard (Bearer <code>read</code>)</td></tr>
+              <tr><td>Metrics</td><td><code>127.0.0.1:7779</code></td><td>Prometheus <code>/metrics</code> + open <code>/healthz</code>, <code>/readyz</code></td></tr>
+              <tr><td>RPC</td><td><code>127.0.0.1:9092</code></td><td>the control socket the <code>cerberus</code> CLI talks to</td></tr>
+              <tr><td>Mesh</td><td>libp2p/QUIC + mDNS</td><td>peer discovery + capability-gated data plane</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout info">
+          <span class="mark" aria-hidden="true">i</span>
+          <span><b>Profiles.</b> <code class="inline">cerberusd</code> defaults to <code class="inline">-profile=open_mesh</code> (the compute economy is on; the daemon mints genesis credits). Use <code class="inline">-profile=sealed</code> for the economy-off, attestation-on mode.</span>
+        </div>
+
+        <h3 id="operator-token">The operator token</h3>
+        <p>
+          Cerberus has <b>no ambient authority</b> — every network surface requires a capability
+          token. On first start the daemon mints an <b>operator token</b> (subject
+          <code class="inline">operator</code>, <code class="inline">admin</code> rights, 24-hour TTL)
+          and writes it to your OS config directory. The CLI reads it automatically.
+        </p>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead><tr><th>OS</th><th>Path</th></tr></thead>
+            <tbody>
+              <tr><td>Windows</td><td><code>%AppData%\cerberus\operator.token</code></td></tr>
+              <tr><td>macOS</td><td><code>~/Library/Application Support/cerberus/operator.token</code></td></tr>
+              <tr><td>Linux</td><td><code>~/.config/cerberus/operator.token</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>To use it in a shell (for <code class="inline">curl</code>, Python, etc.), load it into an environment variable:</p>
+        <div class="codeblock">
+<pre><code><span class="cmt"># Linux / macOS</span>
+export CERBERUS_TOKEN="$(cat ~/.config/cerberus/operator.token)"</code></pre>
+        </div>
+        <div class="codeblock">
+<pre><code><span class="cmt"># Windows (PowerShell)</span>
+$env:CERBERUS_TOKEN = Get-Content "$env:AppData\cerberus\operator.token"</code></pre>
+        </div>
+        <p>The token is written owner-only (<code class="inline">0600</code>) — treat it like an SSH key. It expires after 24h; restart the daemon to rotate it.</p>
+
+        <!-- PAIRING -->
+        <h2 id="pairing">Pairing machines</h2>
+        <p>
+          This is the moment Cerberus becomes a <em>mesh</em>. Each node runs
+          <code class="inline">cerberusd</code>. The daemon now binds the mesh on <b>all interfaces
+          by default</b> (<code class="inline">--mesh-listen /ip4/0.0.0.0/udp/0/quic-v1</code>), so it's
+          reachable from other machines, and it logs its dialable address(es) at startup:
+        </p>
+        <div class="codeblock">
+<pre><code><span class="out">mesh: dialable at /ip4/192.168.1.24/udp/54613/quic-v1/p2p/12D3KooW...</span></code></pre>
+        </div>
+        <p>That full <code class="inline">/ip4/&lt;ip&gt;/udp/&lt;port&gt;/quic-v1/p2p/&lt;peer-id&gt;</code> string is the node's <b>multiaddr</b> — the thing another machine dials to pair explicitly.</p>
+
+        <h3 id="pair-lan">Same LAN — zero config</h3>
+        <p>
+          If both machines are on the same local network, there is <b>nothing to configure</b>. Each
+          daemon advertises and browses the <code class="inline">_cerberus</code> mDNS service on the
+          subnet and connects to peers it finds over libp2p/QUIC. Just start the daemon on the second
+          machine:
+        </p>
+        <div class="codeblock">
+<pre><code>go run ./cmd/cerberusd    <span class="cmt"># on the second machine — that's it</span></code></pre>
+        </div>
+        <p>Within a few seconds the two daemons discover each other.</p>
+        <div class="callout warn">
+          <span class="mark" aria-hidden="true">!</span>
+          <span>Both machines must be on the <b>same L2 subnet</b> for mDNS multicast to reach. Many corporate/guest Wi-Fi networks block multicast and client-to-client traffic — use a home/office LAN or a wired switch. If mDNS is blocked, use the cross-network path below.</span>
+        </div>
+
+        <h3 id="pair-remote">Different networks (or mDNS blocked)</h3>
+        <p>
+          When the machines aren't on the same subnet — or multicast is blocked — give them a shared,
+          stable address space with <a href="https://tailscale.com" rel="noopener">Tailscale</a>, then
+          pair explicitly with <code class="inline">--peer</code>.
+        </p>
+        <ol>
+          <li><b>Install Tailscale on both machines.</b> Each gets a stable <code class="inline">100.x.y.z</code> IP that works across networks.</li>
+          <li><b>On node A</b>, start the daemon and read its dialable multiaddr from the startup log — the one using its <b>Tailscale IP</b> (a <code class="inline">100.x.y.z</code> address):
+            <div class="codeblock">
+<pre><code><span class="out">mesh: dialable at /ip4/100.101.102.103/udp/41000/quic-v1/p2p/12D3KooW...</span></code></pre>
+            </div>
+          </li>
+          <li><b>On node B</b>, start the daemon pointed at node A's Tailscale multiaddr:
+            <div class="codeblock">
+<pre><code>cerberusd --peer /ip4/100.101.102.103/udp/41000/quic-v1/p2p/12D3KooW...</code></pre>
+            </div>
+          </li>
+        </ol>
+        <p><code class="inline">--peer</code> takes a <b>comma-separated list</b>, so you can bootstrap against several nodes at once:</p>
+        <div class="codeblock">
+<pre><code>cerberusd --peer /ip4/100.101.102.103/udp/41000/quic-v1/p2p/12D3Koo...,/ip4/100.64.10.5/udp/41000/quic-v1/p2p/12D3Koo...</code></pre>
+        </div>
+        <p>To pin a firewall port (so the QUIC port is predictable instead of ephemeral), set a fixed UDP port on the listen address:</p>
+        <div class="codeblock">
+<pre><code>cerberusd --mesh-listen /ip4/0.0.0.0/udp/4001/quic-v1</code></pre>
+        </div>
+        <div class="callout info">
+          <span class="mark" aria-hidden="true">i</span>
+          <span>mDNS still runs on each node's LAN as usual — <code class="inline">--peer</code> is additive, covering peers that discovery can't reach. WireGuard or any other overlay that gives each machine a routable IP works the same way as Tailscale.</span>
+        </div>
+
+        <h3 id="pair-verify">Verify convergence</h3>
+        <p>Confirm the nodes see each other from either side. Three equivalent ways:</p>
+        <p><b>Diagnostics (recommended):</b></p>
+        <div class="codeblock">
+<pre><code>cerberus doctor
+<span class="out">Cerberus Doctor
+...
+Reachability:
+  /healthz:   ok
+  /readyz:    ok
+  RPC Status: ok (version=0.1.0 profile=open_mesh mesh_up=true peers=1)
+Overall: cerberusd looks reachable and correctly wired.</span></code></pre>
+        </div>
+        <p><b>The tray Overview:</b> the desktop dashboard's Mesh view lists connected peers live.</p>
+        <p><b>The status API</b> — a non-empty <code class="inline">peers</code> array means it converged:</p>
+        <div class="codeblock">
+<pre><code>curl -sS http://127.0.0.1:7777/api/v1/status -H "Authorization: Bearer $CERBERUS_TOKEN"</code></pre>
+        </div>
+        <div class="codeblock">
+<pre><code><span class="out">{
+  "version": "0.1.0",
+  "profile": "open_mesh",
+  "mesh_up": true,
+  "peers": ["/ip4/100.101.102.103/udp/41000/quic-v1/p2p/12D3KooW..."],
+  "operator_balance": 1000000
+}</span></code></pre>
+        </div>
+
+        <!-- SECURITY -->
+        <h2 id="security">Security model</h2>
+        <p>
+          Cerberus is built on <b>object capabilities, not identities</b>. There are no passwords,
+          no roles, and no ambient authority — you can't do something just because of <em>who</em>
+          you are. You can only do something if you hold a <b>capability</b> for it.
+        </p>
+        <div class="grid cols-2" style="margin:16px 0">
+          <div class="card">
+            <h3>Capabilities, not passwords</h3>
+            <p>Every cross-boundary action presents an unforgeable capability handle. No shared secret grants blanket access; there is nothing to phish or replay across resources.</p>
+          </div>
+          <div class="card">
+            <h3>Revocable Ed25519 tokens</h3>
+            <p>Each capability is an Ed25519-signed token you can <b>narrow</b> (attenuate), <b>delegate</b>, and <b>revoke</b>. Revocations gossip mesh-wide over a capability-gated topic and survive a restart, so a revoke on one node becomes a deny everywhere.</p>
+          </div>
+          <div class="card">
+            <h3>WASM sandbox for agents</h3>
+            <p>Agent workloads run as WebAssembly components in a <b>wazero</b> sandbox. A guest sees only the capabilities it was imported — it cannot reach the host or other resources by default.</p>
+          </div>
+          <div class="card">
+            <h3>Issuer key in the OS keychain</h3>
+            <p>The daemon's root signing key is kept in OS-native custody where available — Windows Credential Manager, macOS Keychain, or the Linux Secret Service — falling back to a <code class="inline">0600</code> file on headless hosts.</p>
+          </div>
+        </div>
+        <div class="callout warn">
+          <span class="mark" aria-hidden="true">!</span>
+          <span>
+            <b>Maturity, honestly.</b> This is early beta. The default build uses the <b>pure-Go OCap
+            kernel</b>; a real Rust kernel exists behind a build flag. There has been <b>no external
+            security audit</b> yet. Frontier features (zk-WASM proof-of-inference, host-TEE memory
+            shielding) are <b>experimental and off by default</b>. Treat Cerberus as LAN-trusted
+            infrastructure — don't rely on it for sensitive or production workloads.
+          </span>
+        </div>
+
+        <!-- CLI -->
+        <h2 id="cli">CLI reference</h2>
+        <p>
+          <code class="inline">cerberus</code> is the operator's control client. It talks to a running
+          <code class="inline">cerberusd</code> over the local RPC socket
+          (<code class="inline">127.0.0.1:9092</code>) and authenticates every call with a capability
+          token — resolved from <code class="inline">$CERBERUS_TOKEN</code> if set, otherwise the
+          operator token file the daemon writes.
+        </p>
+        <div class="codeblock">
+<pre><code>cerberus [--json] &lt;command&gt; [args]
+<span class="cmt"># run without a command to print full usage</span></code></pre>
+        </div>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code>status</code></td><td>Daemon health, identity, uptime, credit balance</td></tr>
+              <tr><td><code>doctor</code></td><td>Diagnose daemon discovery + reachability (use this to confirm pairing)</td></tr>
+              <tr><td><code>nodes</code></td><td>List mesh peers (this node + connected)</td></tr>
+              <tr><td><code>run &lt;component.wasm&gt; [--on &lt;peer&gt;]</code></td><td>Execute a WASM workload and print the real result</td></tr>
+              <tr><td><code>devices</code></td><td>List the 9P namespace devices</td></tr>
+              <tr><td><code>wallet [owner]</code></td><td>Compute-credit balance from the durable ledger</td></tr>
+              <tr><td><code>caps mint / attenuate / revoke / list</code></td><td>Mint, narrow, revoke, and list capability tokens</td></tr>
+              <tr><td><code>components add / list</code></td><td>Register and list local WASM components</td></tr>
+              <tr><td><code>conflicts list / resolve</code></td><td>Inspect and resolve open CRDT belief conflicts</td></tr>
+              <tr><td><code>economy challenge &lt;tx-id&gt; …</code></td><td>Dispute a pending settlement with a fraud proof</td></tr>
+              <tr><td><code>metrics</code></td><td>Fetch the local Prometheus <code>/metrics</code> text</td></tr>
+              <tr><td><code>version</code></td><td>Print client + contract version</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><b>Example — check status:</b></p>
+        <div class="codeblock">
+<pre><code>cerberus status
+<span class="out">Cerberus Daemon Status
+Version: 0.1.0
+State:   Running (Power: AC, Battery: 100.0%)
+Auth:    authenticated as "operator"</span></code></pre>
+        </div>
+        <div class="callout info">
+          <span class="mark" aria-hidden="true">i</span>
+          <span>Add <code class="inline">--json</code> to any command for machine-readable output. For programmatic <em>compute</em>, use the OpenAI-compatible gateway on <code class="inline">:8080</code> rather than the CLI. Full reference lives in the repo at <a href="https://github.com/hash066/Cerberus/blob/main/docs/cli.md" rel="noopener">docs/cli.md</a>.</span>
+        </div>
+
+        <hr>
+        <p style="color:var(--text-2)">
+          More in the repository:
+          <a href="https://github.com/hash066/Cerberus/blob/main/docs/getting-started.md" rel="noopener">getting-started.md</a> ·
+          <a href="https://github.com/hash066/Cerberus/blob/main/docs/user-guide.md" rel="noopener">user-guide.md</a> ·
+          <a href="https://github.com/hash066/Cerberus/blob/main/ARCHITECTURE.md" rel="noopener">ARCHITECTURE.md</a>
+        </p>
+      </article>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <a class="brand" href="index.html"><img src="assets/wolf.svg" alt=""><span>Cerberus</span></a>
+          <p>A zero-trust, masterless distributed hypervisor for multi-agent orchestration. Early beta — LAN-trusted, unsigned builds, no audit yet.</p>
+        </div>
+        <div class="footer-cols">
+          <div class="footer-col">
+            <h4>Product</h4>
+            <a href="index.html">Overview</a>
+            <a href="install.html">Install</a>
+            <a href="install.html#source">Build from source</a>
+          </div>
+          <div class="footer-col">
+            <h4>Docs</h4>
+            <a href="#getting-started">Getting started</a>
+            <a href="#pairing">Pairing machines</a>
+            <a href="#security">Security model</a>
+            <a href="#cli">CLI reference</a>
+          </div>
+          <div class="footer-col">
+            <h4>Project</h4>
+            <a href="https://github.com/hash066/Cerberus" rel="noopener">GitHub</a>
+            <a href="https://github.com/hash066/Cerberus/releases" rel="noopener">Releases</a>
+            <a href="https://github.com/hash066/Cerberus/blob/main/VISION-AND-ROADMAP.md" rel="noopener">Roadmap</a>
+          </div>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        Cerberus is beta software. Run it only on machines and networks you trust; not for sensitive or production workloads.
+      </div>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
