@@ -68,12 +68,24 @@ type DevicesResponse struct {
 type WalletRequest struct {
 	Token string
 	Owner string
+	Limit int
+}
+type WalletTx struct {
+	ID       uint64
+	TaskID   string
+	Model    string
+	Consumer string
+	Provider string
+	Amount   uint64
+	UnixTime int64
+	State    string
 }
 type WalletResponse struct {
-	Owner       string
-	Balance     uint64
-	Enabled     bool
-	TotalSupply uint64
+	Owner        string
+	Balance      uint64
+	Enabled      bool
+	TotalSupply  uint64
+	Transactions []WalletTx
 }
 
 // caps

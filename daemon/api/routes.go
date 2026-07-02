@@ -50,6 +50,29 @@ type WorkloadEntry struct {
 	State string `json:"state"`
 }
 
+// WalletTxView is one row of the /api/v1/wallet transaction list — a recorded
+// compute run and its notional price. Beta records usage only (no credits move).
+type WalletTxView struct {
+	ID       uint64 `json:"id"`
+	TaskID   string `json:"task_id"`
+	Model    string `json:"model,omitempty"`
+	Consumer string `json:"consumer"`
+	Provider string `json:"provider"`
+	Amount   uint64 `json:"amount"`
+	UnixTime int64  `json:"unix_time"`
+	State    string `json:"state"`
+}
+
+// WalletView is the /api/v1/wallet payload: an owner's compute-credit balance
+// plus recent compute transactions (the ledger's append-only usage log). The
+// list does not affect Balance — value transfer is off for beta.
+type WalletView struct {
+	Owner        string         `json:"owner"`
+	Balance      uint64         `json:"balance"`
+	TotalSupply  uint64         `json:"total_supply"`
+	Transactions []WalletTxView `json:"transactions"`
+}
+
 // ConflictCandidateView is one candidate value for a belief-conflict subject.
 type ConflictCandidateView struct {
 	Actor string `json:"actor,omitempty"`
@@ -176,6 +199,7 @@ type ListGetters struct {
 	Conflicts func() []ConflictView
 	Devices   func() []NamespaceDevice
 	Workloads func() []WorkloadEntry
+	Wallet    func() WalletView
 }
 
 // WithActions attaches the write-side Actions to a Server built by New or
@@ -202,6 +226,7 @@ func (s *Server) registerActionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/conflicts/resolve", s.requireWrite(s.handleConflictsResolve))
 	mux.HandleFunc("/api/v1/devices", s.requireRead(s.handleDevicesList))
 	mux.HandleFunc("/api/v1/workloads", s.requireRead(s.handleWorkloadsList))
+	mux.HandleFunc("/api/v1/wallet", s.requireRead(s.handleWallet))
 	// CapsRevoke and CapsMint both require "admin" on the RPC; mirror that
 	// exactly here rather than the weaker "write" (the operator token carries
 	// "admin" so this is not a behavior change for the tray's only credential,
@@ -217,6 +242,17 @@ func (s *Server) handleConflictsList(w http.ResponseWriter, _ *http.Request) {
 	}
 	if out == nil {
 		out = []ConflictView{}
+	}
+	writeJSON(w, out)
+}
+
+func (s *Server) handleWallet(w http.ResponseWriter, _ *http.Request) {
+	var out WalletView
+	if s.lists.Wallet != nil {
+		out = s.lists.Wallet()
+	}
+	if out.Transactions == nil {
+		out.Transactions = []WalletTxView{}
 	}
 	writeJSON(w, out)
 }

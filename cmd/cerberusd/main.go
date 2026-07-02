@@ -324,6 +324,14 @@ func main() {
 		wlog.record(api.WorkloadEntry{ID: ev.TaskID, Model: ev.Model, Node: "local", State: state})
 	})
 
+	// Wallet transactions (#10): price every completed gateway workload at a flat
+	// notional credit and record it in the ledger's durable compute-tx log, so the
+	// wallet shows real run activity (`cerberus wallet`, GET /api/v1/wallet). Value
+	// transfer stays OFF for beta — the recorder appends an audit record, it does
+	// not move UTXOs (see cmd/cerberusd/settlement.go, daemon/ledger/txlog.go).
+	gw.SetPricingPolicy(flatPricingPolicy)
+	gw.SetSettler(ledgerTxRecorder{lg: lg, now: func() int64 { return time.Now().Unix() }})
+
 	gwLn := bindWithFallback("gateway", *gwAddr)
 	gwActualAddr := ""
 	if gwLn != nil {
@@ -411,6 +419,25 @@ func main() {
 		// GET /api/v1/workloads — the ring buffer fed by both the gateway's
 		// OnDispatch hook and DaemonRPC.Run (wired to the same wlog below).
 		Workloads: func() []api.WorkloadEntry { return wlog.list() },
+		// GET /api/v1/wallet — operator balance + recent compute transactions
+		// from the ledger's durable usage log (#10). Beta records usage; no
+		// credits move. Mirrors DaemonRPC.Wallet.
+		Wallet: func() api.WalletView {
+			if lg == nil {
+				return api.WalletView{}
+			}
+			bal, _ := lg.Balance("operator")
+			total, _ := lg.TotalSupply()
+			out := api.WalletView{Owner: "operator", Balance: bal, TotalSupply: total}
+			txs, _ := lg.ComputeTxs(20)
+			for _, t := range txs {
+				out.Transactions = append(out.Transactions, api.WalletTxView{
+					ID: t.ID, TaskID: t.TaskID, Model: t.Model, Consumer: t.Consumer,
+					Provider: t.Provider, Amount: t.Amount, UnixTime: t.UnixTime, State: string(t.State),
+				})
+			}
+			return out
+		},
 	}).WithActions(api.Actions{
 		// POST /api/v1/conflicts/resolve — same daemon/state call
 		// DaemonRPC.ConflictsResolve makes.

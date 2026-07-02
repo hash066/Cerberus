@@ -396,6 +396,20 @@ func cmdWallet(args []string, jsonOut bool) int {
 	fmt.Printf("  Balance:      %d credits\n", resp.Balance)
 	fmt.Printf("  Economy:      enabled=%v\n", resp.Enabled)
 	fmt.Printf("  Total supply: %d credits (ledger-wide)\n", resp.TotalSupply)
+	if len(resp.Transactions) == 0 {
+		fmt.Println("  Transactions: none yet (run a workload to record one)")
+	} else {
+		fmt.Printf("  Transactions (%d most recent; beta logs usage, credits do not move):\n", len(resp.Transactions))
+		for _, t := range resp.Transactions {
+			when := time.Unix(t.UnixTime, 0).Format("2006-01-02 15:04:05")
+			model := t.Model
+			if model == "" {
+				model = "-"
+			}
+			fmt.Printf("    #%d  %s  model=%s  %d credit(s)  %s -> %s  [%s]\n",
+				t.ID, when, model, t.Amount, t.Consumer, t.Provider, t.State)
+		}
+	}
 	return exitOK
 }
 

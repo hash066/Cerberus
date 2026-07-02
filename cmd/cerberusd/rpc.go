@@ -358,12 +358,29 @@ func (d *DaemonRPC) Devices(req *DevicesRequest, resp *DevicesResponse) error {
 type WalletRequest struct {
 	Token string
 	Owner string // empty => the caller's subject, then "operator"
+	Limit int     // max recent transactions to return; <=0 => a sensible default
+}
+
+// WalletTx is one recorded compute transaction (from the ledger's append-only
+// compute-tx log). Beta records usage without moving credits, so State is
+// "recorded" and the balance is unaffected — the list is honest activity, not a
+// value transfer.
+type WalletTx struct {
+	ID       uint64
+	TaskID   string
+	Model    string
+	Consumer string
+	Provider string
+	Amount   uint64
+	UnixTime int64
+	State    string
 }
 type WalletResponse struct {
-	Owner       string
-	Balance     uint64
-	Enabled     bool
-	TotalSupply uint64
+	Owner        string
+	Balance      uint64
+	Enabled      bool
+	TotalSupply  uint64
+	Transactions []WalletTx
 }
 
 // Wallet reports an owner's compute-credit balance from the durable eUTXO
@@ -396,6 +413,29 @@ func (d *DaemonRPC) Wallet(req *WalletRequest, resp *WalletResponse) error {
 	resp.Balance = bal
 	resp.Enabled = d.profile == "open_mesh"
 	resp.TotalSupply, _ = d.ledger.TotalSupply()
+
+	// Recent compute transactions for this owner (as consumer or provider),
+	// newest first. This is the "transactions / spend" the wallet was missing:
+	// every gateway workload run appends one durable record (see
+	// cmd/cerberusd/settlement.go). Beta records usage only — no credits move.
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if all, terr := d.ledger.ComputeTxs(0); terr == nil {
+		for _, t := range all {
+			if t.Consumer != owner && t.Provider != owner {
+				continue
+			}
+			resp.Transactions = append(resp.Transactions, WalletTx{
+				ID: t.ID, TaskID: t.TaskID, Model: t.Model, Consumer: t.Consumer,
+				Provider: t.Provider, Amount: t.Amount, UnixTime: t.UnixTime, State: string(t.State),
+			})
+			if len(resp.Transactions) >= limit {
+				break
+			}
+		}
+	}
 	return nil
 }
 

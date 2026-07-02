@@ -220,6 +220,43 @@ func TestAssertBeliefRequiresWrite(t *testing.T) {
 	}
 }
 
+// TestWalletListsRecordedTransactions proves the wallet surface (#10) returns the
+// ledger's recorded compute transactions and that recording usage does not move
+// the balance (beta value-transfer-off).
+func TestWalletListsRecordedTransactions(t *testing.T) {
+	d, tok := testDaemon(t)
+
+	var before WalletResponse
+	if err := d.Wallet(&WalletRequest{Token: tok, Owner: "operator"}, &before); err != nil {
+		t.Fatalf("wallet before: %v", err)
+	}
+	if len(before.Transactions) != 0 {
+		t.Fatalf("expected no transactions initially, got %d", len(before.Transactions))
+	}
+
+	if _, err := d.ledger.RecordComputeTx(ledger.ComputeTx{
+		TaskID: "operator:hello-shard", Model: "hello-shard",
+		Consumer: "operator", Provider: "node:local", Amount: 1, UnixTime: 123,
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	var after WalletResponse
+	if err := d.Wallet(&WalletRequest{Token: tok, Owner: "operator"}, &after); err != nil {
+		t.Fatalf("wallet after: %v", err)
+	}
+	if len(after.Transactions) != 1 {
+		t.Fatalf("expected 1 transaction, got %d", len(after.Transactions))
+	}
+	tx := after.Transactions[0]
+	if tx.Model != "hello-shard" || tx.Amount != 1 || tx.Provider != "node:local" || tx.State != string(ledger.ComputeRecorded) {
+		t.Fatalf("unexpected tx: %+v", tx)
+	}
+	if before.Balance == 0 || after.Balance != before.Balance {
+		t.Fatalf("recording a tx must not move the balance: before=%d after=%d", before.Balance, after.Balance)
+	}
+}
+
 func TestWallet(t *testing.T) {
 	d, tok := testDaemon(t)
 	var resp WalletResponse
