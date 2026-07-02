@@ -16,7 +16,7 @@ wasmi = "1.1.0"
 # Optional so downstream crates that only need the wasmi path / blockstore (e.g.
 # core/cabi built as a windows-gnu staticlib for cgo, where wasmtime's transitive
 # windows-sys needs mingw `dlltool`) can opt out via default-features = false.
-wasmtime = { version = "37", optional = true, default-features = false, features = [
+wasmtime = { version = "46", optional = true, default-features = false, features = [
     "cranelift",
     "runtime",
     "component-model",
@@ -26,7 +26,7 @@ wasmtime = { version = "37", optional = true, default-features = false, features
 # component's `wasi:*` imports (clocks/random/io/cli/...). Pinned to the same
 # major as wasmtime. Gated under the same `wasmtime` feature so cabi's
 # default-features = false staticlib never pulls it (keeps the cgo gnu build lean).
-wasmtime-wasi = { version = "37", optional = true, default-features = false }
+wasmtime-wasi = { version = "46", optional = true, default-features = false }
 # SHA-256 for content-addressed CIDs (ARCHITECTURE §3.4 ComputeTask.component).
 # Already resolved at 0.10 in the workspace lockfile (transitive of ed25519-dalek),
 # so promoting it to a direct dep adds no new version.

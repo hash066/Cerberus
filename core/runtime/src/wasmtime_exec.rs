@@ -222,9 +222,9 @@ pub fn run_component(bytes: &[u8], name: &str) -> Result<u32, String> {
     let (result,) = func
         .call(&mut store, ())
         .map_err(|e| format!("component trap: {e}"))?;
-    // Component calls must run post-return before the next call / store reuse.
-    func.post_return(&mut store)
-        .map_err(|e| format!("post_return: {e}"))?;
+    // Wasmtime >= 46 runs the guest's post-return hook automatically after each
+    // `call`; the explicit `post_return` (needed on the pinned 37.x line) is now a
+    // deprecated no-op and has been dropped.
     Ok(result)
 }
 
@@ -298,8 +298,8 @@ pub fn run_wasi_component(bytes: &[u8], name: &str) -> Result<u32, String> {
     let (result,) = func
         .call(&mut store, ())
         .map_err(|e| format!("component trap: {e}"))?;
-    func.post_return(&mut store)
-        .map_err(|e| format!("post_return: {e}"))?;
+    // Wasmtime >= 46 runs post-return automatically after `call` (the explicit
+    // `post_return` from the 37.x line is now a deprecated no-op).
     // touch WasiView so the import stays used even if the trait method is only
     // reached through the linker (keeps `-D warnings` happy without an allow).
     let _ = store.data_mut().ctx();
@@ -315,7 +315,7 @@ pub fn run_wasi_component(bytes: &[u8], name: &str) -> Result<u32, String> {
 /// To run it, the production wiring is:
 ///
 /// ```ignore
-/// // Cargo.toml: wasmtime-wasi = "37"   (matches the pinned wasmtime)
+/// // Cargo.toml: wasmtime-wasi = "46"   (matches the pinned wasmtime)
 /// use wasmtime::{Engine, Store};
 /// use wasmtime::component::{Component, Linker};
 /// use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
