@@ -8,8 +8,17 @@
 
 Everything below this section (the original doc) was written before the "v3" integration wave (signed capability envelopes on the wire, tray dashboard rewrite, `/cer/fs` wired into 9P) and before the segment described here. Where the two disagree, **trust this section**. The old content below is still useful for deep historical/phase context (E/F/G/H roadmap reasoning) — just don't treat its "Reality matrix" or "Phase E roadmap" tables as current without cross-checking against this update.
 
-### Current repo state (verified 2026-07-01)
-- Branch `integration`, HEAD `fa0e9fb`. `main` is kept in sync (fast-forwarded to the same HEAD). **CI on `fa0e9fb` is green** (run conclusion = success). See the "CI restored to green" subsection below for what was fixed — `c220fa4` (the previous HEAD) was actually **red**, contrary to the pre-fix assumption in this doc.
+### Current repo state (verified 2026-07-02)
+- Branch `integration`, HEAD `390c5bd`. `main` is kept in sync (fast-forwarded to the same HEAD). **CI on `390c5bd` is green** (run conclusion = success; the only red job is `golangci-lint`, which is intentionally `continue-on-error`). See "Production hardening — Phase 0" just below for what landed, and "CI restored to green" further down for the earlier green-restore work.
+
+### Production hardening — Phase 0 done (2026-07-02)
+The user wants Cerberus to become a real production product, not a dev preview. An approved plan (5 phases, LAN-trusted v1, frontier features kept experimental/off, economy credits-only) drives this; **Phase 0 (foundations & hard CI gates) is complete**:
+- **wasmtime 37 → 46.0.1** (`core/runtime`) — clears all 18 RustSec advisories; `cargo-audit` promoted from advisory to a **hard gate**.
+- **`go test -race`** added as a hard CI gate (ubuntu, cgo+amd64) — the suite is race-clean. The real-process chaos test skips under `-race` (its work is in child processes the detector can't see) and its in-test `go build` timeout was raised 2m→5m.
+- **Fuzzing**: harnesses for the signed-capability `Verify`, bearer-token `Authorize`, and mesh wire envelope; a hard `fuzz smoke` CI gate actively fuzzes them on 64-bit. This immediately found and we fixed a **real DoS**: `daemon/auth` `decodeCanonical` trusted the u32 rights/caveats count, so a ~4-billion-count envelope hung/OOMed a node (`390c5bd`). Closes the previously-false "caveats fuzzed in CI" claim in `docs/verticals/00`.
+- **golangci-lint**: was dead (go1.24 binary vs go1.25 module); now built from source under the module's Go so it runs — reports **70 findings** (50 errcheck, 15 staticcheck, 5 unused), kept **advisory** until burned down, then promote to hard.
+- **SBOM**: CycloneDX (Syft, Go+Rust) generated as a CI artifact; deps already pinned via committed `go.sum` + `Cargo.lock`.
+- **Next (Phase 1)**: security core — OCap kernel + wazero sandbox audit/fuzz, key custody (TEE), LAN wire mTLS/PeerID-pin, threat model + external audit. The immediate smaller follow-up is burning down the 70 lint findings to make golangci-lint a hard gate.
 - Recent commit chain (newest first): `c220fa4` merge → `c2b96fa` tray HTTP routes + audio registration → `81857a1` mesh capability-gating → `9c14bc5` wazero sandboxing → `43e94e4` economy Challenge wiring → `9ae09f5` tray Docker-Desktop UI rewrite → `5fe7037` AcquireLock TOCTOU fix. Further back: `375e469` signed capability envelopes on compute+dataplane wire (retired the old shared-kernel demo model), `df38398` first tray dashboard integration, `9ad1465` `/cer/fs` wired into the 9P namespace over the data plane.
 - Harmless stale worktree dirs exist under `.claude/worktrees/agent-*` (older, unrelated agent runs from Jun 30–Jul 1 morning, branches named `worktree-agent-*`). Not blocking anything; clean up opportunistically with `git worktree remove`.
 
