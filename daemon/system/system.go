@@ -13,6 +13,7 @@ import (
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/audio"
+	"github.com/hash066/cerberus/daemon/audiolink"
 	"github.com/hash066/cerberus/daemon/dataplane"
 	"github.com/hash066/cerberus/daemon/dfs"
 	"github.com/hash066/cerberus/daemon/mesh"
@@ -50,6 +51,11 @@ type System struct {
 	Scheduler *scheduler.Scheduler
 	Namespace *ninep.Server
 	DataPlane *dataplane.Server
+	// Site is the intra-site domain the mesh fabric and its capability-scoped
+	// services (shard placement, audio sessions) were composed with. The RPC layer
+	// reads it to mint session capabilities against the right per-site resource
+	// (e.g. mesh.AudioResource(Site)) so the serving peer's gate accepts them.
+	Site string
 	// NinePAddr is the 9P2000.L wire server's listen address (control plane).
 	NinePAddr string
 	// DataPlaneAddr is the QUIC data-plane receiver's listen address (bulk bytes).
@@ -285,6 +291,24 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	fab.ServeShards(NewLocalShardServer(localShards), mesh.SelfIssuerResolver, func() int64 { return time.Now().Unix() }, nil)
 	scatterShards := NewRemoteScatterShardStore(localShards, fab, shardSigner, site)
 
+	// Cross-node real-time audio (mic/speaker sharing): serve the responder side of
+	// a capability-gated mesh audio session (daemon/mesh/audio.go). A remote peer
+	// that presents a valid signed capability over mesh.AudioResource(site) can
+	// PLAY into THIS node's live speaker (RightWrite) or MONITOR THIS node's live
+	// microphone (RightRead); the gate is verified — self-issued, stream-bound via
+	// mesh.SelfIssuerResolver, exactly like ServeShards above — before any audio
+	// device is opened. The live backends are daemon/audio's WASAPI Source/Sink
+	// (real on Windows; documented stubs elsewhere), so on a machine with no real
+	// backend the session opens, authorizes, then fails loudly on device open
+	// rather than faking audio. The requester side (`cerberus audio play/monitor
+	// --on <peer>`) is driven from the daemon RPC via fab.OpenAudioSession.
+	fab.ServeAudio(
+		audiolink.NewLiveMeshAudioServer(audiolink.DefaultFormat, audio.ReceiverConfig{}),
+		mesh.SelfIssuerResolver,
+		func() int64 { return time.Now().Unix() },
+		nil,
+	)
+
 	fsStore, err := newDFSFSStore(dp, router, scatterShards, meta)
 	if err != nil {
 		return nil, fmt.Errorf("dfs fs store: %w", err)
@@ -362,6 +386,7 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 		Scheduler:     sched,
 		Namespace:     ns,
 		DataPlane:     dp,
+		Site:          site,
 		NinePAddr:     nineLn.Addr().String(),
 		DataPlaneAddr: dp.Addr(),
 		AudioDevices:  audioDevices,

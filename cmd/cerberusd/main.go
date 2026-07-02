@@ -33,8 +33,8 @@ import (
 	"github.com/hash066/cerberus/daemon/store"
 	"github.com/hash066/cerberus/daemon/system"
 	"github.com/hash066/cerberus/daemon/wasm"
-	"github.com/libp2p/go-libp2p/core/peer"
 	e2enode "github.com/hash066/cerberus/test/e2e/node"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // rerouter is the slice of the scheduler the lid-drop coordinator needs. Declared
@@ -191,12 +191,14 @@ func main() {
 	var sched *scheduler.Scheduler // the live placement brain
 	var devices []deviceInfo       // the 9P devices Compose registered (for `cerberus devices`)
 	var fsSurface fsBackend        // /cer/fs put/get/ls surface (nil if compose failed)
+	var meshSite string            // the intra-site domain the fabric was composed with (for audio-session caps)
 	if sys, serr := system.Compose(ctx, k, "local", db); serr != nil {
 		log.Printf("cerberusd: compose system failed: %v", serr)
 	} else {
 		fabric = sys.Fabric
 		sched = sys.Scheduler
 		fsSurface = sys
+		meshSite = sys.Site
 		if mf, ok := sys.Fabric.(*mesh.Fabric); ok {
 			meshFabric = mf
 			// Surface this node's dialable multiaddrs so an operator can hand one
@@ -361,9 +363,9 @@ func main() {
 	// Start the status API the desktop tray/dashboard consumes (token-gated).
 	started := time.Now()
 	apiSrv := api.NewWithGetters(issuer, api.Getters{
-		Version: func() string { return contract.ContractVersion },
-		Profile: func() string { return *profile },
-		Kernel:  func() string { return ffi.Backend() },
+		Version:   func() string { return contract.ContractVersion },
+		Profile:   func() string { return *profile },
+		Kernel:    func() string { return ffi.Backend() },
 		UptimeSec: func() int64 { return int64(time.Since(started).Seconds()) },
 		MeshUp:    func() bool { return fabric != nil },
 		Peers: func() []string {
@@ -554,6 +556,7 @@ func main() {
 		devices:   devices,
 		caps:      caps,
 		wlog:      wlog,
+		site:      meshSite,
 		profile:   *profile,
 		kernel:    ffi.Backend(),
 		started:   started,

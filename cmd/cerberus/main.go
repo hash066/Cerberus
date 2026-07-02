@@ -15,7 +15,7 @@
 //	components add|list            local named-component registry (name -> CID)
 //	fs put|get|ls                  distributed filesystem (erasure-coded, mesh-scattered)
 //	gpu <kernel> …                 GPU/CPU compute dispatch (real GPU under -tags ffi)
-//	audio loopback …               real-time audio session over the QUIC data plane
+//	audio loopback|play|monitor …  real-time audio: local data-plane loopback, or cross-node mic/speaker sharing
 //	conflicts assert|list|resolve … CRDT belief assertion / conflict inspection / resolution
 //	economy challenge …             dispute a pending settlement with a fraud proof
 //	metrics                         fetch the local Prometheus /metrics text
@@ -39,10 +39,10 @@ import (
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
-	"github.com/hash066/cerberus/daemon/gpu"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/components"
 	"github.com/hash066/cerberus/daemon/discovery"
+	"github.com/hash066/cerberus/daemon/gpu"
 	"github.com/hash066/cerberus/daemon/store"
 )
 
@@ -207,6 +207,8 @@ Commands:
   fs ls                               List files stored in /cer/fs
   gpu <kernel> <a> [b] [--param N]    Run a compute kernel (vector-add|saxpy|scalar-mul); reports backend
   audio loopback [--freq HZ] [--frames N]  Run a real audio session over the QUIC data plane; report delivery
+  audio play --on <peerHexID>          Capture this node's mic and stream it to the PEER's speaker (mesh)
+  audio monitor --on <peerHexID>       Play the PEER's mic on this node's speaker (mesh)
   conflicts assert <subject> <value> --agent <name> [--doc <hex>]
                                        Assert an agent belief; concurrent contradictory asserts surface a conflict
   conflicts list [--doc <hex>]        Open CRDT belief conflicts
@@ -643,15 +645,82 @@ func cmdComponents(args []string, jsonOut bool) int {
 	}
 }
 
-
 // ---- audio (real-time session over the data plane) ------------------------
 
 func cmdAudio(args []string, jsonOut bool) int {
-	if len(args) == 0 || args[0] != "loopback" {
-		fmt.Fprintln(os.Stderr, "usage: cerberus audio loopback [--freq HZ] [--frames N]")
-		fmt.Fprintln(os.Stderr, "  runs a real audio session over the QUIC data plane and reports delivery")
+	if len(args) == 0 {
+		audioUsage()
 		return exitUsage
 	}
+	switch args[0] {
+	case "loopback":
+		return cmdAudioLoopback(args, jsonOut)
+	case "play":
+		return cmdAudioSession(args, jsonOut, false)
+	case "monitor":
+		return cmdAudioSession(args, jsonOut, true)
+	default:
+		audioUsage()
+		return exitUsage
+	}
+}
+
+func audioUsage() {
+	fmt.Fprintln(os.Stderr, "usage: cerberus audio <loopback|play|monitor> [flags]")
+	fmt.Fprintln(os.Stderr, "  loopback [--freq HZ] [--frames N]  run a local audio session over the QUIC data plane (no hardware needed)")
+	fmt.Fprintln(os.Stderr, "  play    --on <peerHexID>           capture THIS node's mic and stream it to the PEER's speaker")
+	fmt.Fprintln(os.Stderr, "  monitor --on <peerHexID>           play the PEER's mic on THIS node's speaker")
+}
+
+// cmdAudioSession drives a cross-node mic/speaker session: `audio play --on
+// <peer>` (our mic → peer's speaker) or `audio monitor --on <peer>` (peer's mic →
+// our speaker). It blocks for the life of the session. Real audio hardware
+// (WASAPI on Windows) is required on BOTH nodes to actually hear anything; on a
+// machine without a real backend the daemon authorizes the session and then
+// reports a clear device-unavailable error rather than faking audio.
+func cmdAudioSession(args []string, jsonOut bool, monitor bool) int {
+	verb := args[0]
+	rest := args[1:]
+	on, _ := extractValueFlag(rest, "--on")
+	if on == "" {
+		fmt.Fprintf(os.Stderr, "usage: cerberus audio %s --on <peerHexID>\n", verb)
+		return exitUsage
+	}
+
+	token, code := loadToken()
+	if code != exitOK {
+		return code
+	}
+	client, code := dial()
+	if code != exitOK {
+		return code
+	}
+	defer client.Close()
+
+	req := &AudioSessionRequest{Token: token, On: on, Monitor: monitor}
+	method := "DaemonRPC.AudioPlay"
+	if monitor {
+		method = "DaemonRPC.AudioMonitor"
+	}
+	if !jsonOut {
+		if monitor {
+			fmt.Printf("Monitoring peer %s microphone on this node's speaker (Ctrl-C to stop)...\n", short(on))
+		} else {
+			fmt.Printf("Streaming this node's microphone to peer %s speaker (Ctrl-C to stop)...\n", short(on))
+		}
+	}
+	var resp AudioSessionResponse
+	if err := client.Call(method, req, &resp); err != nil {
+		return rpcErr("audio "+verb, err)
+	}
+	if jsonOut {
+		return printJSON(resp)
+	}
+	fmt.Printf("Audio %s session with peer %s over %s ended.\n", resp.Direction, short(resp.Peer), resp.Backend)
+	return exitOK
+}
+
+func cmdAudioLoopback(args []string, jsonOut bool) int {
 	rest := args[1:]
 	freqStr, rest := extractValueFlag(rest, "--freq")
 	framesStr, _ := extractValueFlag(rest, "--frames")

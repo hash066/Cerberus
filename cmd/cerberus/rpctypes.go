@@ -191,6 +191,18 @@ type AudioLoopbackResponse struct {
 	Backend    string
 }
 
+// cross-node audio (mic/speaker sharing over the mesh)
+type AudioSessionRequest struct {
+	Token   string
+	On      string
+	Monitor bool
+}
+type AudioSessionResponse struct {
+	Peer      string
+	Direction string
+	Backend   string
+}
+
 // gpu (compute dispatch)
 type GpuDispatchRequest struct {
 	Token  string

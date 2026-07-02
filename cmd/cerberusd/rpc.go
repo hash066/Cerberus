@@ -26,6 +26,7 @@ import (
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/api"
+	"github.com/hash066/cerberus/daemon/audio"
 	"github.com/hash066/cerberus/daemon/audiolink"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/economy"
@@ -109,6 +110,12 @@ type DaemonRPC struct {
 	devices []deviceInfo
 	caps    *capRegistry
 	wlog    *workloadLog // recent workload dispatch history for `cerberus workloads` / /api/v1/workloads; nil-safe
+
+	// site is the mesh intra-site domain the fabric was composed with. Cross-node
+	// audio sessions mint their signed capability against mesh.AudioResource(site),
+	// so it must match the site the serving peer's ServeAudio gate uses (both come
+	// from the same system.Compose site value). Empty falls back to "local".
+	site string
 
 	profile string
 	kernel  string
@@ -361,7 +368,7 @@ func (d *DaemonRPC) Devices(req *DevicesRequest, resp *DevicesResponse) error {
 type WalletRequest struct {
 	Token string
 	Owner string // empty => the caller's subject, then "operator"
-	Limit int     // max recent transactions to return; <=0 => a sensible default
+	Limit int    // max recent transactions to return; <=0 => a sensible default
 }
 
 // WalletTx is one recorded compute transaction (from the ledger's append-only
@@ -569,6 +576,106 @@ func (d *DaemonRPC) AudioLoopback(req *AudioLoopbackRequest, resp *AudioLoopback
 	resp.FreqHz = stats.FreqHz
 	resp.DurationMS = stats.Duration.Milliseconds()
 	resp.Backend = stats.Backend
+	return nil
+}
+
+// ---- cross-node audio (mic/speaker sharing over the mesh) ------------------
+
+type AudioSessionRequest struct {
+	Token string
+	// On is the hex Ed25519 PeerID of the mesh peer to open the session with.
+	On string
+	// Monitor selects the direction: false => PLAY (capture THIS node's mic and
+	// stream it to the peer's speaker); true => MONITOR (play the PEER's mic on
+	// THIS node's speaker).
+	Monitor bool
+}
+type AudioSessionResponse struct {
+	Peer      string // the peer the session ran with
+	Direction string // "play" or "monitor"
+	Backend   string // the transport the media rode ("mesh-quic")
+}
+
+// AudioPlay captures THIS node's microphone and streams it to a mesh PEER's
+// speaker in real time (`cerberus audio play --on <peer>`). It mints a fresh
+// signed capability (RightWrite over mesh.AudioResource(site)) keyed to this
+// node's own mesh identity — the self-issued, stream-bound authority the peer's
+// ServeAudio gate verifies — then opens the capability-gated mesh audio session
+// and drives the local mic Source onto it. Requires exec (it runs a live
+// streaming session). Blocks until the session ends (mic drains / peer
+// disconnects) or errors.
+func (d *DaemonRPC) AudioPlay(req *AudioSessionRequest, resp *AudioSessionResponse) error {
+	return d.audioSession(&AudioSessionRequest{Token: req.Token, On: req.On, Monitor: false}, resp)
+}
+
+// AudioMonitor plays a mesh PEER's microphone on THIS node's speaker in real
+// time (`cerberus audio monitor --on <peer>`). It mints a fresh signed capability
+// (RightRead over mesh.AudioResource(site)) and opens the gated mesh audio
+// session in the MONITOR direction. Requires exec. Blocks until the session ends.
+func (d *DaemonRPC) AudioMonitor(req *AudioSessionRequest, resp *AudioSessionResponse) error {
+	return d.audioSession(&AudioSessionRequest{Token: req.Token, On: req.On, Monitor: true}, resp)
+}
+
+// audioSession is the shared body of AudioPlay/AudioMonitor: authorize, resolve
+// the peer, mint the direction-scoped signed capability, and drive the session.
+func (d *DaemonRPC) audioSession(req *AudioSessionRequest, resp *AudioSessionResponse) error {
+	if _, err := d.authz.Authorize(req.Token, "exec", ""); err != nil {
+		return fmt.Errorf("unauthorized (audio session requires exec): %w", err)
+	}
+	if d.fabric == nil {
+		return fmt.Errorf("audio session: mesh not composed on this daemon")
+	}
+	if strings.TrimSpace(req.On) == "" {
+		return fmt.Errorf("audio session: --on <peer> is required (the peer to share audio with)")
+	}
+	peer, perr := parsePeerID(req.On)
+	if perr != nil {
+		return fmt.Errorf("audio session --on: %w", perr)
+	}
+
+	dir := mesh.AudioDirPlay
+	right := contract.RightWrite
+	if req.Monitor {
+		dir = mesh.AudioDirMonitor
+		right = contract.RightRead
+	}
+
+	// Mint the session capability, self-signed by this node's mesh identity so the
+	// issuer PeerID equals the PeerID the peer's QUIC/TLS handshake authenticates
+	// for our outbound stream — the self-issuer trust model mesh.SelfIssuerResolver
+	// enforces on the serving side (mirrors the shard-cap signer in daemon/system).
+	signer, err := audiolink.NewAudioCapSigner(d.fabric.Identity())
+	if err != nil {
+		return fmt.Errorf("audio session: build cap signer: %w", err)
+	}
+	issuerID, err := signer.IssuerPeerID()
+	if err != nil {
+		return fmt.Errorf("audio session: resolve issuer id: %w", err)
+	}
+	site := d.site
+	if site == "" {
+		site = "local"
+	}
+	grant, err := auth.NewGrant(mesh.AudioResource(site), []contract.Right{right}, nil, time.Hour)
+	if err != nil {
+		return fmt.Errorf("audio session: build grant: %w", err)
+	}
+	env, err := signer.Issue(grant)
+	if err != nil {
+		return fmt.Errorf("audio session: sign cap: %w", err)
+	}
+
+	// Live requester-side backends: our real mic (for PLAY) and speaker (for
+	// MONITOR). On a machine with no real backend, OpenAudioSession authorizes and
+	// then fails loudly on device open rather than streaming fake audio.
+	client := audiolink.NewLiveMeshAudioClient(audiolink.DefaultFormat, audio.ReceiverConfig{})
+
+	if err := d.fabric.OpenAudioSession(peer, dir, client, env, issuerID); err != nil {
+		return fmt.Errorf("audio %s --on %s: %w", dir, short(req.On), err)
+	}
+	resp.Peer = req.On
+	resp.Direction = string(dir)
+	resp.Backend = "mesh-quic"
 	return nil
 }
 

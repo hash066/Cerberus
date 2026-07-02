@@ -10,6 +10,13 @@
 // such transfer, whose payload is the audio packet stream length-framed by
 // audio.SendTransport / audio.RecvTransport. Media bytes thus flow on the data
 // plane and never traverse the 9P control plane.
+//
+// This package also carries the CROSS-NODE mic/speaker-sharing path (xnode.go):
+// the same packetization core (SendStream / SinkStream) rides a capability-gated
+// libp2p/QUIC mesh session (daemon/mesh's ServeAudio / OpenAudioSession) so two
+// people on the mesh can share audio using only a peer's PeerID. daemon/mesh
+// stays a leaf w.r.t. audio — it declares AudioServer/AudioClient interfaces and
+// this package implements them against daemon/audio's real WASAPI backends.
 package audiolink
 
 import (
@@ -59,10 +66,39 @@ func Send(ctx context.Context, client *dataplane.Client, ep dataplane.Endpoint, 
 // DLL, and writes reconstructed frames to dst until the transfer ends.
 func Sink(dst audio.Sink, cfg audio.ReceiverConfig) dataplane.Sink {
 	return func(_ uint64, r io.Reader) error {
-		rx := audio.NewReceiver(audio.NewRecvTransport(r), dst, cfg)
-		if err := rx.Run(context.Background()); err != nil && !errors.Is(err, io.EOF) {
-			return err
-		}
-		return nil
+		return SinkStream(context.Background(), r, dst, cfg)
 	}
+}
+
+// SendStream is the transport-agnostic core of Send: it packetizes src with an
+// audio.Sender and length-frames the packets onto w (any io.Writer). It returns
+// when the Source drains (clean nil), ctx is cancelled, or the write errors.
+//
+// Unlike Send (which owns a data-plane transfer), SendStream writes directly to
+// a caller-provided byte pipe — e.g. a libp2p/QUIC mesh stream (an
+// io.ReadWriteCloser) — so a cross-node audio session can ride the same
+// authenticated mesh transport the control plane uses, not only the raw data
+// plane. Both paths share this one packetization core, so the wire format is
+// identical regardless of which transport carries it.
+func SendStream(ctx context.Context, w io.Writer, src audio.Source) error {
+	sender := audio.NewSender(src, audio.NewSendTransport(w))
+	if err := sender.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
+// SinkStream is the transport-agnostic core of Sink: it deframes packets read
+// from r (any io.Reader), runs them through the jitter buffer / DLL, and writes
+// reconstructed frames to dst until the stream ends (io.EOF is a clean end).
+//
+// It is the receive-side counterpart to SendStream: a cross-node session hands
+// it a mesh stream and a LIVE speaker Sink (daemon/audio's WASAPI render backend)
+// so a peer's captured audio is played here in real time.
+func SinkStream(ctx context.Context, r io.Reader, dst audio.Sink, cfg audio.ReceiverConfig) error {
+	rx := audio.NewReceiver(audio.NewRecvTransport(r), dst, cfg)
+	if err := rx.Run(ctx); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
 }
