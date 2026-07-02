@@ -9,7 +9,15 @@
 Everything below this section (the original doc) was written before the "v3" integration wave (signed capability envelopes on the wire, tray dashboard rewrite, `/cer/fs` wired into 9P) and before the segment described here. Where the two disagree, **trust this section**. The old content below is still useful for deep historical/phase context (E/F/G/H roadmap reasoning) — just don't treat its "Reality matrix" or "Phase E roadmap" tables as current without cross-checking against this update.
 
 ### Current repo state (verified 2026-07-02)
-- Branch `integration`, HEAD `390c5bd`. `main` is kept in sync (fast-forwarded to the same HEAD). **CI on `390c5bd` is green** (run conclusion = success; the only red job is `golangci-lint`, which is intentionally `continue-on-error`). See "Production hardening — Phase 0" just below for what landed, and "CI restored to green" further down for the earlier green-restore work.
+- Branch `integration`, HEAD `0e9f43a`. `main` kept in sync. CI green (only the advisory `golangci-lint` red). See "Beta-ready track" immediately below, then "Phase 1"/"Phase 0" for prior work.
+
+### Beta-ready track — in progress (2026-07-02)
+Phase 1 security lanes (DoS/quota, threat model, lint) PAUSED per user; priority pivoted to proving multi-machine + removing beta-tester friction.
+- **Multi-machine PROVEN** ✅ (`e0e4ca0`): the composed daemon bound loopback-only, so it was unreachable cross-host (the real DOA blocker — NOT the non-fatal libp2p "Failed to set multicast interface" mDNS warning). Now binds `0.0.0.0` (`CERBERUS_MESH_LISTEN`; cmd/cerberusd default `--mesh-listen /ip4/0.0.0.0/udp/0/quic-v1`), logs dialable multiaddrs, and adds `--peer <multiaddr>` bootstrap for cross-network. Live-proven on one box: node B `--peer`'d node A's routable `192.168.0.100` addr, `bootstrap-connected`, both report peers. Same-LAN = mDNS auto; cross-network = Tailscale + `--peer`.
+- **Installers** ✅ (`0e9f43a`): unsigned Windows `.msi` (3.4 MB) + NSIS `.exe` (2.2 MB) build via `cd tray && npm run tauri build`; `release.yml` `desktop` job builds all-OS (`.msi/.exe/.dmg/.deb/.AppImage`) and attaches to the draft release.
+- **Wolf brand mark** ✅ (`0e9f43a`): replaced the "C" logo with `tray/src/assets/wolf.svg` in the app + mock; web dashboard uses it too.
+- **Web dashboard** (in progress, agent): minimalistic Docker-style static site under `web/` — per-OS install + docs (pairing/Tailscale, security model).
+- **BIGGEST remaining friction gap**: the installer ships the tray UI ONLY; `cerberusd` must run separately (tray errors "is cerberusd running?"). For true one-click, bundle `cerberusd` as a Tauri sidecar (`bundle.externalBin` / a `resource`) and auto-spawn it from `tray/src-tauri/src/lib.rs` on startup (kill on exit); the `release.yml` desktop job must build+place `cerberusd` per target-triple before `tauri build`. **This is the #1 next beta task.**
 
 ### Production hardening — Phase 0 done (2026-07-02)
 The user wants Cerberus to become a real production product, not a dev preview. An approved plan (5 phases, LAN-trusted v1, frontier features kept experimental/off, economy credits-only) drives this; **Phase 0 (foundations & hard CI gates) is complete**:
