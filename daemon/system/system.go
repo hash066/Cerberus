@@ -23,6 +23,21 @@ import (
 	"github.com/hash066/cerberus/daemon/telemetry"
 )
 
+// meshListenAddrs is the QUIC listen multiaddr for the mesh fabric.
+//
+// It defaults to LOOPBACK so unit tests (which Compose many fabrics in one
+// process / one LAN) stay isolated and never auto-discover each other or a real
+// daemon. cmd/cerberusd sets CERBERUS_MESH_LISTEN to /ip4/0.0.0.0/... so the
+// SHIPPING daemon binds all interfaces and is reachable from other machines
+// (LAN, or a Tailscale/WireGuard overlay) — the previous loopback-only default
+// made cross-machine mesh impossible even though mDNS discovery ran.
+func meshListenAddrs() []string {
+	if v := os.Getenv("CERBERUS_MESH_LISTEN"); v != "" {
+		return []string{v}
+	}
+	return []string{"/ip4/127.0.0.1/udp/0/quic-v1"}
+}
+
 // runFunc adapts a Serve-style function into a supervised service.
 type runFunc func(context.Context) error
 
@@ -110,7 +125,7 @@ func registerAudioDevices(ns *ninep.Server) []DeviceRef {
 // the live daemon always passes its real store.
 func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *store.Store) (*System, error) {
 	// Real intra-site mesh: libp2p + QUIC + mDNS, capability-gated.
-	fab, err := mesh.New(ctx, mesh.Config{Site: site, Kernel: kernel, EnableMDNS: true})
+	fab, err := mesh.New(ctx, mesh.Config{Site: site, Kernel: kernel, EnableMDNS: true, ListenAddrs: meshListenAddrs()})
 	if err != nil {
 		return nil, fmt.Errorf("mesh: %w", err)
 	}

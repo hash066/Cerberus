@@ -33,6 +33,7 @@ import (
 	"github.com/hash066/cerberus/daemon/store"
 	"github.com/hash066/cerberus/daemon/system"
 	"github.com/hash066/cerberus/daemon/wasm"
+	"github.com/libp2p/go-libp2p/core/peer"
 	e2enode "github.com/hash066/cerberus/test/e2e/node"
 )
 
@@ -89,7 +90,18 @@ func main() {
 	apiAddr := flag.String("api-addr", "127.0.0.1:7777", "status API listen address")
 	metricsAddr := flag.String("metrics-addr", "127.0.0.1:7779", "metrics/health listen address")
 	rpcAddr := flag.String("rpc-addr", "127.0.0.1:9092", "control-plane RPC listen address")
+	meshListen := flag.String("mesh-listen", "/ip4/0.0.0.0/udp/0/quic-v1",
+		"mesh QUIC listen multiaddr; 0.0.0.0 makes this node reachable from other machines (LAN or a Tailscale/WireGuard overlay). Use a fixed udp port to pin a firewall rule.")
+	peers := flag.String("peer", "",
+		"comma-separated peer multiaddrs to bootstrap-connect at startup (e.g. /ip4/100.x.y.z/udp/PORT/quic-v1/p2p/12D3Koo...). Use across networks where mDNS can't reach, e.g. over a Tailscale tunnel.")
 	flag.Parse()
+
+	// The composed mesh reads its listen address from this env (see
+	// daemon/system.meshListenAddrs); setting it here binds the shipping daemon to
+	// a routable address while unit tests keep the loopback default.
+	if *meshListen != "" {
+		_ = os.Setenv("CERBERUS_MESH_LISTEN", *meshListen)
+	}
 
 	if *e2eNode {
 		if err := e2enode.Run(context.Background(), e2enode.Config{
@@ -185,6 +197,30 @@ func main() {
 		sched = sys.Scheduler
 		if mf, ok := sys.Fabric.(*mesh.Fabric); ok {
 			meshFabric = mf
+			// Surface this node's dialable multiaddrs so an operator can hand one
+			// to another machine for explicit pairing (copy-paste bootstrap).
+			for _, a := range meshFabric.DialableAddrs() {
+				log.Printf("mesh: dialable at %s", a)
+			}
+			// Bootstrap-connect explicit peers: mDNS auto-discovers the LAN, this
+			// covers cross-network peers reachable over an overlay (e.g. Tailscale).
+			for _, p := range strings.Split(*peers, ",") {
+				if p = strings.TrimSpace(p); p == "" {
+					continue
+				}
+				ai, perr := peer.AddrInfoFromString(p)
+				if perr != nil {
+					log.Printf("mesh: ignoring bad --peer %q: %v", p, perr)
+					continue
+				}
+				cctx, ccancel := context.WithTimeout(ctx, 10*time.Second)
+				if cerr := meshFabric.Connect(cctx, *ai); cerr != nil {
+					log.Printf("mesh: bootstrap-connect %s failed: %v", p, cerr)
+				} else {
+					log.Printf("mesh: bootstrap-connected to %s", p)
+				}
+				ccancel()
+			}
 		}
 		// Mirror the devices system.Compose registers in the 9P namespace so the
 		// CLI (and the status API's /api/v1/devices route) can enumerate them
