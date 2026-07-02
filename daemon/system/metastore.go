@@ -12,6 +12,7 @@ package system
 
 import (
 	"encoding/json"
+	"sort"
 	"sync"
 
 	"github.com/hash066/cerberus/daemon/dfs"
@@ -75,6 +76,19 @@ func (b *BoltMetaStore) Get(path string) (dfs.Manifest, bool) {
 		return dfs.Manifest{}, false
 	}
 	return man, true
+}
+
+// List returns every stored /cer/fs path in deterministic (sorted) order,
+// reading the metadata bucket's keys directly from the store.
+func (b *BoltMetaStore) List() ([]string, error) {
+	b.mu.Lock()
+	keys, err := b.s.Keys(metaBucket)
+	b.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
 
 var _ MetaStore = (*BoltMetaStore)(nil)

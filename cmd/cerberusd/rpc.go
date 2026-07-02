@@ -101,7 +101,8 @@ type DaemonRPC struct {
 	settler   *economy.Settler // optimistic compute-settlement layer wrapping ledger
 	crdt      *state.Engine
 	metrics   *metrics.Metrics
-	daemonDoc []byte // the CRDT doc id the daemon checkpoints belief state under
+	fs        fsBackend // /cer/fs distributed filesystem surface; nil if system compose failed
+	daemonDoc []byte    // the CRDT doc id the daemon checkpoints belief state under
 
 	devices []deviceInfo
 	caps    *capRegistry
@@ -436,6 +437,94 @@ func (d *DaemonRPC) Wallet(req *WalletRequest, resp *WalletResponse) error {
 			}
 		}
 	}
+	return nil
+}
+
+// ---- /cer/fs (distributed filesystem) -------------------------------------
+
+// fsBackend is the daemon's /cer/fs surface the RPC borrows (implemented by
+// *daemon/system.System). Kept as a narrow interface so the RPC does not depend
+// on the whole System, and so a compose failure (fs == nil) degrades to a clean
+// "not available" instead of a panic.
+type fsBackend interface {
+	FSPut(path string, data []byte) error
+	FSGet(path string) ([]byte, error)
+	FSList() ([]string, error)
+}
+
+type FSPutRequest struct {
+	Token string
+	Path  string
+	Data  []byte
+}
+type FSPutResponse struct {
+	Path  string
+	Bytes int
+}
+type FSGetRequest struct {
+	Token string
+	Path  string
+}
+type FSGetResponse struct {
+	Path string
+	Data []byte
+}
+type FSListRequest struct{ Token string }
+type FSListResponse struct{ Paths []string }
+
+// FSPut stores bytes as a file in the distributed filesystem: the dfs engine
+// erasure-codes them and scatters the shards across mesh peers, and the Manifest
+// is recorded under Path. Requires write.
+func (d *DaemonRPC) FSPut(req *FSPutRequest, resp *FSPutResponse) error {
+	if _, err := d.authz.Authorize(req.Token, "write", ""); err != nil {
+		return fmt.Errorf("unauthorized (fs put requires write): %w", err)
+	}
+	if d.fs == nil {
+		return fmt.Errorf("fs: /cer/fs not available (system did not compose)")
+	}
+	if strings.TrimSpace(req.Path) == "" {
+		return fmt.Errorf("fs put: path required")
+	}
+	if err := d.fs.FSPut(req.Path, req.Data); err != nil {
+		return err
+	}
+	resp.Path = req.Path
+	resp.Bytes = len(req.Data)
+	return nil
+}
+
+// FSGet reconstructs and returns a file's bytes from the distributed filesystem
+// (fetching shards from peers as needed, integrity-checked). Requires read.
+func (d *DaemonRPC) FSGet(req *FSGetRequest, resp *FSGetResponse) error {
+	if _, err := d.authz.Authorize(req.Token, "read", ""); err != nil {
+		return fmt.Errorf("unauthorized: %w", err)
+	}
+	if d.fs == nil {
+		return fmt.Errorf("fs: /cer/fs not available (system did not compose)")
+	}
+	data, err := d.fs.FSGet(req.Path)
+	if err != nil {
+		return err
+	}
+	resp.Path = req.Path
+	resp.Data = data
+	return nil
+}
+
+// FSList returns the paths of files stored in the distributed filesystem.
+// Requires read.
+func (d *DaemonRPC) FSList(req *FSListRequest, resp *FSListResponse) error {
+	if _, err := d.authz.Authorize(req.Token, "read", ""); err != nil {
+		return fmt.Errorf("unauthorized: %w", err)
+	}
+	if d.fs == nil {
+		return fmt.Errorf("fs: /cer/fs not available (system did not compose)")
+	}
+	paths, err := d.fs.FSList()
+	if err != nil {
+		return err
+	}
+	resp.Paths = paths
 	return nil
 }
 

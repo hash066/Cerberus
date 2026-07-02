@@ -175,6 +175,27 @@ type AssertBeliefResponse struct {
 	Values   []string
 }
 
+// /cer/fs (distributed filesystem)
+type FSPutRequest struct {
+	Token string
+	Path  string
+	Data  []byte
+}
+type FSPutResponse struct {
+	Path  string
+	Bytes int
+}
+type FSGetRequest struct {
+	Token string
+	Path  string
+}
+type FSGetResponse struct {
+	Path string
+	Data []byte
+}
+type FSListRequest struct{ Token string }
+type FSListResponse struct{ Paths []string }
+
 // economy challenge
 type EconomyChallengeRequest struct {
 	Token            string

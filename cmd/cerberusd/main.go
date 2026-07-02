@@ -190,11 +190,13 @@ func main() {
 	var meshFabric *mesh.Fabric    // concrete type for RequestCompute / PeerID
 	var sched *scheduler.Scheduler // the live placement brain
 	var devices []deviceInfo       // the 9P devices Compose registered (for `cerberus devices`)
+	var fsSurface fsBackend        // /cer/fs put/get/ls surface (nil if compose failed)
 	if sys, serr := system.Compose(ctx, k, "local", db); serr != nil {
 		log.Printf("cerberusd: compose system failed: %v", serr)
 	} else {
 		fabric = sys.Fabric
 		sched = sys.Scheduler
+		fsSurface = sys
 		if mf, ok := sys.Fabric.(*mesh.Fabric); ok {
 			meshFabric = mf
 			// Surface this node's dialable multiaddrs so an operator can hand one
@@ -547,6 +549,7 @@ func main() {
 		settler:   settler,
 		crdt:      crdtEngine,
 		metrics:   met,
+		fs:        fsSurface,
 		daemonDoc: []byte("daemon-doc"),
 		devices:   devices,
 		caps:      caps,

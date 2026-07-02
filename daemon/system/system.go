@@ -91,6 +91,16 @@ type DeviceRef struct {
 // It never fails Compose: an enumeration error (or zero endpoints) just means
 // zero audio devices are registered, exactly like a machine with no
 // microphone plugged in — maturity honesty, not a hard dependency.
+//
+// DOCUMENTED STUB — cross-node audio SESSIONS are not composed here. This
+// registers/discovers audio endpoints (so they list in `cerberus devices` and
+// are capability-grantable), and the streaming transport exists as a tested
+// library (daemon/audiolink over the QUIC data plane). But nothing in the
+// running daemon starts a live remote capture→stream→playback session, and
+// there is no CLI/API verb to do so. Wiring a real audio session (device
+// capture/playback + session control + jitter handling end-to-end over the
+// mesh) is a substantial follow-up, not implemented. Do not present remote
+// audio as working (ARCHITECTURE.md §8 maturity honesty).
 func registerAudioDevices(ns *ninep.Server) []DeviceRef {
 	endpoints, err := audio.EnumerateEndpoints()
 	if err != nil {
@@ -205,6 +215,17 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	router := newSinkRouter()
 
 	// 9P capability namespace with a sample local VRAM device.
+	//
+	// DOCUMENTED STUB — GPU COMPUTE DISPATCH is not implemented. This registers a
+	// VRAM resource (a quota-bearing, capability-grantable namespace entry, so it
+	// lists in `cerberus devices` and opening its ctl mints a data-plane grant),
+	// but there is NO GPU compute backend anywhere in the daemon: no wgpu/CUDA
+	// binding, and the scheduler has no GPU dispatch path — a task never runs on a
+	// GPU. Remote GPU compute is Frontier (ARCHITECTURE.md §8); wiring a real
+	// backend (device enumeration, kernel upload, VRAM-quota-enforced execution,
+	// result readback over the data plane) is a from-scratch effort. Do not
+	// present GPU offload as working. (Real cross-node compute today is WASM/CPU:
+	// `cerberus run --on <peer>`.)
 	ns := ninep.New(kernel)
 	q := contract.Quota{Bytes: 2 * 1024 * 1024 * 1024}
 	ns.Register("/cer/dev/vram/local/0",

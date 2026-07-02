@@ -13,6 +13,7 @@
 //	wallet [owner]                  compute-credit balance from the durable ledger
 //	caps mint|attenuate|revoke|list capability-token lifecycle
 //	components add|list            local named-component registry (name -> CID)
+//	fs put|get|ls                  distributed filesystem (erasure-coded, mesh-scattered)
 //	conflicts assert|list|resolve … CRDT belief assertion / conflict inspection / resolution
 //	economy challenge …             dispute a pending settlement with a fraud proof
 //	metrics                         fetch the local Prometheus /metrics text
@@ -159,6 +160,8 @@ func run(args []string) int {
 		return cmdCaps(rest, jsonOut)
 	case "components":
 		return cmdComponents(rest, jsonOut)
+	case "fs":
+		return cmdFS(rest, jsonOut)
 	case "conflicts":
 		return cmdConflicts(rest, jsonOut)
 	case "economy":
@@ -192,6 +195,9 @@ Commands:
   caps list                           List tokens this daemon minted
   components add <name> <path.wasm>   Register a local component under a name
   components list                     List registered components (name, CID, size)
+  fs put <local-file> [/cer/fs/name]  Store a file in the distributed FS (erasure-coded, scattered)
+  fs get /cer/fs/name [local-file]    Reconstruct a stored file (to a file, or stdout)
+  fs ls                               List files stored in /cer/fs
   conflicts assert <subject> <value> --agent <name> [--doc <hex>]
                                        Assert an agent belief; concurrent contradictory asserts surface a conflict
   conflicts list [--doc <hex>]        Open CRDT belief conflicts
@@ -628,6 +634,99 @@ func cmdComponents(args []string, jsonOut bool) int {
 	}
 }
 
+
+// ---- /cer/fs (distributed filesystem: put / get / ls) ---------------------
+
+func cmdFS(args []string, jsonOut bool) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "fs: need a subcommand: put | get | ls")
+		return exitUsage
+	}
+	sub := args[0]
+	rest := args[1:]
+
+	token, code := loadToken()
+	if code != exitOK {
+		return code
+	}
+	client, code := dial()
+	if code != exitOK {
+		return code
+	}
+	defer client.Close()
+
+	switch sub {
+	case "put":
+		if len(rest) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: cerberus fs put <local-file> [/cer/fs/<name>]")
+			return exitUsage
+		}
+		local := rest[0]
+		data, err := os.ReadFile(local)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fs put: read %s: %v\n", local, err)
+			return exitErr
+		}
+		remote := "/cer/fs/" + filepath.Base(local)
+		if len(rest) > 1 {
+			remote = rest[1]
+		}
+		var resp FSPutResponse
+		if err := client.Call("DaemonRPC.FSPut", &FSPutRequest{Token: token, Path: remote, Data: data}, &resp); err != nil {
+			return rpcErr("fs put", err)
+		}
+		if jsonOut {
+			return printJSON(resp)
+		}
+		fmt.Printf("Stored %s (%d bytes) — erasure-coded into the distributed filesystem "+
+			"(shards placed across mesh peers when present, local-only on a solo node)\n", resp.Path, resp.Bytes)
+		return exitOK
+
+	case "get":
+		if len(rest) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: cerberus fs get /cer/fs/<name> [local-file]")
+			return exitUsage
+		}
+		remote := rest[0]
+		var resp FSGetResponse
+		if err := client.Call("DaemonRPC.FSGet", &FSGetRequest{Token: token, Path: remote}, &resp); err != nil {
+			return rpcErr("fs get", err)
+		}
+		if len(rest) > 1 {
+			out := rest[1]
+			if err := os.WriteFile(out, resp.Data, 0o644); err != nil {
+				fmt.Fprintf(os.Stderr, "fs get: write %s: %v\n", out, err)
+				return exitErr
+			}
+			fmt.Printf("Wrote %d bytes to %s\n", len(resp.Data), out)
+			return exitOK
+		}
+		os.Stdout.Write(resp.Data) // no local file given: stream to stdout
+		return exitOK
+
+	case "ls":
+		var resp FSListResponse
+		if err := client.Call("DaemonRPC.FSList", &FSListRequest{Token: token}, &resp); err != nil {
+			return rpcErr("fs ls", err)
+		}
+		if jsonOut {
+			return printJSON(resp)
+		}
+		if len(resp.Paths) == 0 {
+			fmt.Println("No files stored in /cer/fs yet (cerberus fs put <file> to store one).")
+			return exitOK
+		}
+		fmt.Printf("/cer/fs — %d file(s):\n", len(resp.Paths))
+		for _, p := range resp.Paths {
+			fmt.Printf("  %s\n", p)
+		}
+		return exitOK
+
+	default:
+		fmt.Fprintf(os.Stderr, "fs: unknown subcommand %q (put | get | ls)\n", sub)
+		return exitUsage
+	}
+}
 
 func cmdConflicts(args []string, jsonOut bool) int {
 	if len(args) == 0 {

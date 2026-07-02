@@ -262,3 +262,57 @@ func TestFSCaplessAccessDenied(t *testing.T) {
 		t.Fatal("read with a revoked capability must be denied")
 	}
 }
+
+// TestSystemFSPutGetListRoundTrip proves the synchronous operator FS surface
+// (`cerberus fs put/get/ls` → System.FS*) round-trips exact bytes through the
+// real dfs engine and lists stored paths — the whole-buffer sibling of the
+// data-plane streaming path exercised above.
+func TestSystemFSPutGetListRoundTrip(t *testing.T) {
+	fss, err := newDFSFSStore(nil, nil, nil, nil) // mem shard store + mem meta store
+	if err != nil {
+		t.Fatalf("new fs store: %v", err)
+	}
+	sys := &System{fsStore: fss}
+
+	if paths, err := sys.FSList(); err != nil || len(paths) != 0 {
+		t.Fatalf("expected empty fs, got %v (err %v)", paths, err)
+	}
+
+	data := []byte("hello distributed filesystem — the answer is 1337")
+	if err := sys.FSPut("/cer/fs/greeting.txt", data); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	got, err := sys.FSGet("/cer/fs/greeting.txt")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("round-trip mismatch:\n got %q\nwant %q", got, data)
+	}
+
+	paths, err := sys.FSList()
+	if err != nil || len(paths) != 1 || paths[0] != "/cer/fs/greeting.txt" {
+		t.Fatalf("ls: %v (err %v)", paths, err)
+	}
+
+	// A read of a never-written path errors — it does not fabricate bytes.
+	if _, err := sys.FSGet("/cer/fs/nope"); err == nil {
+		t.Fatal("expected an error reading an unknown path")
+	}
+}
+
+// TestSystemFSNilStoreIsCleanError proves a daemon whose system did not compose
+// (fsStore nil) reports a clean error rather than panicking.
+func TestSystemFSNilStoreIsCleanError(t *testing.T) {
+	sys := &System{}
+	if err := sys.FSPut("/x", []byte("a")); err == nil {
+		t.Fatal("FSPut with no store must error")
+	}
+	if _, err := sys.FSGet("/x"); err == nil {
+		t.Fatal("FSGet with no store must error")
+	}
+	if _, err := sys.FSList(); err == nil {
+		t.Fatal("FSList with no store must error")
+	}
+}

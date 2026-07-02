@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -581,5 +582,92 @@ func TestEconomyChallengeRequiresSpendRight(t *testing.T) {
 	}
 	if pend.State != ledger.ClaimPending {
 		t.Fatalf("settlement state = %s, want pending (unauthorized caller must not affect it)", pend.State)
+	}
+}
+
+// fakeFS is an in-memory fsBackend for exercising the FS RPC surface without a
+// composed System.
+type fakeFS struct{ files map[string][]byte }
+
+func (f *fakeFS) FSPut(path string, data []byte) error {
+	if f.files == nil {
+		f.files = map[string][]byte{}
+	}
+	f.files[path] = append([]byte(nil), data...)
+	return nil
+}
+func (f *fakeFS) FSGet(path string) ([]byte, error) {
+	b, ok := f.files[path]
+	if !ok {
+		return nil, errors.New("no such file")
+	}
+	return b, nil
+}
+func (f *fakeFS) FSList() ([]string, error) {
+	out := make([]string, 0, len(f.files))
+	for p := range f.files {
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// TestFSPutGetListRPC proves the /cer/fs RPC surface round-trips a file and lists
+// it (the transport for `cerberus fs put/get/ls`).
+func TestFSPutGetListRPC(t *testing.T) {
+	d, tok := testDaemon(t)
+	d.fs = &fakeFS{}
+
+	var put FSPutResponse
+	if err := d.FSPut(&FSPutRequest{Token: tok, Path: "/cer/fs/a.txt", Data: []byte("hi")}, &put); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if put.Bytes != 2 || put.Path != "/cer/fs/a.txt" {
+		t.Fatalf("put resp = %+v", put)
+	}
+
+	var get FSGetResponse
+	if err := d.FSGet(&FSGetRequest{Token: tok, Path: "/cer/fs/a.txt"}, &get); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(get.Data) != "hi" {
+		t.Fatalf("get data = %q, want hi", get.Data)
+	}
+
+	var ls FSListResponse
+	if err := d.FSList(&FSListRequest{Token: tok}, &ls); err != nil {
+		t.Fatalf("ls: %v", err)
+	}
+	if len(ls.Paths) != 1 || ls.Paths[0] != "/cer/fs/a.txt" {
+		t.Fatalf("ls = %v", ls.Paths)
+	}
+}
+
+// TestFSPutRequiresWrite proves fs put is write-gated while read-only tokens can
+// still list/read (no ambient authority; CLAUDE.md rule 5).
+func TestFSPutRequiresWrite(t *testing.T) {
+	d, _ := testDaemon(t)
+	d.fs = &fakeFS{}
+	readTok, err := d.authz.Mint("reader", []string{"read"}, "", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var put FSPutResponse
+	if err := d.FSPut(&FSPutRequest{Token: readTok, Path: "/x", Data: []byte("a")}, &put); err == nil {
+		t.Fatal("fs put allowed a read-only token to write")
+	}
+	var ls FSListResponse
+	if err := d.FSList(&FSListRequest{Token: readTok}, &ls); err != nil {
+		t.Fatalf("fs ls must allow a read-only token: %v", err)
+	}
+}
+
+// TestFSNotComposedIsCleanError proves the RPC reports a clean error (not a
+// panic) when the system did not compose (d.fs == nil).
+func TestFSNotComposedIsCleanError(t *testing.T) {
+	d, tok := testDaemon(t)
+	d.fs = nil
+	var put FSPutResponse
+	if err := d.FSPut(&FSPutRequest{Token: tok, Path: "/x", Data: []byte("a")}, &put); err == nil {
+		t.Fatal("expected an error when /cer/fs is not composed")
 	}
 }

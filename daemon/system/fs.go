@@ -38,8 +38,11 @@
 package system
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"sort"
 	"sync"
 
 	contract "github.com/hash066/cerberus/contract/go"
@@ -63,6 +66,8 @@ type MetaStore interface {
 	Put(path string, man dfs.Manifest) error
 	// Get returns the manifest for path, or false if no file was written there.
 	Get(path string) (dfs.Manifest, bool)
+	// List returns the paths of every stored file, in deterministic order.
+	List() ([]string, error)
 }
 
 // MemMetaStore maps a /cer/fs path to the dfs Manifest of the file stored there.
@@ -95,7 +100,64 @@ func (m *MemMetaStore) Get(path string) (dfs.Manifest, bool) {
 	return man, ok
 }
 
+// List returns the stored file paths in deterministic (sorted) order.
+func (m *MemMetaStore) List() ([]string, error) {
+	m.mu.RLock()
+	out := make([]string, 0, len(m.byID))
+	for p := range m.byID {
+		out = append(out, p)
+	}
+	m.mu.RUnlock()
+	sort.Strings(out)
+	return out, nil
+}
+
 var _ MetaStore = (*MemMetaStore)(nil)
+
+// FSPut stores data as the file at logical path in /cer/fs: it erasure-codes the
+// bytes with the dfs engine (scattering shards across mesh peers via the composed
+// ShardStore) and durably records the returned Manifest under path. This is the
+// synchronous, whole-buffer form the operator CLI (`cerberus fs put`) uses;
+// BeginWrite is the streaming data-plane form the 9P namespace uses. The buffer
+// is held in memory, so this is intended for modest operator files, not media.
+func (s *System) FSPut(path string, data []byte) error {
+	if s.fsStore == nil {
+		return fmt.Errorf("fs: no /cer/fs store composed")
+	}
+	man, err := s.fsStore.fs.Put(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("fs put: %w", err)
+	}
+	return s.fsStore.meta.Put(path, man)
+}
+
+// FSGet reconstructs and returns the bytes of the file at path, or an error if
+// no file was written there. It resolves path to its Manifest and runs dfs.Get
+// (fetching shards from peers as needed, integrity-checked) — it never fabricates
+// bytes for a path that was never written.
+func (s *System) FSGet(path string) ([]byte, error) {
+	if s.fsStore == nil {
+		return nil, fmt.Errorf("fs: no /cer/fs store composed")
+	}
+	man, ok := s.fsStore.meta.Get(path)
+	if !ok {
+		return nil, fmt.Errorf("fs: no such file: %s", path)
+	}
+	rc, err := s.fsStore.fs.Get(man)
+	if err != nil {
+		return nil, fmt.Errorf("fs get: %w", err)
+	}
+	defer rc.Close()
+	return io.ReadAll(rc)
+}
+
+// FSList returns the logical paths of every file stored in /cer/fs.
+func (s *System) FSList() ([]string, error) {
+	if s.fsStore == nil {
+		return nil, fmt.Errorf("fs: no /cer/fs store composed")
+	}
+	return s.fsStore.meta.List()
+}
 
 // sinkRouter is the daemon's single data-plane Sink. The data-plane server calls
 // it with (transferID, reader) for every authorized inbound transfer; the router
