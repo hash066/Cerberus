@@ -205,7 +205,7 @@ Commands:
   fs put <local-file> [/cer/fs/name]  Store a file in the distributed FS (erasure-coded, scattered)
   fs get /cer/fs/name [local-file]    Reconstruct a stored file (to a file, or stdout)
   fs ls                               List files stored in /cer/fs
-  gpu <kernel> <a> [b] [--param N]    Run a compute kernel (vector-add|saxpy|scalar-mul); reports backend
+  gpu <kernel> <a> [b] [--param N]    Run a compute kernel (vector-add|saxpy|scalar-mul); reports backend (gpu-wgpu with task build:gpu; see docs/gpu.md)
   audio loopback [--freq HZ] [--frames N]  Run a real audio session over the QUIC data plane; report delivery
   audio play --on <peerHexID>          Capture this node's mic and stream it to the PEER's speaker (mesh)
   audio monitor --on <peerHexID>       Play the PEER's mic on this node's speaker (mesh)
@@ -788,10 +788,34 @@ func parseFloats(s string) ([]float32, error) {
 	return out, nil
 }
 
+// gpuUsage is the detailed help for `cerberus gpu`, including the exact steps a
+// Windows + NVIDIA user runs to make the daemon dispatch on the real GPU. Printed
+// on `cerberus gpu` with no args (or `--help`).
+const gpuUsage = `usage: cerberus gpu <vector-add|saxpy|scalar-mul> <a,b,c> [<d,e,f>] [--param N]
+
+Runs an element-wise f32 kernel on the daemon and prints the result plus the
+backend that ACTUALLY ran it. Examples:
+  cerberus gpu vector-add 1,2,3 4,5,6          # [5 7 9]
+  cerberus gpu saxpy 1,2,3 0.5,0.5,0.5 --param 2   # 2*x + y
+  cerberus gpu scalar-mul 1,2,3 --param 3      # x * 3
+
+Backends (the "backend:" line never lies about what ran):
+  cpu-software  real CPU compute; the default build, works with no GPU/toolchain
+  gpu-wgpu      the physical GPU via wgpu (e.g. an NVIDIA RTX card)
+
+To get backend: gpu-wgpu on Windows + NVIDIA (one-time), see docs/gpu.md:
+  1. install a mingw-w64 GNU C toolchain (zig cc) that cgo can drive, and
+     rustup target add x86_64-pc-windows-gnu; rustup component add llvm-tools-preview
+  2. build the daemon with the real GPU backend:
+       pwsh build/ffi.ps1 -Action build -Gpu     (or: task build:gpu)
+  3. run that cerberusd-ffi.exe, then:
+       cerberus gpu vector-add 1,2,3 4,5,6   ->   backend: gpu-wgpu
+`
+
 func cmdGPU(args []string, jsonOut bool) int {
 	paramStr, args := extractValueFlag(args, "--param")
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: cerberus gpu <vector-add|saxpy|scalar-mul> <a,b,c> [<d,e,f>] [--param N]")
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
+		fmt.Fprint(os.Stderr, gpuUsage)
 		return exitUsage
 	}
 	kernel, ok := gpu.ParseKernel(args[0])
@@ -846,6 +870,12 @@ func cmdGPU(args []string, jsonOut bool) int {
 	}
 	fmt.Printf("%s(%s) = %v\n", kernel, formatParam(kernel, param), resp.Output)
 	fmt.Printf("backend: %s\n", resp.Backend)
+	// Honest nudge: if a real GPU did not run, point at the exact way to get one.
+	// (Only "cpu-software" means no GPU ran; "gpu-wgpu" or any ffi-fallback string
+	// that already names the reason is left as-is.)
+	if resp.Backend == "cpu-software" {
+		fmt.Println("hint: this is real CPU compute. For the physical GPU (backend: gpu-wgpu), build the daemon with `task build:gpu` — see docs/gpu.md.")
+	}
 	return exitOK
 }
 
