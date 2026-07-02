@@ -175,7 +175,11 @@ func (b *rpSafeBuffer) String() string {
 func buildCerberusd(t *testing.T, repoRoot, outDir string) string {
 	t.Helper()
 	binPath := filepath.Join(outDir, executableName("cerberusd"))
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Generous ceiling: this `go build` competes for CPU with the rest of the
+	// suite when run as part of `go test ./...`, so a tight 2m budget produced
+	// spurious build-timeout failures on a contended runner. 5m only ever trips
+	// on a genuinely stuck build, not on load.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, "./cmd/cerberusd")
 	cmd.Dir = repoRoot
@@ -490,6 +494,9 @@ func nodesSeesPeer(addr, token string) bool {
 func TestRealProcessKillAndRestartConvergesRevocation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real-process chaos test in -short mode (spawns real cerberusd OS processes; takes real wall-clock time for mDNS discovery)")
+	}
+	if raceEnabled {
+		t.Skip("skipping under -race: this test's real work runs in child cerberusd processes (built without -race), so the detector cannot instrument the code under test — running it here only adds load/timeout risk with no race coverage (see raceflag_norace_test.go)")
 	}
 	if runtime.GOOS == "darwin" && os.Getenv("GITHUB_ACTIONS") != "" {
 		// GitHub-hosted macOS runners restrict the UDP multicast that libp2p's

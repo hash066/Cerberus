@@ -156,7 +156,7 @@ func AcquireLock() error {
 			return fmt.Errorf("discovery: create temp lock: %w", err)
 		}
 		tmpName := tmp.Name()
-		_, werr := tmp.WriteString(fmt.Sprintf("%d", os.Getpid()))
+		_, werr := fmt.Fprintf(tmp, "%d", os.Getpid())
 		cerr := tmp.Close()
 		if werr != nil || cerr != nil {
 			_ = os.Remove(tmpName)

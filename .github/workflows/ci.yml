@@ -57,8 +57,12 @@ jobs:
   golangci-lint:
     name: golangci-lint
     runs-on: ubuntu-latest
-    # Advisory gate during the launch push: reports issues but does not fail the
-    # run. Promote to a hard gate (remove this line) as part of v3 hardening.
+    # Advisory for now (reports but does not fail the run). Promote to a hard
+    # gate — remove continue-on-error — once the reported findings are burned
+    # down (Phase 0 follow-up). The linter is BUILT FROM SOURCE with the
+    # module's own Go toolchain (setup-go reads go.mod = 1.25.x), so it never
+    # hits the "linter built with an older Go than the target module" error that
+    # made the pinned golangci-lint-action@v6 binary (go1.24) refuse to run.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -66,11 +70,52 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+      - name: Install golangci-lint (compiled with the module's Go)
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+      - name: golangci-lint run
+        run: "$(go env GOPATH)/bin/golangci-lint run --timeout=5m ./..."
+
+  # ---------------------------------------------------------------- Go race detector
+  go-race:
+    name: go test -race (ubuntu)
+    runs-on: ubuntu-latest
+    # The race detector needs cgo + a 64-bit target; the default dev build is
+    # pure-Go win/386 and cannot run it, so races (like the AcquireLock
+    # double-acquire fixed in fa0e9fb's series) can only be caught here. Hard
+    # gate: a data race is a bug, not an advisory.
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          version: latest
-          args: --timeout=5m ./...
+          go-version-file: go.mod
+          cache: true
+      - name: go test -race ./...
+        run: go test -race -timeout 20m ./...
+
+  # ---------------------------------------------------------------- Fuzz (untrusted-input decoders)
+  fuzz:
+    name: fuzz smoke (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: fuzz untrusted-input decoders (short active smoke)
+        # Every target's SEED corpus already runs in the `go test ./...` matrix
+        # above (regression). This adds a short ACTIVE search for shallow
+        # crashers — it must run on a 64-bit host because the fuzz engine mmaps a
+        # corpus file the pure-Go win/386 dev build cannot. A crash here is a real
+        # parser bug on attacker-controlled bytes, so this is a hard gate.
+        # (Longer nightly fuzzing is a documented follow-up.)
+        run: |
+          set -euo pipefail
+          go test ./daemon/auth/ -run '^$' -fuzz '^FuzzVerifySignedCap$' -fuzztime=40s
+          go test ./daemon/auth/ -run '^$' -fuzz '^FuzzAuthorizeToken$' -fuzztime=40s
+          go test ./daemon/mesh/ -run '^$' -fuzz '^FuzzUnmarshalEnvelope$' -fuzztime=40s
 
   # ---------------------------------------------------------------- Rust core
   rust:
@@ -137,9 +182,9 @@ jobs:
   cargo-audit:
     name: cargo-audit (advisory scan)
     runs-on: ubuntu-latest
-    # Advisory: a RustSec advisory in a transitive dep (libp2p/wasmtime/wgpu tree)
-    # should surface but not block the launch push. Promote to hard gate in v3.
-    continue-on-error: true
+    # Hard gate: as of the wasmtime 37->46 upgrade the tree is advisory-clean
+    # (only the allowed `unmaintained: paste` warning remains, which cargo audit
+    # does not fail on), so a NEW vulnerability must block rather than warn.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -150,6 +195,26 @@ jobs:
         # Scans Cargo.lock against the RustSec advisory DB. Fails on a known
         # vulnerability; unmaintained/yanked warnings do not fail the build.
         run: cargo audit
+
+  # ---------------------------------------------------------------- Supply chain (SBOM)
+  sbom:
+    name: SBOM (Go + Rust, CycloneDX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate CycloneDX SBOM (scans go.mod + Cargo.lock)
+        # Syft discovers both the Go module graph and the Cargo.lock crates in one
+        # pass and emits a CycloneDX SBOM (component + license inventory) uploaded
+        # as a build artifact. Dependency pinning is already enforced by the
+        # committed go.sum + Cargo.lock; hard license-policy enforcement is a
+        # documented follow-up (needs an agreed allowlist).
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: true
+          artifact-name: sbom.cdx.json
 
   # ---------------------------------------------------------------- 2-node acceptance demo
   e2e:
