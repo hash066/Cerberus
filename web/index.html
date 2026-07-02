@@ -49,7 +49,7 @@
           No master node, no cloud account, no ambient authority.
         </p>
         <div class="hero-actions">
-          <a class="btn primary" href="install.html">Download for your OS</a>
+          <a class="btn primary" href="#download">Download</a>
           <a class="btn ghost" href="docs.html#getting-started">Read the docs</a>
           <a class="btn ghost" href="https://github.com/hash066/Cerberus" rel="noopener">View source</a>
         </div>
@@ -161,6 +161,47 @@
       </div>
     </section>
 
+    <!-- WHAT YOU CAN DO -->
+    <section class="section-pad">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">What you can do on it</p>
+          <h2>Pool compute, storage, GPU, and audio — and let your agents drive it.</h2>
+          <p>Every action below is capability-gated: a peer, or an AI agent, can only do what its token allows.</p>
+        </div>
+        <div class="grid cols-3">
+          <div class="card">
+            <h3>Run workloads anywhere</h3>
+            <p>Dispatch a sandboxed WASM workload to any node on the mesh and get the result back over an encrypted stream.</p>
+            <p><code class="inline">cerberus run app.wasm --on &lt;peer&gt;</code></p>
+          </div>
+          <div class="card">
+            <h3>Distributed filesystem</h3>
+            <p>Store a file once; it is erasure-coded and its shards scatter across peers, then reconstruct on demand from any node.</p>
+            <p><code class="inline">cerberus fs put report.pdf</code></p>
+          </div>
+          <div class="card">
+            <h3>GPU compute</h3>
+            <p>Run f32 kernels with real compute. Ships with a CPU backend; a from-source build lights up your GPU via wgpu — and always reports which backend actually ran.</p>
+            <p><code class="inline">cerberus gpu vector-add 1,2,3 4,5,6</code></p>
+          </div>
+          <div class="card">
+            <h3>Cross-node audio</h3>
+            <p>Stream one machine's microphone to another's speaker in real time over the encrypted, capability-gated mesh.</p>
+            <p><code class="inline">cerberus audio play --on &lt;peer&gt;</code></p>
+          </div>
+          <div class="card">
+            <h3>Drive it from your AI agents — MCP</h3>
+            <p>Connect Claude or Cursor to the built-in MCP server and let an agent discover nodes, run workloads, read metrics, and resolve conflicts through 12 <code class="inline">cerberus_*</code> tools — using capability tokens, never ambient access.</p>
+          </div>
+          <div class="card">
+            <h3>Metered &amp; consistent</h3>
+            <p>A durable compute-credit ledger logs every run; contradictory agent beliefs surface as CRDT conflicts for a human to resolve instead of being silently overwritten.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- DOWNLOAD / INSTALL -->
     <section class="section-pad" id="download">
       <div class="wrap">
@@ -172,27 +213,30 @@
         <div class="grid cols-3">
           <div class="card">
             <h3>Windows</h3>
-            <p><code class="inline">.msi</code> installer or standalone <code class="inline">.exe</code>. SmartScreen will warn about an unknown publisher.</p>
-            <p style="margin-top:14px"><a class="btn small" href="install.html#windows">Windows install guide →</a></p>
+            <p><code class="inline">.msi</code> installer with the daemon <b>bundled</b> — install, open, it self-starts. SmartScreen warns (unsigned beta) → <b>More info → Run anyway</b>.</p>
+            <p style="margin-top:14px">
+              <a class="btn primary small" href="https://github.com/hash066/Cerberus/releases/latest/download/Cerberus_0.1.0_x64_en-US.msi" rel="noopener">Download .msi (x64)</a>
+            </p>
+            <p style="margin-top:10px"><a class="btn small" href="install.html#windows">Install guide →</a></p>
           </div>
           <div class="card">
             <h3>macOS</h3>
-            <p><code class="inline">.dmg</code> for Apple Silicon and Intel. Gatekeeper will block it on first open; right-click → Open.</p>
-            <p style="margin-top:14px"><a class="btn small" href="install.html#macos">macOS install guide →</a></p>
+            <p>Native installer coming soon. For now, <a href="install.html#source">build from source</a> — the same code, Apple Silicon &amp; Intel.</p>
+            <p style="margin-top:14px"><a class="btn small" href="install.html#macos">macOS notes →</a></p>
           </div>
           <div class="card">
             <h3>Linux</h3>
-            <p><code class="inline">.AppImage</code> (portable) or <code class="inline">.deb</code> for Debian/Ubuntu. Or just build with Go.</p>
-            <p style="margin-top:14px"><a class="btn small" href="install.html#linux">Linux install guide →</a></p>
+            <p>Native installer coming soon. For now, <a href="install.html#source">build from source</a> (<code class="inline">go build ./cmd/cerberusd</code>).</p>
+            <p style="margin-top:14px"><a class="btn small" href="install.html#linux">Linux notes →</a></p>
           </div>
         </div>
         <div class="hero-actions" style="margin-top:24px">
-          <a class="btn primary" href="https://github.com/hash066/Cerberus/releases" rel="noopener">All downloads on GitHub Releases</a>
-          <a class="btn ghost" href="install.html#source">Build from source</a>
+          <a class="btn primary" href="https://github.com/hash066/Cerberus/releases/latest" rel="noopener">All downloads on GitHub Releases</a>
+          <a class="btn ghost" href="https://github.com/hash066/Cerberus/blob/main/TESTERS.md" rel="noopener">Testing guide →</a>
         </div>
         <div class="callout warn" style="margin-top:20px">
           <span class="mark" aria-hidden="true">!</span>
-          <span>Real signed release binaries don't exist yet. During the beta, download links point at the project's <a href="https://github.com/hash066/Cerberus/releases" rel="noopener">GitHub Releases</a> page. If a build isn't posted there for your platform, use the <a href="install.html#source">build-from-source</a> path — it's the same code and works on all three OSes.</span>
+          <span><b>Beta, unsigned.</b> The Windows x64 installer is live on <a href="https://github.com/hash066/Cerberus/releases/latest" rel="noopener">GitHub Releases</a> with the daemon bundled — one click and the node is running. macOS/Linux installers are coming; until then <a href="install.html#source">build from source</a> (same code, all three OSes). To connect two machines, see the <a href="https://github.com/hash066/Cerberus/blob/main/TESTERS.md" rel="noopener">testing guide</a>.</span>
         </div>
       </div>
     </section>
