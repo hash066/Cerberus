@@ -214,10 +214,15 @@ func main() {
 	}
 
 	// Capability auth: a persisted Ed25519 key is the daemon root of trust.
-	seed, serr := auth.LoadOrCreateSeed(filepath.Join(cfgDir, "issuer.key"))
+	// Prefer OS-keychain custody (Windows Credential Manager / macOS Keychain /
+	// Linux Secret Service); an existing plaintext issuer.key is migrated into the
+	// keychain and removed, preserving identity. Falls back to the 0600 file when
+	// no keychain is available (e.g. headless CI). See daemon/auth/custody.go.
+	seed, custody, serr := auth.LoadOrCreateSeedCustodial(filepath.Join(cfgDir, "issuer.key"))
 	if serr != nil {
 		log.Fatalf("load issuer key: %v", serr)
 	}
+	log.Printf("issuer key custody = %s", custody)
 	issuer := auth.FromSeed(seed)
 	issuer.UseRevocationBackend(storeRevocations{db})
 
