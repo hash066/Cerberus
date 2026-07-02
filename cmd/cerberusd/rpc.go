@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -614,6 +615,80 @@ func (d *DaemonRPC) ConflictsResolve(req *ConflictsResolveRequest, resp *Conflic
 	}
 	resp.Resolved = ok
 	resp.Subject = req.Subject
+	return nil
+}
+
+// AssertBeliefRequest asserts one agent belief (subject -> value) into the
+// daemon's CRDT belief doc, attributed to Agent (the CRDT actor). It is the
+// write surface that lets belief conflicts actually arise: the engine already
+// detects and durably surfaces concurrent contradictions (daemon/state), but
+// nothing drove it in the shipping daemon, so the conflicts panel was always
+// empty. Two DIFFERENT agents asserting different values for the same subject
+// are causally concurrent (each assertion carries only its own actor's context),
+// so the second surfaces a BeliefConflict — exactly the agent.belief semantics.
+type AssertBeliefRequest struct {
+	Token   string
+	Doc     string // hex doc id; empty => the daemon's belief doc
+	Agent   string // the asserting agent; becomes the CRDT actor (defaults to caller subject)
+	Subject string
+	Value   string
+}
+type AssertBeliefResponse struct {
+	Subject  string
+	Agent    string
+	Conflict bool     // true if the subject is now an open conflict
+	Values   []string // the subject's current live value frontier (>1 means conflict)
+}
+
+// AssertBelief records an agent's belief assertion. Requires write. It applies a
+// single agent.belief CRDT op with an empty clock, so the engine stamps it with
+// only the asserting actor's causal context — making independent agents'
+// assertions concurrent, which is what surfaces a contradiction as a durable
+// conflict rather than silently last-writer-wins.
+func (d *DaemonRPC) AssertBelief(req *AssertBeliefRequest, resp *AssertBeliefResponse) error {
+	claims, err := d.authz.Authorize(req.Token, "write", "")
+	if err != nil {
+		return fmt.Errorf("unauthorized (assert requires write): %w", err)
+	}
+	if d.crdt == nil {
+		return fmt.Errorf("beliefs: CRDT engine not available")
+	}
+	if strings.TrimSpace(req.Subject) == "" {
+		return fmt.Errorf("beliefs assert: subject required")
+	}
+	doc, derr := d.resolveDoc(req.Doc)
+	if derr != nil {
+		return derr
+	}
+	agent := strings.TrimSpace(req.Agent)
+	if agent == "" {
+		agent = claims.Subject
+	}
+	var actor contract.PeerID
+	copy(actor[:], []byte(agent))
+	delta, merr := json.Marshal(map[string]string{req.Subject: req.Value})
+	if merr != nil {
+		return fmt.Errorf("beliefs assert: encode delta: %w", merr)
+	}
+	// Empty Clock: the engine ticks only this actor's counter (daemon/state.apply),
+	// so distinct agents' assertions are causally incomparable.
+	op := contract.CrdtOp{DocID: doc, Actor: actor, Domain: state.DomainBelief, Delta: delta}
+	if aerr := d.crdt.Apply(op); aerr != nil {
+		return fmt.Errorf("beliefs assert: %w", aerr)
+	}
+	resp.Subject = req.Subject
+	resp.Agent = agent
+	for _, c := range d.crdt.Conflicts(doc) {
+		if c.Subject == req.Subject {
+			resp.Conflict = true
+			for _, cand := range c.Candidates {
+				resp.Values = append(resp.Values, string(cand.Value))
+			}
+		}
+	}
+	if !resp.Conflict {
+		resp.Values = []string{req.Value}
+	}
 	return nil
 }
 

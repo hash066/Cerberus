@@ -147,6 +147,79 @@ func TestRunRequiresExecRight(t *testing.T) {
 	}
 }
 
+// TestAssertBeliefSurfacesConflictAndResolves proves the belief-conflict feature
+// end-to-end at the RPC surface: two agents asserting contradictory values for
+// one subject surface a durable conflict (detect), it appears in ConflictsList
+// (list), and ConflictsResolve clears it (resolve). This is the loop the tray's
+// Conflicts panel exercises; before AssertBelief there was no way to create a
+// conflict, so the panel was always empty.
+func TestAssertBeliefSurfacesConflictAndResolves(t *testing.T) {
+	d, tok := testDaemon(t)
+
+	// One agent's assertion is not a conflict.
+	var r1 AssertBeliefResponse
+	if err := d.AssertBelief(&AssertBeliefRequest{Token: tok, Agent: "alice", Subject: "sky", Value: "blue"}, &r1); err != nil {
+		t.Fatalf("assert alice: %v", err)
+	}
+	if r1.Conflict {
+		t.Fatalf("a single assertion must not conflict, got values %v", r1.Values)
+	}
+
+	// A different agent's concurrent contradictory assertion surfaces a conflict.
+	var r2 AssertBeliefResponse
+	if err := d.AssertBelief(&AssertBeliefRequest{Token: tok, Agent: "bob", Subject: "sky", Value: "green"}, &r2); err != nil {
+		t.Fatalf("assert bob: %v", err)
+	}
+	if !r2.Conflict || len(r2.Values) != 2 {
+		t.Fatalf("concurrent contradiction must surface a 2-value conflict, got conflict=%v values=%v", r2.Conflict, r2.Values)
+	}
+
+	// It shows up in the conflicts list with both candidates.
+	var lst ConflictsListResponse
+	if err := d.ConflictsList(&ConflictsListRequest{Token: tok}, &lst); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	found := false
+	for _, c := range lst.Conflicts {
+		if c.Subject == "sky" && len(c.Candidates) == 2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("sky conflict not in list: %+v", lst.Conflicts)
+	}
+
+	// Resolving it clears the conflict durably.
+	var res ConflictsResolveResponse
+	if err := d.ConflictsResolve(&ConflictsResolveRequest{Token: tok, Subject: "sky", Value: "blue"}, &res); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !res.Resolved {
+		t.Fatalf("expected resolve to clear an open conflict")
+	}
+	var after ConflictsListResponse
+	if err := d.ConflictsList(&ConflictsListRequest{Token: tok}, &after); err != nil {
+		t.Fatalf("list after resolve: %v", err)
+	}
+	if len(after.Conflicts) != 0 {
+		t.Fatalf("expected no open conflicts after resolve, got %+v", after.Conflicts)
+	}
+}
+
+// TestAssertBeliefRequiresWrite proves the write gate: a read-only token cannot
+// assert a belief (no ambient authority; CLAUDE.md rule 5).
+func TestAssertBeliefRequiresWrite(t *testing.T) {
+	d, _ := testDaemon(t)
+	readTok, err := d.authz.Mint("reader", []string{"read"}, "", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp AssertBeliefResponse
+	if err := d.AssertBelief(&AssertBeliefRequest{Token: readTok, Agent: "reader", Subject: "sky", Value: "blue"}, &resp); err == nil {
+		t.Fatalf("assert allowed a read-only token to write a belief")
+	}
+}
+
 func TestWallet(t *testing.T) {
 	d, tok := testDaemon(t)
 	var resp WalletResponse

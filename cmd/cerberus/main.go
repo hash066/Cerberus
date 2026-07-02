@@ -13,7 +13,7 @@
 //	wallet [owner]                  compute-credit balance from the durable ledger
 //	caps mint|attenuate|revoke|list capability-token lifecycle
 //	components add|list            local named-component registry (name -> CID)
-//	conflicts list|resolve …        CRDT belief-conflict inspection / resolution
+//	conflicts assert|list|resolve … CRDT belief assertion / conflict inspection / resolution
 //	economy challenge …             dispute a pending settlement with a fraud proof
 //	metrics                         fetch the local Prometheus /metrics text
 //	version                         print the client + contract version
@@ -192,6 +192,8 @@ Commands:
   caps list                           List tokens this daemon minted
   components add <name> <path.wasm>   Register a local component under a name
   components list                     List registered components (name, CID, size)
+  conflicts assert <subject> <value> --agent <name> [--doc <hex>]
+                                       Assert an agent belief; concurrent contradictory asserts surface a conflict
   conflicts list [--doc <hex>]        Open CRDT belief conflicts
   conflicts resolve <subject> <value> [--doc <hex>]
   economy challenge <tx-id> --component-cid C --input-cid I --claimed-output-cid O --actual-output-cid A [--challenger P]
@@ -615,7 +617,7 @@ func cmdComponents(args []string, jsonOut bool) int {
 
 func cmdConflicts(args []string, jsonOut bool) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "conflicts: need a subcommand: list | resolve")
+		fmt.Fprintln(os.Stderr, "conflicts: need a subcommand: assert | list | resolve")
 		return exitUsage
 	}
 	sub := args[0]
@@ -632,6 +634,31 @@ func cmdConflicts(args []string, jsonOut bool) int {
 	defer client.Close()
 
 	switch sub {
+	case "assert":
+		doc, rest := extractValueFlag(rest, "--doc")
+		agent, rest := extractValueFlag(rest, "--agent")
+		if len(rest) < 2 {
+			fmt.Fprintln(os.Stderr, "conflicts assert: need <subject> <value>")
+			fmt.Fprintln(os.Stderr, "usage: cerberus conflicts assert <subject> <value> --agent <name> [--doc <hex>]")
+			return exitUsage
+		}
+		subject, value := rest[0], rest[1]
+		req := &AssertBeliefRequest{Token: token, Doc: doc, Agent: agent, Subject: subject, Value: value}
+		var resp AssertBeliefResponse
+		if err := client.Call("DaemonRPC.AssertBelief", req, &resp); err != nil {
+			return rpcErr("conflicts assert", err)
+		}
+		if jsonOut {
+			return printJSON(resp)
+		}
+		if resp.Conflict {
+			fmt.Printf("Agent %q asserted %q=%q — subject now IN CONFLICT (%d live values: %v)\n",
+				resp.Agent, subject, value, len(resp.Values), resp.Values)
+		} else {
+			fmt.Printf("Agent %q asserted %q=%q (no conflict)\n", resp.Agent, subject, value)
+		}
+		return exitOK
+
 	case "list":
 		doc, _ := extractValueFlag(rest, "--doc")
 		var resp ConflictsListResponse
@@ -674,7 +701,7 @@ func cmdConflicts(args []string, jsonOut bool) int {
 		return exitOK
 
 	default:
-		fmt.Fprintf(os.Stderr, "conflicts: unknown subcommand %q (list | resolve)\n", sub)
+		fmt.Fprintf(os.Stderr, "conflicts: unknown subcommand %q (assert | list | resolve)\n", sub)
 		return exitUsage
 	}
 }

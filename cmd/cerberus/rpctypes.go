@@ -148,6 +148,21 @@ type ConflictsResolveResponse struct {
 	Subject  string
 }
 
+// beliefs (assert) — the write surface that lets belief conflicts arise
+type AssertBeliefRequest struct {
+	Token   string
+	Doc     string
+	Agent   string
+	Subject string
+	Value   string
+}
+type AssertBeliefResponse struct {
+	Subject  string
+	Agent    string
+	Conflict bool
+	Values   []string
+}
+
 // economy challenge
 type EconomyChallengeRequest struct {
 	Token            string
