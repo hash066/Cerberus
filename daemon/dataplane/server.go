@@ -60,8 +60,16 @@ type Server struct {
 	// instead of trusting the channel on capability-authorization alone.
 	identity ed25519.PrivateKey
 
+	// onAuthClient, if set, is invoked with the authenticated client PeerID
+	// (derived from the verified mTLS client certificate) each time a transfer is
+	// authorized, BEFORE its payload is delivered to the sink. It lets the control
+	// plane observe which real peer a transfer was bound to. Set via
+	// SetClientObserver; nil by default.
+	onAuthClient func(transferID uint64, client contract.PeerID)
+
 	mu     sync.Mutex
-	grants map[uint64]grant // transferID -> authorized grant
+	grants map[uint64]grant           // transferID -> authorized grant
+	authBy map[uint64]contract.PeerID // transferID -> last authenticated client PeerID
 	ln     *quic.Listener
 	closed bool
 }
@@ -81,7 +89,32 @@ type grant struct {
 // defeat pinning, so callers must thread through the node's actual identity
 // rather than generate a new one per server.
 func NewServer(kernel contract.CapKernel, now int64, identity ed25519.PrivateKey) *Server {
-	return &Server{kernel: kernel, now: now, identity: identity, grants: map[uint64]grant{}}
+	return &Server{
+		kernel:   kernel,
+		now:      now,
+		identity: identity,
+		grants:   map[uint64]grant{},
+		authBy:   map[uint64]contract.PeerID{},
+	}
+}
+
+// SetClientObserver installs a callback invoked with the authenticated client
+// PeerID (derived from the verified mTLS client certificate) each time a transfer
+// is authorized, before its payload is delivered. Pass nil to clear. Not safe to
+// call concurrently with Serve.
+func (s *Server) SetClientObserver(fn func(transferID uint64, client contract.PeerID)) {
+	s.onAuthClient = fn
+}
+
+// AuthenticatedClient reports the client PeerID that was authenticated (via the
+// mTLS client certificate) for the most recent authorized transfer under
+// transferID, and whether one has been recorded. Because mTLS is enforced, a
+// transfer that reached authorization always carries a real client identity.
+func (s *Server) AuthenticatedClient(transferID uint64) (contract.PeerID, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.authBy[transferID]
+	return id, ok
 }
 
 // SetSignedVerifier installs a cross-kernel signed-capability verifier. Once set,
@@ -191,6 +224,12 @@ func (s *Server) Serve(ctx context.Context, sink Sink) error {
 }
 
 func (s *Server) serveConn(ctx context.Context, conn *quic.Conn, sink Sink) {
+	// Derive the client's authenticated PeerID once per connection from the
+	// verified mTLS client certificate. The handshake already completed by the
+	// time AcceptStream returns, and newSelfSignedTLS demanded (RequireAnyClientCert)
+	// and vetted (requireEd25519ClientCert) an Ed25519 client leaf — so on any
+	// accepted connection PeerCertificates[0] is present and yields a real PeerID.
+	client := connClientPeerID(conn)
 	for {
 		st, err := conn.AcceptStream(ctx)
 		if err != nil {
@@ -199,13 +238,27 @@ func (s *Server) serveConn(ctx context.Context, conn *quic.Conn, sink Sink) {
 		}
 		// One transfer per stream; handle synchronously so a malformed stream
 		// cannot starve, but allow concurrent streams via AcceptStream loop.
-		go s.handleStream(st, sink)
+		go s.handleStream(st, client, sink)
 	}
 }
 
+// connClientPeerID extracts the authenticated client PeerID from a connection's
+// verified TLS client certificate. Returns the zero PeerID if (unexpectedly under
+// enforced mTLS) no usable client leaf is present.
+func connClientPeerID(conn *quic.Conn) contract.PeerID {
+	certs := conn.ConnectionState().TLS.PeerCertificates
+	if len(certs) == 0 {
+		return contract.PeerID{}
+	}
+	id, _ := peerIDFromCert(certs[0])
+	return id
+}
+
 // handleStream authorizes and receives one transfer. The capability is verified
-// and the quota resolved BEFORE any payload byte is read from the stream.
-func (s *Server) handleStream(st *quic.Stream, sink Sink) {
+// and the quota resolved BEFORE any payload byte is read from the stream. client
+// is the PeerID authenticated for this connection via mTLS; it is recorded against
+// the transfer once authorization succeeds.
+func (s *Server) handleStream(st *quic.Stream, client contract.PeerID, sink Sink) {
 	defer st.CancelRead(0)
 
 	h, err := readHeader(st)
@@ -248,6 +301,16 @@ func (s *Server) handleStream(st *quic.Stream, sink Sink) {
 		return
 	}
 
+	// The transfer is now authorized. Bind it to the client's authenticated
+	// PeerID (from the verified mTLS client cert) so the receiver has a real peer
+	// identity for the transfer, just as the mesh path records its authenticated
+	// peer. This runs only after every authorization gate has passed and before
+	// any payload byte is delivered to the sink.
+	s.recordClient(h.TransferID, client)
+	if s.onAuthClient != nil {
+		s.onAuthClient(h.TransferID, client)
+	}
+
 	// 3) Stream the payload through a quota guard into the sink. The guard
 	//    enforces the ceiling even if Length under-declared the real size.
 	ack := func(code uint8, msg string) {
@@ -288,6 +351,14 @@ func (s *Server) lookup(transferID uint64) (grant, bool) {
 	defer s.mu.Unlock()
 	g, ok := s.grants[transferID]
 	return g, ok
+}
+
+// recordClient stores the authenticated client PeerID for an authorized transfer
+// so AuthenticatedClient can report which real peer it was bound to.
+func (s *Server) recordClient(transferID uint64, client contract.PeerID) {
+	s.mu.Lock()
+	s.authBy[transferID] = client
+	s.mu.Unlock()
 }
 
 func (s *Server) isClosed() bool {

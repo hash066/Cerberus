@@ -9,10 +9,12 @@ import (
 // sendRaw is a test-only sender that writes a chosen header and an arbitrary
 // payload, deliberately bypassing the honest Client (which would refuse to
 // under-declare Length or exceed the local quota). It exists to prove the SERVER
-// enforces the byte ceiling regardless of what the client claims. It returns nil
-// only if the server acked OK.
+// enforces the byte ceiling regardless of what the client claims. It still
+// presents a (fresh, ephemeral) client certificate so the server's mTLS handshake
+// admits it — the point under test is quota enforcement, not the identity gate.
+// It returns nil only if the server acked OK.
 func sendRaw(ctx context.Context, ep Endpoint, h header, payload []byte) error {
-	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(ep.ServerPeerID), &quic.Config{})
+	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(ep.ServerPeerID, NewClient().cert), &quic.Config{})
 	if err != nil {
 		return err
 	}

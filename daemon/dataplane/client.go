@@ -3,6 +3,9 @@ package dataplane
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"strings"
@@ -20,11 +23,50 @@ import (
 // the SERVER is the authority and enforces the ceiling regardless (defense in
 // depth: a buggy or hostile client cannot exceed the grant).
 
-// Client dials data-plane servers.
-type Client struct{}
+// Client dials data-plane servers. Because the server now requires mutual TLS,
+// every Client carries a client certificate bound to an Ed25519 identity, which
+// it presents on the handshake so the server can authenticate and record the
+// dialing node's PeerID.
+type Client struct {
+	// cert is the Ed25519-bound client-auth certificate presented on the mTLS
+	// handshake. NewClientWithIdentity binds it to the node's REAL mesh identity
+	// (so the server records the node's true PeerID); NewClient binds it to a
+	// fresh ephemeral identity (a real, verifiable key — just not the node's
+	// durable PeerID), preserving the pre-mTLS zero-argument call sites.
+	cert tls.Certificate
+}
 
-// NewClient returns a data-plane client.
-func NewClient() *Client { return &Client{} }
+// NewClient returns a data-plane client whose mTLS certificate is bound to a
+// FRESH, ephemeral Ed25519 identity. The client still authenticates itself with a
+// real key the server can pin/record, but that key is not the node's durable mesh
+// PeerID. Use this only where the caller has no node identity to bind (e.g. tests,
+// or a purely outbound context); prefer NewClientWithIdentity so the server can
+// record the dialing node's true PeerID. Panics only on a crypto/rand failure,
+// which is not a recoverable condition.
+func NewClient() *Client {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("dataplane: generate ephemeral client identity: %v", err))
+	}
+	c, err := NewClientWithIdentity(priv)
+	if err != nil {
+		panic(fmt.Sprintf("dataplane: build ephemeral client cert: %v", err))
+	}
+	return c
+}
+
+// NewClientWithIdentity returns a data-plane client whose mTLS certificate is
+// bound to the node's REAL Ed25519 mesh identity (the same keypair the node uses
+// as its PeerID; see daemon/mesh Fabric.Identity()). The server derives and
+// records the dialing node's authenticated PeerID from this certificate, binding
+// each transfer to a real peer identity exactly as the mesh path already does.
+func NewClientWithIdentity(identity ed25519.PrivateKey) (*Client, error) {
+	cert, err := clientCert(identity)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{cert: cert}, nil
+}
 
 // Send streams a blob to the server described by ep, authorized by ep.Cap and
 // bounded by ep.Quota.Bytes. The payload is read from r (the bulk source); n is
@@ -52,7 +94,7 @@ func (c *Client) Send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) e
 			fmt.Sprintf("blob %d bytes exceeds quota %d", n, ep.Quota.Bytes))
 	}
 
-	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(ep.ServerPeerID), &quic.Config{})
+	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(ep.ServerPeerID, c.cert), &quic.Config{})
 	if err != nil {
 		return contract.Errf(contract.ErrPartitioned, err.Error())
 	}
