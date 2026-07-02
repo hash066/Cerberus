@@ -445,12 +445,19 @@ func decodeCanonical(b []byte) (Grant, error) {
 	copyFixed(g.Resource.Node[:], d.bytes())
 	g.Resource.Path = d.str()
 	g.Resource.Quota = d.quota()
+	// The rights/caveats COUNTS are attacker-controlled u32s. Stop the moment the
+	// buffer is exhausted (d.err set) instead of trusting the count: otherwise an
+	// envelope claiming e.g. ~4 billion entries with no data behind them spins the
+	// loop billions of times, appending empty values, until the process hangs/OOMs
+	// — a denial-of-service on the capability wire seam (found by FuzzVerifySignedCap).
+	// With the guard the loop can only run as many times as there is real data,
+	// after which the d.err != nil check below rejects the envelope.
 	nr := d.u32()
-	for i := uint32(0); i < nr; i++ {
+	for i := uint32(0); i < nr && d.err == nil; i++ {
 		g.Rights = append(g.Rights, contract.Right(d.str()))
 	}
 	nc := d.u32()
-	for i := uint32(0); i < nc; i++ {
+	for i := uint32(0); i < nc && d.err == nil; i++ {
 		g.Caveats = append(g.Caveats, contract.Caveat{Op: d.str(), Val: d.str()})
 	}
 	copyFixed(g.Issuer[:], d.bytes())

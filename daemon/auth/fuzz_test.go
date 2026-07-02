@@ -2,11 +2,49 @@ package auth
 
 import (
 	"crypto/ed25519"
+	"encoding/binary"
 	"testing"
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
 )
+
+// TestVerifyRejectsHugeCountWithoutHang is the regression for the DoS
+// FuzzVerifySignedCap found: the canonical decoder trusted the attacker-supplied
+// rights/caveats COUNT, so an envelope that parses cleanly up to the count and
+// then claims ~4 billion entries with no data behind them spun the decode loop
+// billions of times (append-empty) until the process hung/OOMed. Here we craft
+// exactly that envelope and require Verify to reject it promptly rather than
+// hang. (The signature is bogus; the decode hang happened before signature
+// verification, so no valid key is needed.)
+func TestVerifyRejectsHugeCountWithoutHang(t *testing.T) {
+	var b []byte
+	putU32 := func(v uint32) { var x [4]byte; binary.BigEndian.PutUint32(x[:], v); b = append(b, x[:]...) }
+	putLenBytes := func(p []byte) { putU32(uint32(len(p))); b = append(b, p...) }
+
+	b = append(b, 1)              // capEnvelopeVersion
+	putLenBytes(make([]byte, 16)) // Grant.ID
+	putLenBytes([]byte("gpu"))    // Resource.Kind
+	putLenBytes(make([]byte, 32)) // Resource.Node
+	putLenBytes([]byte("/x"))     // Resource.Path
+	b = append(b, 0)              // Quota == nil
+	putU32(0xffffffff)            // rights count: ~4 billion, with NO rights data following
+	b = append(b, make([]byte, ed25519.SignatureSize)...) // bogus 64-byte trailing signature
+
+	done := make(chan struct{})
+	go func() {
+		_, err := Verify(b, make(ed25519.PublicKey, ed25519.PublicKeySize), 0, nil)
+		if err == nil {
+			t.Error("Verify accepted a malformed envelope claiming ~4 billion rights")
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Verify hung on an envelope claiming ~4 billion rights (unbounded-allocation DoS regressed)")
+	}
+}
 
 // FuzzVerifySignedCap hammers the signed-capability envelope verifier — the
 // zero-trust seam by which a node accepts a capability it did NOT mint, taken
