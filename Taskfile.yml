@@ -34,6 +34,16 @@ tasks:
     cmds:
       - pwsh -NoProfile -File build/ffi.ps1 -Action test
 
+  build:gpu:
+    desc: "Windows+GPU: build cerberusd with the REAL wgpu GPU backend (raw: pwsh build/ffi.ps1 -Action build -Gpu). See docs/gpu.md."
+    cmds:
+      - pwsh -NoProfile -File build/ffi.ps1 -Action build -Gpu
+
+  test:gpu:
+    desc: "Windows+GPU: test the real-GPU cgo path (raw: pwsh build/ffi.ps1 -Action test -Gpu). Reports gpu-wgpu when an adapter is present. See docs/gpu.md."
+    cmds:
+      - pwsh -NoProfile -File build/ffi.ps1 -Action test -Gpu
+
   test:
     desc: Unit tests, Go + Rust (raw: `go test ./...` && `cargo test`)
     cmds:

@@ -55,6 +55,16 @@ pwsh build/ffi.ps1 -Action run      # run the daemon with the Rust kernel
 # or via task:  task build:ffi   /   task test:ffi
 ```
 
+Add **`-Gpu`** to build the cabi staticlib with the real wgpu GPU backend
+(`--features gpu`) and the daemon with the extra `ffigpu` link tag, so
+`cerberus gpu` reports `backend: gpu-wgpu` on a machine with a GPU. See
+[docs/gpu.md](gpu.md) for the end-to-end steps.
+
+```
+pwsh build/ffi.ps1 -Action build -Gpu    # cerberusd-ffi.exe with the real GPU backend
+# or via task:  task build:gpu  /  task test:gpu
+```
+
 The script encapsulates the three steps (build gnu staticlib → strip the
 duplicate builtin → `go {test,build} -tags ffi` with `CGO_ENABLED=1`,
 `GOARCH=amd64`, `CC="zig cc"`).
