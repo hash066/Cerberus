@@ -465,11 +465,19 @@ pub unsafe extern "C" fn cerberus_gpu_submit(
             2 => KernelSource::ScalarMul { scalar: param },
             _ => return -1,
         };
-        let a_slice: &[f32] = if a.is_null() { &[] } else { slice::from_raw_parts(a, a_len) };
+        let a_slice: &[f32] = if a.is_null() {
+            &[]
+        } else {
+            slice::from_raw_parts(a, a_len)
+        };
         let inputs: Vec<&[f32]> = match kernel {
             KernelSource::ScalarMul { .. } => vec![a_slice],
             _ => {
-                let b_slice: &[f32] = if b.is_null() { &[] } else { slice::from_raw_parts(b, b_len) };
+                let b_slice: &[f32] = if b.is_null() {
+                    &[]
+                } else {
+                    slice::from_raw_parts(b, b_len)
+                };
                 vec![a_slice, b_slice]
             }
         };
@@ -696,7 +704,16 @@ mod tests {
         let mut out = [0.0f32; 4];
         // SAFETY: a/b are 4 readable f32; out is 4 writable f32.
         let n = unsafe {
-            cerberus_gpu_submit(0, 0.0, a.as_ptr(), a.len(), b.as_ptr(), b.len(), out.as_mut_ptr(), out.len())
+            cerberus_gpu_submit(
+                0,
+                0.0,
+                a.as_ptr(),
+                a.len(),
+                b.as_ptr(),
+                b.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
         };
         assert_eq!(n, 4);
         assert_eq!(out, [11.0, 22.0, 33.0, 44.0]);
@@ -708,14 +725,25 @@ mod tests {
         let x = [1.0f32, 2.0, 3.0];
         let y = [0.5f32, 0.5, 0.5];
         let mut out = [0.0f32; 3];
-        let n = unsafe { cerberus_gpu_submit(1, 2.0, x.as_ptr(), 3, y.as_ptr(), 3, out.as_mut_ptr(), 3) };
+        let n = unsafe {
+            cerberus_gpu_submit(1, 2.0, x.as_ptr(), 3, y.as_ptr(), 3, out.as_mut_ptr(), 3)
+        };
         assert_eq!(n, 3);
         assert_eq!(out, [2.5, 4.5, 6.5]);
 
         // ScalarMul: out = x * 3 (b unused / null)
         let mut out2 = [0.0f32; 3];
         let n2 = unsafe {
-            cerberus_gpu_submit(2, 3.0, x.as_ptr(), 3, std::ptr::null(), 0, out2.as_mut_ptr(), 3)
+            cerberus_gpu_submit(
+                2,
+                3.0,
+                x.as_ptr(),
+                3,
+                std::ptr::null(),
+                0,
+                out2.as_mut_ptr(),
+                3,
+            )
         };
         assert_eq!(n2, 3);
         assert_eq!(out2, [3.0, 6.0, 9.0]);
@@ -728,18 +756,24 @@ mod tests {
         let mut out = [0.0f32; 2];
         // mismatched input lengths -> -1
         assert_eq!(
-            unsafe { cerberus_gpu_submit(0, 0.0, a.as_ptr(), 2, b.as_ptr(), 1, out.as_mut_ptr(), 2) },
+            unsafe {
+                cerberus_gpu_submit(0, 0.0, a.as_ptr(), 2, b.as_ptr(), 1, out.as_mut_ptr(), 2)
+            },
             -1
         );
         // unknown kernel id -> -1
         assert_eq!(
-            unsafe { cerberus_gpu_submit(99, 0.0, a.as_ptr(), 2, a.as_ptr(), 2, out.as_mut_ptr(), 2) },
+            unsafe {
+                cerberus_gpu_submit(99, 0.0, a.as_ptr(), 2, a.as_ptr(), 2, out.as_mut_ptr(), 2)
+            },
             -1
         );
         // out buffer too small -> -1
         let mut small = [0.0f32; 1];
         assert_eq!(
-            unsafe { cerberus_gpu_submit(0, 0.0, a.as_ptr(), 2, a.as_ptr(), 2, small.as_mut_ptr(), 1) },
+            unsafe {
+                cerberus_gpu_submit(0, 0.0, a.as_ptr(), 2, a.as_ptr(), 2, small.as_mut_ptr(), 1)
+            },
             -1
         );
     }
