@@ -216,16 +216,21 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 
 	// 9P capability namespace with a sample local VRAM device.
 	//
-	// DOCUMENTED STUB — GPU COMPUTE DISPATCH is not implemented. This registers a
-	// VRAM resource (a quota-bearing, capability-grantable namespace entry, so it
-	// lists in `cerberus devices` and opening its ctl mints a data-plane grant),
-	// but there is NO GPU compute backend anywhere in the daemon: no wgpu/CUDA
-	// binding, and the scheduler has no GPU dispatch path — a task never runs on a
-	// GPU. Remote GPU compute is Frontier (ARCHITECTURE.md §8); wiring a real
-	// backend (device enumeration, kernel upload, VRAM-quota-enforced execution,
-	// result readback over the data plane) is a from-scratch effort. Do not
-	// present GPU offload as working. (Real cross-node compute today is WASM/CPU:
-	// `cerberus run --on <peer>`.)
+	// DOCUMENTED GAP — remote GPU compute is not wired end-to-end, but this is a
+	// WIRING gap, not a missing backend. core/runtime/src/gpu/wgpu_backend.rs is a
+	// REAL, tested wgpu compute path (kernel → WGSL shader → buffer upload →
+	// dispatch → readback, on Vulkan/Metal/DX12/GL, with a SoftwareGpu fallback),
+	// gated behind a default-OFF `gpu` cargo feature. What is missing:
+	//   1. it is not exposed across the core/cabi Go↔Rust FFI (which today bridges
+	//      only the capability kernel — see daemon/ffi/kernel_ffi.go), and
+	//   2. the Go scheduler has no GPU dispatch path.
+	// So this VRAM entry is a capability-grantable namespace resource only (it
+	// lists in `cerberus devices`; opening its ctl mints a data-plane grant) — no
+	// task actually runs on a GPU yet. Closing it is an integration effort (cabi
+	// export + scheduler hook + result marshaling over the data plane + enabling
+	// the `gpu` feature), NOT a §8 Frontier item (those are zk-WASM
+	// proof-of-inference, RDMA-over-TB off-Mac, etc.). Real cross-node compute
+	// today is WASM/CPU: `cerberus run --on <peer>`.
 	ns := ninep.New(kernel)
 	q := contract.Quota{Bytes: 2 * 1024 * 1024 * 1024}
 	ns.Register("/cer/dev/vram/local/0",
