@@ -22,7 +22,7 @@ func TestVerifyRejectsHugeCountWithoutHang(t *testing.T) {
 	putU32 := func(v uint32) { var x [4]byte; binary.BigEndian.PutUint32(x[:], v); b = append(b, x[:]...) }
 	putLenBytes := func(p []byte) { putU32(uint32(len(p))); b = append(b, p...) }
 
-	b = append(b, 1)              // capEnvelopeVersion
+	b = append(b, capEnvelopeVersion) // envelope version (must match, or decode bails before the count loop)
 	putLenBytes(make([]byte, 16)) // Grant.ID
 	putLenBytes([]byte("gpu"))    // Resource.Kind
 	putLenBytes(make([]byte, 32)) // Resource.Node

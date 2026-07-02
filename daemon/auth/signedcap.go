@@ -59,8 +59,12 @@ var (
 )
 
 // capEnvelopeVersion is the wire-format version of the envelope. Bumped only on
-// a breaking change to canonicalBytes.
-const capEnvelopeVersion uint8 = 1
+// a breaking change to canonicalBytes. v2 appends the Ancestors chain (the full
+// root..parent id list) so a verifier holding only a leaf envelope can deny it
+// when ANY ancestor is revoked, not just its immediate parent — closing the
+// one-hop revocation-cascade gap the Phase-1 audit found. Envelopes are ephemeral
+// (minted per grant, never persisted), so the bump needs no on-disk migration.
+const capEnvelopeVersion uint8 = 2
 
 // Grant is the authority a SignedCap conveys — the verifiable payload. It is the
 // "what" (resource + rights + quota), the "who" (issuer PeerID), the "when"
@@ -85,6 +89,12 @@ type Grant struct {
 	// Parent, when non-nil, is the id of the capability this was attenuated
 	// from — the attenuation metadata that lets a verifier confirm narrowing.
 	Parent *contract.CapID
+	// Ancestors is the full attenuation chain, oldest first: the root's id down
+	// to and including the immediate Parent. A root grant's is empty; a child's is
+	// parent.Ancestors + parent.ID. It travels in the envelope so a verifier that
+	// holds only this one leaf can still deny it when ANY ancestor id is revoked
+	// (revoking a root kills the whole delegated subtree).
+	Ancestors []contract.CapID
 	// NotBefore / Expiry bound the validity window (unix seconds). Expiry==0
 	// means no expiry.
 	NotBefore int64
@@ -196,6 +206,9 @@ func (s *SignedCap) IssueAttenuated(parentEnvelope []byte, child Grant) ([]byte,
 	}
 	pid := parent.ID
 	child.Parent = &pid
+	// Carry the full chain (root..parent) so revoking any ancestor denies this
+	// child on the wire, where the verifier holds only this leaf envelope.
+	child.Ancestors = append(append([]contract.CapID{}, parent.Ancestors...), parent.ID)
 	if err := checkNarrower(parent, child); err != nil {
 		return nil, err
 	}
@@ -242,6 +255,16 @@ func Verify(envelope []byte, issuerPub ed25519.PublicKey, now int64, isRevoked R
 		if isRevoked(g.ID) {
 			return Grant{}, ErrRevoked
 		}
+		// Deny if ANY ancestor (root..parent) is revoked: a revoked root kills the
+		// whole delegated subtree, even for a leaf whose immediate parent is still
+		// live. The chain travels in the envelope (v2), so no ancestor-envelope
+		// custody is needed.
+		for _, a := range g.Ancestors {
+			if isRevoked(a) {
+				return Grant{}, ErrRevoked
+			}
+		}
+		// Retained for robustness and for grants built without an Ancestors chain.
 		if g.Parent != nil && isRevoked(*g.Parent) {
 			return Grant{}, ErrRevoked
 		}
@@ -387,6 +410,11 @@ func canonicalBytes(g Grant) []byte {
 	b = appendU64(b, uint64(g.NotBefore))
 	b = appendU64(b, uint64(g.Expiry))
 	b = appendBytes(b, g.Nonce[:])
+	// ancestors: full chain (root..parent) so revocation cascades on the wire.
+	b = appendU32(b, uint32(len(g.Ancestors)))
+	for _, a := range g.Ancestors {
+		b = appendBytes(b, a[:])
+	}
 	return b
 }
 
@@ -483,6 +511,14 @@ func decodeCanonical(b []byte) (Grant, error) {
 	g.NotBefore = int64(d.u64())
 	g.Expiry = int64(d.u64())
 	copyFixed(g.Nonce[:], d.bytes())
+	// ancestors chain. The count is attacker-controlled, so stop the moment the
+	// buffer runs out (d.err) instead of trusting it (same guard as rights/caveats).
+	na := d.u32()
+	for i := uint32(0); i < na && d.err == nil; i++ {
+		var a contract.CapID
+		copyFixed(a[:], d.bytes())
+		g.Ancestors = append(g.Ancestors, a)
+	}
 	if d.err != nil {
 		return Grant{}, d.err
 	}

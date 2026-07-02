@@ -14,9 +14,10 @@ package auth
 //     window), with widening on each dimension rejected;
 //   - id + nonce uniqueness (regression for the all-zero-id minting bug, see
 //     TestIssueGeneratesUniqueID);
-//   - revocation of id and of immediate parent; and the DOCUMENTED LIMIT that
-//     the wire path cascades revocation only one hop (see the SECURITY-REVIEW
-//     block on TestRevocationCascadeDepthLimit);
+//   - revocation of id, of the immediate parent, and full-chain cascade —
+//     revoking any ancestor (incl. the root) denies a descendant at any depth,
+//     with subtree isolation (see TestRevocationCascadesFullChain /
+//     TestRevocationCascadeMidChainAndIsolation);
 //   - time bounds with exact boundary conditions;
 //   - signature fail-closed on wrong key / tamper / truncation / padding /
 //     non-canonical re-encode;
@@ -284,24 +285,14 @@ func TestRevocationByIDAndImmediateParent(t *testing.T) {
 	}
 }
 
-// TestRevocationCascadeDepthLimit documents a SECURITY-LOGIC LIMITATION found in
-// this audit that needs human review.
-//
-// SECURITY-REVIEW (do not "fix" silently): the wire verifier (Verify) consults
-// the revocation predicate ONLY for the leaf's own id and its IMMEDIATE parent
-// id (signedcap.go Verify, steps 5). It does not walk the full ancestor chain,
-// because a node that receives a single delegated envelope may not hold the
-// ancestor envelopes. Consequence: revoking a ROOT capability does NOT deny a
-// grandchild — the grandchild's Parent points at the (middle) child, which is
-// not the revoked id. An operator who revokes a root reasonably expects the whole
-// delegated subtree to die; today only depth-1 descendants do.
-//
-// This test asserts the CURRENT (limited) behavior so it stays green and the
-// limit is pinned; the companion TestRevocationRootShouldCascade_SKIP records the
-// DESIRED behavior and is skipped pending a design decision (full-chain custody,
-// or an OR-set that enumerates descendants on root revocation). See the final
-// report's "Security weaknesses for human review" section.
-func TestRevocationCascadeDepthLimit(t *testing.T) {
+// TestRevocationCascadesFullChain verifies the fix for the one-hop-cascade
+// weakness this audit found: the wire verifier (Verify) now consults the
+// revocation predicate for the leaf's own id AND every ancestor in the chain the
+// v2 envelope carries (Grant.Ancestors = root..parent), not just the immediate
+// parent. Consequence: revoking a ROOT denies every descendant at any depth,
+// which is what an operator revoking a root reasonably expects — and it holds for
+// a verifier that has only the single leaf envelope (no ancestor custody needed).
+func TestRevocationCascadesFullChain(t *testing.T) {
 	sc, pub := newSC(t, seed32())
 	now := time.Now().Unix()
 
@@ -317,30 +308,66 @@ func TestRevocationCascadeDepthLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Revoke the ROOT.
+	// Revoke the ROOT only.
 	rev := map[contract.CapID]bool{root.ID: true}
 	pred := func(id contract.CapID) bool { return rev[id] }
 
-	// Depth-1 child: denied (its immediate parent is the root).
+	// Depth-1 child: denied (immediate parent is the root).
 	if _, err := Verify(childEnv, pub, now, pred); !errors.Is(err, ErrRevoked) {
 		t.Fatalf("depth-1 child must be denied when root is revoked, got %v", err)
 	}
-	// Depth-2 grandchild: CURRENTLY still verifies (the documented limit). If this
-	// ever starts failing because cascade was deepened, flip this expectation and
-	// un-skip TestRevocationRootShouldCascade_SKIP.
-	if _, err := Verify(grandEnv, pub, now, pred); err != nil {
-		t.Fatalf("depth-2 cascade appears to have changed (grandchild denied): %v — "+
-			"if intentional, update this test and enable the _SKIP companion", err)
+	// Depth-2 grandchild: now ALSO denied — the root is in its ancestor chain.
+	if _, err := Verify(grandEnv, pub, now, pred); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("depth-2 grandchild must be denied when root is revoked (full-chain cascade), got %v", err)
 	}
 }
 
-// TestRevocationRootShouldCascade_SKIP records the DESIRED (currently unmet)
-// invariant: revoking a root should deny every descendant at any depth. Skipped
-// until the design question in the SECURITY-REVIEW block above is resolved.
-func TestRevocationRootShouldCascade_SKIP(t *testing.T) {
-	t.Skip("SECURITY-REVIEW / TODO: wire-path revocation cascades only one hop; " +
-		"revoking a root does not deny depth>=2 descendants. Needs a design decision " +
-		"(full-chain custody or descendant-enumerating OR-set) before enforcing.")
+// TestRevocationCascadeMidChainAndIsolation checks the cascade is precise: it
+// covers a deeper chain, denies only the revoked node's SUBTREE (not its
+// ancestors), and never touches an unrelated capability.
+func TestRevocationCascadeMidChainAndIsolation(t *testing.T) {
+	sc, pub := newSC(t, seed32())
+	now := time.Now().Unix()
+
+	// Chain: root -> c1 -> c2 -> c3.
+	rootEnv, _ := sc.Issue(vramGrant(t, time.Hour))
+	root, _ := Verify(rootEnv, pub, now, nil)
+	atten := func(parentEnv []byte, parent Grant) ([]byte, Grant) {
+		env, err := sc.IssueAttenuated(parentEnv, Grant{Rights: []contract.Right{contract.RightAlloc}, Resource: parent.Resource, Caveats: parent.Caveats})
+		if err != nil {
+			t.Fatal(err)
+		}
+		g, err := Verify(env, pub, now, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return env, g
+	}
+	c1Env, c1 := atten(rootEnv, root)
+	c2Env, c2 := atten(c1Env, c1)
+	c3Env, _ := atten(c2Env, c2)
+
+	// An unrelated cap minted independently must be unaffected by any revocation here.
+	otherEnv, _ := sc.Issue(vramGrant(t, time.Hour))
+
+	// Revoke the MIDDLE cap c1.
+	rev := map[contract.CapID]bool{c1.ID: true}
+	pred := func(id contract.CapID) bool { return rev[id] }
+
+	// c1's subtree (c1, c2, c3) is denied.
+	for name, env := range map[string][]byte{"c1": c1Env, "c2": c2Env, "c3": c3Env} {
+		if _, err := Verify(env, pub, now, pred); !errors.Is(err, ErrRevoked) {
+			t.Fatalf("%s must be denied when its ancestor c1 is revoked, got %v", name, err)
+		}
+	}
+	// The root (an ANCESTOR of c1, not a descendant) is untouched.
+	if _, err := Verify(rootEnv, pub, now, pred); err != nil {
+		t.Fatalf("root must stay valid when a descendant (c1) is revoked, got %v", err)
+	}
+	// An unrelated capability is untouched.
+	if _, err := Verify(otherEnv, pub, now, pred); err != nil {
+		t.Fatalf("unrelated cap must be unaffected by revoking c1, got %v", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
