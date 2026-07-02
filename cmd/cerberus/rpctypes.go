@@ -175,6 +175,22 @@ type AssertBeliefResponse struct {
 	Values   []string
 }
 
+// audio (real-time session over the data plane)
+type AudioLoopbackRequest struct {
+	Token  string
+	FreqHz float64
+	Frames int
+}
+type AudioLoopbackResponse struct {
+	FramesSent int
+	FramesRecv int
+	SampleRate int
+	Channels   int
+	FreqHz     float64
+	DurationMS int64
+	Backend    string
+}
+
 // gpu (compute dispatch)
 type GpuDispatchRequest struct {
 	Token  string

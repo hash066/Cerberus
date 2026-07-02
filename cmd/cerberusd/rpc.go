@@ -26,6 +26,7 @@ import (
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/api"
+	"github.com/hash066/cerberus/daemon/audiolink"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/economy"
 	"github.com/hash066/cerberus/daemon/gpu"
@@ -526,6 +527,48 @@ func (d *DaemonRPC) FSList(req *FSListRequest, resp *FSListResponse) error {
 		return err
 	}
 	resp.Paths = paths
+	return nil
+}
+
+// ---- audio (real-time session over the data plane) ------------------------
+
+type AudioLoopbackRequest struct {
+	Token  string
+	FreqHz float64
+	Frames int
+}
+type AudioLoopbackResponse struct {
+	FramesSent int
+	FramesRecv int
+	SampleRate int
+	Channels   int
+	FreqHz     float64
+	DurationMS int64
+	Backend    string
+}
+
+// AudioLoopback runs one real audio session end-to-end over the QUIC data plane
+// (audiolink.RunLoopback) and returns delivery stats — the same control-plane
+// grant → data-plane bytes → jitter-buffered reconstruction path a cross-node
+// mic→speaker session uses, exercised locally without audio hardware. Requires
+// exec (it runs a streaming session).
+func (d *DaemonRPC) AudioLoopback(req *AudioLoopbackRequest, resp *AudioLoopbackResponse) error {
+	if _, err := d.authz.Authorize(req.Token, "exec", ""); err != nil {
+		return fmt.Errorf("unauthorized (audio requires exec): %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	stats, err := audiolink.RunLoopback(ctx, req.FreqHz, req.Frames)
+	if err != nil {
+		return err
+	}
+	resp.FramesSent = stats.FramesSent
+	resp.FramesRecv = stats.FramesRecv
+	resp.SampleRate = stats.SampleRate
+	resp.Channels = stats.Channels
+	resp.FreqHz = stats.FreqHz
+	resp.DurationMS = stats.Duration.Milliseconds()
+	resp.Backend = stats.Backend
 	return nil
 }
 

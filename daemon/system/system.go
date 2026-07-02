@@ -95,12 +95,18 @@ type DeviceRef struct {
 // DOCUMENTED STUB — cross-node audio SESSIONS are not composed here. This
 // registers/discovers audio endpoints (so they list in `cerberus devices` and
 // are capability-grantable), and the streaming transport exists as a tested
-// library (daemon/audiolink over the QUIC data plane). But nothing in the
-// running daemon starts a live remote capture→stream→playback session, and
-// there is no CLI/API verb to do so. Wiring a real audio session (device
-// capture/playback + session control + jitter handling end-to-end over the
-// mesh) is a substantial follow-up, not implemented. Do not present remote
-// audio as working (ARCHITECTURE.md §8 maturity honesty).
+// library (daemon/audiolink over the QUIC data plane). A driveable SESSION now
+// exists: `cerberus audio loopback` / DaemonRPC.AudioLoopback runs the full
+// pipeline (control-plane grant, data-plane bytes, jitter-buffered
+// reconstruction) over the REAL data plane on one node (audiolink.RunLoopback).
+// What is NOT yet composed is a cross-NODE mic-to-speaker session: node B opening
+// THIS node's registered speaker endpoint over the mesh and streaming its mic to
+// it. That needs the device ctl-open to bind to a live speaker sink / mic source
+// on each side plus a second node, and its end-to-end verification needs real
+// audio hardware on two machines. Endpoints are registered + grantable and the
+// transport is proven; the remaining gap is the cross-node device-open
+// composition. Do not present remote mic/speaker sharing as working yet
+// (maturity honesty).
 func registerAudioDevices(ns *ninep.Server) []DeviceRef {
 	endpoints, err := audio.EnumerateEndpoints()
 	if err != nil {

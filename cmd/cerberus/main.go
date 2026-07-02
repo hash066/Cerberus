@@ -15,6 +15,7 @@
 //	components add|list            local named-component registry (name -> CID)
 //	fs put|get|ls                  distributed filesystem (erasure-coded, mesh-scattered)
 //	gpu <kernel> …                 GPU/CPU compute dispatch (real GPU under -tags ffi)
+//	audio loopback …               real-time audio session over the QUIC data plane
 //	conflicts assert|list|resolve … CRDT belief assertion / conflict inspection / resolution
 //	economy challenge …             dispute a pending settlement with a fraud proof
 //	metrics                         fetch the local Prometheus /metrics text
@@ -166,6 +167,8 @@ func run(args []string) int {
 		return cmdFS(rest, jsonOut)
 	case "gpu":
 		return cmdGPU(rest, jsonOut)
+	case "audio":
+		return cmdAudio(rest, jsonOut)
 	case "conflicts":
 		return cmdConflicts(rest, jsonOut)
 	case "economy":
@@ -203,6 +206,7 @@ Commands:
   fs get /cer/fs/name [local-file]    Reconstruct a stored file (to a file, or stdout)
   fs ls                               List files stored in /cer/fs
   gpu <kernel> <a> [b] [--param N]    Run a compute kernel (vector-add|saxpy|scalar-mul); reports backend
+  audio loopback [--freq HZ] [--frames N]  Run a real audio session over the QUIC data plane; report delivery
   conflicts assert <subject> <value> --agent <name> [--doc <hex>]
                                        Assert an agent belief; concurrent contradictory asserts surface a conflict
   conflicts list [--doc <hex>]        Open CRDT belief conflicts
@@ -639,6 +643,61 @@ func cmdComponents(args []string, jsonOut bool) int {
 	}
 }
 
+
+// ---- audio (real-time session over the data plane) ------------------------
+
+func cmdAudio(args []string, jsonOut bool) int {
+	if len(args) == 0 || args[0] != "loopback" {
+		fmt.Fprintln(os.Stderr, "usage: cerberus audio loopback [--freq HZ] [--frames N]")
+		fmt.Fprintln(os.Stderr, "  runs a real audio session over the QUIC data plane and reports delivery")
+		return exitUsage
+	}
+	rest := args[1:]
+	freqStr, rest := extractValueFlag(rest, "--freq")
+	framesStr, _ := extractValueFlag(rest, "--frames")
+	req := &AudioLoopbackRequest{}
+	if freqStr != "" {
+		f, err := strconv.ParseFloat(freqStr, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "audio: --freq %q: %v\n", freqStr, err)
+			return exitUsage
+		}
+		req.FreqHz = f
+	}
+	if framesStr != "" {
+		n, err := strconv.Atoi(framesStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "audio: --frames %q: %v\n", framesStr, err)
+			return exitUsage
+		}
+		req.Frames = n
+	}
+
+	token, code := loadToken()
+	if code != exitOK {
+		return code
+	}
+	client, code := dial()
+	if code != exitOK {
+		return code
+	}
+	defer client.Close()
+
+	req.Token = token
+	var resp AudioLoopbackResponse
+	if err := client.Call("DaemonRPC.AudioLoopback", req, &resp); err != nil {
+		return rpcErr("audio", err)
+	}
+	if jsonOut {
+		return printJSON(resp)
+	}
+	fmt.Printf("Audio session over %s: %d/%d frames delivered (%.0f Hz, %d Hz %dch) in %dms\n",
+		resp.Backend, resp.FramesRecv, resp.FramesSent, resp.FreqHz, resp.SampleRate, resp.Channels, resp.DurationMS)
+	if resp.FramesRecv == resp.FramesSent {
+		fmt.Println("OK — every frame was reconstructed (control-plane grant → data-plane bytes → jitter buffer).")
+	}
+	return exitOK
+}
 
 // ---- gpu (compute dispatch: vector-add / saxpy / scalar-mul) --------------
 
