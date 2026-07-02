@@ -89,6 +89,24 @@ intptr_t cerberus_blockstore_get(const uint8_t *cid, uint8_t *out, size_t cap);
 /* 1 = the store holds a block for cid[36], 0 = absent or malformed CID. */
 int cerberus_blockstore_has(const uint8_t *cid);
 
+/* ── GPU dispatch (ARCHITECTURE §5, core/runtime GpuDispatch) ───────────────────
+ * Run an element-wise f32 kernel on the real backend and copy the output into
+ * `out`. kernel_id: 0 = VectorAdd(a,b), 1 = SAXPY(alpha=param; x=a, y=b),
+ * 2 = ScalarMul(scalar=param; x=a). `b`/`b_len` are ignored for ScalarMul.
+ * Output length equals the (common) input length. Returns f32 written (>=0), or
+ * -1 on error (unknown kernel, unequal input lengths, out too small, backend
+ * failure). Software backend by default (real host compute); the wgpu device when
+ * cabi is built with `--features gpu` and an adapter is present. */
+intptr_t cerberus_gpu_submit(uint32_t kernel_id, float param,
+                             const float *a, size_t a_len,
+                             const float *b, size_t b_len,
+                             float *out, size_t out_cap);
+
+/* The backend cerberus_gpu_submit would use now: "gpu-wgpu" only when built
+ * --features gpu AND a physical adapter is present, else "cpu-software". Static,
+ * never freed. */
+const char *cerberus_gpu_backend(void);
+
 /* ── sys/revocations OR-set (Phase E4, core/crdt RevocationSet) ─────────────────
  * Grow-only convergent set of revoked 16-byte capability ids. The merge/export
  * wire format is defined by THIS ABI (core/crdt exposes no serializer): a flat

@@ -28,6 +28,7 @@ import (
 	"github.com/hash066/cerberus/daemon/api"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/economy"
+	"github.com/hash066/cerberus/daemon/gpu"
 	"github.com/hash066/cerberus/daemon/ledger"
 	"github.com/hash066/cerberus/daemon/lifecycle"
 	"github.com/hash066/cerberus/daemon/mesh"
@@ -525,6 +526,37 @@ func (d *DaemonRPC) FSList(req *FSListRequest, resp *FSListResponse) error {
 		return err
 	}
 	resp.Paths = paths
+	return nil
+}
+
+// ---- gpu (compute dispatch) -----------------------------------------------
+
+type GpuDispatchRequest struct {
+	Token  string
+	Kernel int // 0=VectorAdd, 1=Saxpy(alpha=Param), 2=ScalarMul(scalar=Param)
+	Param  float32
+	A      []float32
+	B      []float32 // ignored for ScalarMul
+}
+type GpuDispatchResponse struct {
+	Output  []float32
+	Backend string // which backend actually ran: "cpu-software" or "gpu-wgpu"/…
+}
+
+// GpuDispatch runs an element-wise f32 kernel via daemon/gpu, which uses the real
+// GPU (wgpu) when the daemon is built `-tags ffi` with cabi `--features gpu` and
+// an adapter is present, else a real pure-Go CPU backend. The response reports
+// which backend actually ran. Requires exec (it runs compute).
+func (d *DaemonRPC) GpuDispatch(req *GpuDispatchRequest, resp *GpuDispatchResponse) error {
+	if _, err := d.authz.Authorize(req.Token, "exec", ""); err != nil {
+		return fmt.Errorf("unauthorized (gpu requires exec): %w", err)
+	}
+	out, backend, err := gpu.Dispatch(gpu.Kernel(req.Kernel), req.Param, req.A, req.B)
+	if err != nil {
+		return err
+	}
+	resp.Output = out
+	resp.Backend = backend
 	return nil
 }
 

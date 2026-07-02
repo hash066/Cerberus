@@ -175,6 +175,19 @@ type AssertBeliefResponse struct {
 	Values   []string
 }
 
+// gpu (compute dispatch)
+type GpuDispatchRequest struct {
+	Token  string
+	Kernel int
+	Param  float32
+	A      []float32
+	B      []float32
+}
+type GpuDispatchResponse struct {
+	Output  []float32
+	Backend string
+}
+
 // /cer/fs (distributed filesystem)
 type FSPutRequest struct {
 	Token string

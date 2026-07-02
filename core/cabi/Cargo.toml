@@ -17,3 +17,11 @@ cerberus-ocap = { path = "../ocap" }
 cerberus-runtime = { path = "../runtime", default-features = false }
 cerberus-crdt = { path = "../crdt" }
 serde_json = "1"
+
+[features]
+# `gpu` forwards to cerberus-runtime/gpu so a cabi built with `--features gpu`
+# exports cerberus_gpu_submit backed by the real wgpu device (falling back to the
+# software backend when no adapter). OFF by default: the default staticlib keeps
+# the software GpuDispatch (real host compute) and never pulls wgpu, so the lean
+# windows-gnu cgo build is unchanged.
+gpu = ["cerberus-runtime/gpu"]

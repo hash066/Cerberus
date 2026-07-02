@@ -22,7 +22,7 @@ use std::sync::{Mutex, OnceLock};
 use cerberus_contract::{CapId, CapKernel, Caveat, Quota, ResourceKind, ResourceRef, Right};
 use cerberus_crdt::RevocationSet;
 use cerberus_ocap::SignedKernel;
-use cerberus_runtime::{BlockStore, Cid};
+use cerberus_runtime::{BlockStore, Cid, GpuDispatch, KernelSource, SoftwareGpu};
 
 /// Panic-safety guard for the FFI boundary (production-readiness hardening):
 /// a Rust panic must never unwind across an `extern "C"` fn into Go via cgo —
@@ -408,6 +408,103 @@ pub unsafe extern "C" fn cerberus_blockstore_has(cid: *const u8) -> c_int {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GPU dispatch (ARCHITECTURE §5 "AI accel via wgpu") — the Go↔Rust bridge for
+// core/runtime's GpuDispatch. The Go scheduler/CLI marshals an f32 kernel + input
+// buffers across this ABI; the Rust side runs it on a REAL backend and copies the
+// result back.
+//
+// Backend selection is honest (CLAUDE.md maturity): with the `gpu` feature ON
+// (`--features gpu`, which forwards to cerberus-runtime/gpu) we try the real wgpu
+// device first and fall back to the software backend only when there is genuinely
+// no adapter (headless / GPU-less host). The DEFAULT build ships the software
+// backend — which is REAL compute on the host, not a stub — so the dispatch path
+// works end-to-end everywhere, and lights up on a physical GPU when built with the
+// feature. We never fabricate a result when nothing ran.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// gpu_backend picks the strongest available GpuDispatch: the real wgpu device
+/// when the `gpu` feature is on and an adapter exists, else the real software
+/// backend. Boxed so both arms share one type.
+fn gpu_backend() -> Box<dyn GpuDispatch> {
+    #[cfg(feature = "gpu")]
+    {
+        if let Ok(dev) = cerberus_runtime::WgpuDispatch::new() {
+            return Box::new(dev);
+        }
+        // NoAdapter (or backend init failure): fall through to software — labelled,
+        // not faked.
+    }
+    Box::new(SoftwareGpu::new())
+}
+
+/// Run an element-wise f32 GPU kernel and copy the output into `out`.
+///
+/// `kernel_id`: 0 = VectorAdd(a,b), 1 = SAXPY(alpha=`param`; x=a, y=b),
+/// 2 = ScalarMul(scalar=`param`; x=a). `b`/`b_len` are ignored for ScalarMul.
+/// Returns the number of f32 written (>= 0), or -1 on any error (unknown kernel,
+/// mismatched/!equal input lengths, `out` too small, or a backend failure).
+///
+/// # Safety
+/// `a` must point to `a_len` readable f32; `b` to `b_len` readable f32 (may be
+/// null when unused); `out` to `out_cap` writable f32.
+#[no_mangle]
+pub unsafe extern "C" fn cerberus_gpu_submit(
+    kernel_id: u32,
+    param: f32,
+    a: *const f32,
+    a_len: usize,
+    b: *const f32,
+    b_len: usize,
+    out: *mut f32,
+    out_cap: usize,
+) -> isize {
+    guard(-1, || {
+        let kernel = match kernel_id {
+            0 => KernelSource::VectorAdd,
+            1 => KernelSource::Saxpy { alpha: param },
+            2 => KernelSource::ScalarMul { scalar: param },
+            _ => return -1,
+        };
+        let a_slice: &[f32] = if a.is_null() { &[] } else { slice::from_raw_parts(a, a_len) };
+        let inputs: Vec<&[f32]> = match kernel {
+            KernelSource::ScalarMul { .. } => vec![a_slice],
+            _ => {
+                let b_slice: &[f32] = if b.is_null() { &[] } else { slice::from_raw_parts(b, b_len) };
+                vec![a_slice, b_slice]
+            }
+        };
+        let result = match gpu_backend().submit(&kernel, &inputs) {
+            Ok(v) => v,
+            Err(_) => return -1,
+        };
+        if !result.is_empty() {
+            if out.is_null() || out_cap < result.len() {
+                return -1;
+            }
+            std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len());
+        }
+        result.len() as isize
+    })
+}
+
+/// The backend cerberus_gpu_submit would use right now (static, never freed):
+/// `"gpu-wgpu"` only when the `gpu` feature is on AND a physical adapter is
+/// actually available, else `"cpu-software"`. Honest by construction — a caller
+/// can report exactly what ran, and we never say "gpu" when none is present.
+#[no_mangle]
+pub extern "C" fn cerberus_gpu_backend() -> *const c_char {
+    guard(std::ptr::null(), || {
+        #[cfg(feature = "gpu")]
+        {
+            if cerberus_runtime::WgpuDispatch::new().is_ok() {
+                return c"gpu-wgpu".as_ptr();
+            }
+        }
+        c"cpu-software".as_ptr()
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // sys/revocations OR-set (Phase E4 — core/crdt RevocationSet).
 //
 // A grow-only, convergent set of revoked capability ids (`CapId`, 16 bytes).
@@ -586,6 +683,73 @@ mod tests {
             assert_eq!(cerberus_cap_verify(child, c"read".as_ptr(), 0), 0); // read kept
             assert_ne!(cerberus_cap_verify(child, c"alloc".as_ptr(), 0), 0); // alloc dropped
         }
+    }
+
+    // GPU dispatch across the C-ABI: these prove cerberus_gpu_submit runs the real
+    // kernel (software backend in the default test build; identical numerics to the
+    // wgpu path) and copies the result back — the exact call the Go daemon makes
+    // under -tags ffi.
+    #[test]
+    fn gpu_submit_vector_add_computes_real_result() {
+        let a = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [10.0f32, 20.0, 30.0, 40.0];
+        let mut out = [0.0f32; 4];
+        // SAFETY: a/b are 4 readable f32; out is 4 writable f32.
+        let n = unsafe {
+            cerberus_gpu_submit(0, 0.0, a.as_ptr(), a.len(), b.as_ptr(), b.len(), out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(n, 4);
+        assert_eq!(out, [11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn gpu_submit_saxpy_and_scalar_mul() {
+        // SAXPY: out = 2*x + y
+        let x = [1.0f32, 2.0, 3.0];
+        let y = [0.5f32, 0.5, 0.5];
+        let mut out = [0.0f32; 3];
+        let n = unsafe { cerberus_gpu_submit(1, 2.0, x.as_ptr(), 3, y.as_ptr(), 3, out.as_mut_ptr(), 3) };
+        assert_eq!(n, 3);
+        assert_eq!(out, [2.5, 4.5, 6.5]);
+
+        // ScalarMul: out = x * 3 (b unused / null)
+        let mut out2 = [0.0f32; 3];
+        let n2 = unsafe {
+            cerberus_gpu_submit(2, 3.0, x.as_ptr(), 3, std::ptr::null(), 0, out2.as_mut_ptr(), 3)
+        };
+        assert_eq!(n2, 3);
+        assert_eq!(out2, [3.0, 6.0, 9.0]);
+    }
+
+    #[test]
+    fn gpu_submit_rejects_bad_requests() {
+        let a = [1.0f32, 2.0];
+        let b = [1.0f32]; // mismatched length
+        let mut out = [0.0f32; 2];
+        // mismatched input lengths -> -1
+        assert_eq!(
+            unsafe { cerberus_gpu_submit(0, 0.0, a.as_ptr(), 2, b.as_ptr(), 1, out.as_mut_ptr(), 2) },
+            -1
+        );
+        // unknown kernel id -> -1
+        assert_eq!(
+            unsafe { cerberus_gpu_submit(99, 0.0, a.as_ptr(), 2, a.as_ptr(), 2, out.as_mut_ptr(), 2) },
+            -1
+        );
+        // out buffer too small -> -1
+        let mut small = [0.0f32; 1];
+        assert_eq!(
+            unsafe { cerberus_gpu_submit(0, 0.0, a.as_ptr(), 2, a.as_ptr(), 2, small.as_mut_ptr(), 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn gpu_backend_reports_cpu_software_without_gpu_feature() {
+        // The default test build has no `gpu` feature, so no adapter is attempted
+        // and the honest answer is the software backend.
+        let s = unsafe { CStr::from_ptr(cerberus_gpu_backend()) };
+        assert_eq!(s.to_str().unwrap(), "cpu-software");
     }
 
     #[test]

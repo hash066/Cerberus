@@ -216,21 +216,19 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 
 	// 9P capability namespace with a sample local VRAM device.
 	//
-	// DOCUMENTED GAP — remote GPU compute is not wired end-to-end, but this is a
-	// WIRING gap, not a missing backend. core/runtime/src/gpu/wgpu_backend.rs is a
-	// REAL, tested wgpu compute path (kernel → WGSL shader → buffer upload →
-	// dispatch → readback, on Vulkan/Metal/DX12/GL, with a SoftwareGpu fallback),
-	// gated behind a default-OFF `gpu` cargo feature. What is missing:
-	//   1. it is not exposed across the core/cabi Go↔Rust FFI (which today bridges
-	//      only the capability kernel — see daemon/ffi/kernel_ffi.go), and
-	//   2. the Go scheduler has no GPU dispatch path.
-	// So this VRAM entry is a capability-grantable namespace resource only (it
-	// lists in `cerberus devices`; opening its ctl mints a data-plane grant) — no
-	// task actually runs on a GPU yet. Closing it is an integration effort (cabi
-	// export + scheduler hook + result marshaling over the data plane + enabling
-	// the `gpu` feature), NOT a §8 Frontier item (those are zk-WASM
-	// proof-of-inference, RDMA-over-TB off-Mac, etc.). Real cross-node compute
-	// today is WASM/CPU: `cerberus run --on <peer>`.
+	// GPU compute dispatch is now WIRED: daemon/gpu.Dispatch runs f32 kernels via
+	// core/cabi's cerberus_gpu_submit (real wgpu device under `-tags ffi` +
+	// `--features gpu` when an adapter is present, else a real pure-Go/Rust
+	// software backend), exposed as `cerberus gpu <kernel>` / DaemonRPC.GpuDispatch
+	// — and the result honestly reports which backend actually ran.
+	//
+	// This VRAM entry, however, is still only a capability-grantable namespace
+	// resource: it lists in `cerberus devices` and opening its ctl mints a
+	// data-plane grant, but the GPU dispatch path above does NOT yet place work
+	// against this VRAM quota or route through the scheduler for remote placement —
+	// so a peer cannot yet target THIS node's GPU by opening its device. Wiring
+	// dispatch to the scheduler + VRAM-quota accounting is the remaining step;
+	// none of it is a §8 Frontier item.
 	ns := ninep.New(kernel)
 	q := contract.Quota{Bytes: 2 * 1024 * 1024 * 1024}
 	ns.Register("/cer/dev/vram/local/0",

@@ -14,6 +14,7 @@
 //	caps mint|attenuate|revoke|list capability-token lifecycle
 //	components add|list            local named-component registry (name -> CID)
 //	fs put|get|ls                  distributed filesystem (erasure-coded, mesh-scattered)
+//	gpu <kernel> …                 GPU/CPU compute dispatch (real GPU under -tags ffi)
 //	conflicts assert|list|resolve … CRDT belief assertion / conflict inspection / resolution
 //	economy challenge …             dispute a pending settlement with a fraud proof
 //	metrics                         fetch the local Prometheus /metrics text
@@ -37,6 +38,7 @@ import (
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
+	"github.com/hash066/cerberus/daemon/gpu"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/components"
 	"github.com/hash066/cerberus/daemon/discovery"
@@ -162,6 +164,8 @@ func run(args []string) int {
 		return cmdComponents(rest, jsonOut)
 	case "fs":
 		return cmdFS(rest, jsonOut)
+	case "gpu":
+		return cmdGPU(rest, jsonOut)
 	case "conflicts":
 		return cmdConflicts(rest, jsonOut)
 	case "economy":
@@ -198,6 +202,7 @@ Commands:
   fs put <local-file> [/cer/fs/name]  Store a file in the distributed FS (erasure-coded, scattered)
   fs get /cer/fs/name [local-file]    Reconstruct a stored file (to a file, or stdout)
   fs ls                               List files stored in /cer/fs
+  gpu <kernel> <a> [b] [--param N]    Run a compute kernel (vector-add|saxpy|scalar-mul); reports backend
   conflicts assert <subject> <value> --agent <name> [--doc <hex>]
                                        Assert an agent belief; concurrent contradictory asserts surface a conflict
   conflicts list [--doc <hex>]        Open CRDT belief conflicts
@@ -634,6 +639,99 @@ func cmdComponents(args []string, jsonOut bool) int {
 	}
 }
 
+
+// ---- gpu (compute dispatch: vector-add / saxpy / scalar-mul) --------------
+
+// parseFloats parses a comma-separated list of f32 (e.g. "1,2,3.5").
+func parseFloats(s string) ([]float32, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]float32, 0, len(parts))
+	for _, p := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 32)
+		if err != nil {
+			return nil, fmt.Errorf("bad number %q: %w", p, err)
+		}
+		out = append(out, float32(f))
+	}
+	return out, nil
+}
+
+func cmdGPU(args []string, jsonOut bool) int {
+	paramStr, args := extractValueFlag(args, "--param")
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: cerberus gpu <vector-add|saxpy|scalar-mul> <a,b,c> [<d,e,f>] [--param N]")
+		return exitUsage
+	}
+	kernel, ok := gpu.ParseKernel(args[0])
+	if !ok {
+		fmt.Fprintf(os.Stderr, "gpu: unknown kernel %q (vector-add | saxpy | scalar-mul)\n", args[0])
+		return exitUsage
+	}
+	rest := args[1:]
+	if len(rest) == 0 {
+		fmt.Fprintln(os.Stderr, "gpu: need at least one input buffer, e.g. cerberus gpu vector-add 1,2,3 10,20,30")
+		return exitUsage
+	}
+	a, err := parseFloats(rest[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gpu: input a: %v\n", err)
+		return exitUsage
+	}
+	var b []float32
+	if len(rest) > 1 {
+		if b, err = parseFloats(rest[1]); err != nil {
+			fmt.Fprintf(os.Stderr, "gpu: input b: %v\n", err)
+			return exitUsage
+		}
+	}
+	var param float32
+	if paramStr != "" {
+		p, perr := strconv.ParseFloat(paramStr, 32)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "gpu: --param %q: %v\n", paramStr, perr)
+			return exitUsage
+		}
+		param = float32(p)
+	}
+
+	token, code := loadToken()
+	if code != exitOK {
+		return code
+	}
+	client, code := dial()
+	if code != exitOK {
+		return code
+	}
+	defer client.Close()
+
+	req := &GpuDispatchRequest{Token: token, Kernel: int(kernel), Param: param, A: a, B: b}
+	var resp GpuDispatchResponse
+	if err := client.Call("DaemonRPC.GpuDispatch", req, &resp); err != nil {
+		return rpcErr("gpu", err)
+	}
+	if jsonOut {
+		return printJSON(resp)
+	}
+	fmt.Printf("%s(%s) = %v\n", kernel, formatParam(kernel, param), resp.Output)
+	fmt.Printf("backend: %s\n", resp.Backend)
+	return exitOK
+}
+
+// formatParam renders the kernel's scalar parameter for display (alpha / scalar).
+func formatParam(k gpu.Kernel, param float32) string {
+	switch k {
+	case gpu.Saxpy:
+		return fmt.Sprintf("alpha=%g", param)
+	case gpu.ScalarMul:
+		return fmt.Sprintf("scalar=%g", param)
+	default:
+		return "a,b"
+	}
+}
 
 // ---- /cer/fs (distributed filesystem: put / get / ls) ---------------------
 
