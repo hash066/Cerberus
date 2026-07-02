@@ -140,6 +140,20 @@ func (s *SignedCap) Issue(g Grant) ([]byte, error) {
 	}
 	copy(g.Issuer[:], pub)
 
+	// Every minted capability MUST carry a unique id: the id is the revocation
+	// key (RevocationPredicate / OR-set) and the attenuation-provenance anchor a
+	// child records as its Parent. A caller using Issue directly (rather than
+	// NewGrant) would otherwise sign a grant with an all-zero id, so *every* such
+	// cap — and every IssueAttenuated child — would collide on id 000…0: revoking
+	// one would revoke them all, and a child's Parent pointer would be zero,
+	// breaking targeted revocation and cascade. Auto-fill a random id here, in the
+	// same fail-closed spirit as the Nonce below.
+	if g.ID == (contract.CapID{}) {
+		if _, err := rand.Read(g.ID[:]); err != nil {
+			return nil, err
+		}
+	}
+
 	if g.Nonce == ([12]byte{}) {
 		if _, err := rand.Read(g.Nonce[:]); err != nil {
 			return nil, err

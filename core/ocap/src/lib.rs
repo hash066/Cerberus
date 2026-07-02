@@ -463,6 +463,12 @@ impl cerberus_contract::CapKernel for SignedKernel {
     }
 }
 
+// Adversarial / property tests (Phase 1 security audit). In-crate so it can forge
+// capabilities against private internals the auditor must exercise (by_handle,
+// by_id, sign, insert, verify_sig).
+#[cfg(test)]
+mod adversarial_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
