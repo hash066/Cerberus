@@ -30,6 +30,9 @@ tauri-plugin-opener = "2"
 # Native clipboard access so "copy operator token" goes through the OS clipboard
 # via the Rust core (the webview asks; Rust writes) rather than a browser API.
 tauri-plugin-clipboard-manager = "2"
+# Spawn the bundled cerberusd sidecar (bundle.externalBin) on app startup so the
+# mesh comes up the moment the app opens — zero setup for beta testers.
+tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Rust performs every HTTP call to the daemon's localhost surfaces (status API,

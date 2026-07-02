@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.harshita.tray",
   "build": {
-    "frontendDist": "../src"
+    "frontendDist": "../src",
+    "beforeDevCommand": "node build-sidecar.mjs",
+    "beforeBuildCommand": "node build-sidecar.mjs"
   },
   "app": {
     "withGlobalTauri": true,
@@ -25,6 +27,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": [
+      "binaries/cerberusd"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

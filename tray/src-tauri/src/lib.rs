@@ -24,9 +24,13 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tauri::{Manager, RunEvent};
+use tauri_plugin_shell::process::CommandChild;
+use tauri_plugin_shell::ShellExt;
 
 // ---- daemon endpoints -------------------------------------------------------
 //
@@ -441,6 +445,39 @@ fn grant_device(path: String, rights: String) -> Result<String, String> {
     resp.into_string().map_err(|e| e.to_string())
 }
 
+// ---- bundled daemon (sidecar) -----------------------------------------------
+
+/// Holds the bundled cerberusd child process so it can be terminated when the app
+/// exits (otherwise closing the window would orphan a running daemon).
+struct DaemonChild(Mutex<Option<CommandChild>>);
+
+/// Launch the bundled cerberusd sidecar so the mesh is live the instant the app
+/// opens — the whole point of the one-click install (no terminal, no separate
+/// daemon). This is the SAME cmd/cerberusd binary a user could run by hand; the
+/// installer just ships it (bundle.externalBin) and we spawn it here.
+///
+/// Safe to call unconditionally: if a daemon is already running, cerberusd's
+/// single-instance lock makes this child exit immediately and the app simply
+/// talks to the daemon that's already up.
+fn spawn_daemon(app: &tauri::AppHandle) {
+    let sidecar = match app.shell().sidecar("cerberusd") {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            eprintln!("cerberus: bundled daemon unavailable (run cerberusd manually): {e}");
+            return;
+        }
+    };
+    match sidecar.spawn() {
+        Ok((mut rx, child)) => {
+            app.state::<DaemonChild>().0.lock().unwrap().replace(child);
+            // Drain the daemon's stdout/stderr so its pipe never fills and blocks
+            // it (cerberusd is chatty). Discarded here — the daemon logs itself.
+            tauri::async_runtime::spawn(async move { while rx.recv().await.is_some() {} });
+        }
+        Err(e) => eprintln!("cerberus: failed to launch bundled daemon: {e}"),
+    }
+}
+
 // ---- entrypoint -------------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -448,6 +485,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_shell::init())
+        .manage(DaemonChild(Mutex::new(None)))
+        .setup(|app| {
+            spawn_daemon(&app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             daemon_health,
@@ -462,6 +505,14 @@ pub fn run() {
             revoke_capability,
             grant_device,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Tear the bundled daemon down when the app quits so we never orphan it.
+            if let RunEvent::Exit = event {
+                if let Some(child) = app.state::<DaemonChild>().0.lock().unwrap().take() {
+                    let _ = child.kill();
+                }
+            }
+        });
 }
