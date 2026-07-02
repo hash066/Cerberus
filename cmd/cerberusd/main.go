@@ -449,6 +449,18 @@ func main() {
 			copy(resolver[:], []byte("operator"))
 			return crdtEngine.Resolve([]byte("daemon-doc"), resolver, subject, winning)
 		},
+		// POST /api/v1/beliefs — same daemon/state assertion DaemonRPC.AssertBelief
+		// makes (shared applyBeliefAssertion). The write side that creates
+		// conflicts for the panel; an empty agent defaults to the operator.
+		AssertBelief: func(agent, subject, value string) (bool, []string, error) {
+			if crdtEngine == nil {
+				return false, nil, fmt.Errorf("beliefs: CRDT engine not available")
+			}
+			if strings.TrimSpace(agent) == "" {
+				agent = "operator"
+			}
+			return applyBeliefAssertion(crdtEngine, []byte("daemon-doc"), agent, subject, value)
+		},
 		// POST /api/v1/cap/revoke — same auth issuer call DaemonRPC.CapsRevoke
 		// makes.
 		RevokeCap: func(id string) (bool, error) {

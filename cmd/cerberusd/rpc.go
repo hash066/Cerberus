@@ -704,32 +704,43 @@ func (d *DaemonRPC) AssertBelief(req *AssertBeliefRequest, resp *AssertBeliefRes
 	if agent == "" {
 		agent = claims.Subject
 	}
-	var actor contract.PeerID
-	copy(actor[:], []byte(agent))
-	delta, merr := json.Marshal(map[string]string{req.Subject: req.Value})
-	if merr != nil {
-		return fmt.Errorf("beliefs assert: encode delta: %w", merr)
-	}
-	// Empty Clock: the engine ticks only this actor's counter (daemon/state.apply),
-	// so distinct agents' assertions are causally incomparable.
-	op := contract.CrdtOp{DocID: doc, Actor: actor, Domain: state.DomainBelief, Delta: delta}
-	if aerr := d.crdt.Apply(op); aerr != nil {
+	conflict, values, aerr := applyBeliefAssertion(d.crdt, doc, agent, req.Subject, req.Value)
+	if aerr != nil {
 		return fmt.Errorf("beliefs assert: %w", aerr)
 	}
 	resp.Subject = req.Subject
 	resp.Agent = agent
-	for _, c := range d.crdt.Conflicts(doc) {
-		if c.Subject == req.Subject {
-			resp.Conflict = true
+	resp.Conflict = conflict
+	resp.Values = values
+	return nil
+}
+
+// applyBeliefAssertion applies one agent.belief op with an empty clock (the
+// engine stamps only the asserting actor's causal context, so distinct agents'
+// assertions are causally incomparable) and reports whether the subject is now
+// in conflict plus its live value frontier. Shared by the RPC/CLI AssertBelief
+// and the /api/v1/beliefs HTTP route so both create conflicts identically.
+func applyBeliefAssertion(eng *state.Engine, doc []byte, agent, subject, value string) (bool, []string, error) {
+	var actor contract.PeerID
+	copy(actor[:], []byte(agent))
+	delta, err := json.Marshal(map[string]string{subject: value})
+	if err != nil {
+		return false, nil, err
+	}
+	op := contract.CrdtOp{DocID: doc, Actor: actor, Domain: state.DomainBelief, Delta: delta}
+	if err := eng.Apply(op); err != nil {
+		return false, nil, err
+	}
+	for _, c := range eng.Conflicts(doc) {
+		if c.Subject == subject {
+			vals := make([]string, 0, len(c.Candidates))
 			for _, cand := range c.Candidates {
-				resp.Values = append(resp.Values, string(cand.Value))
+				vals = append(vals, string(cand.Value))
 			}
+			return true, vals, nil
 		}
 	}
-	if !resp.Conflict {
-		resp.Values = []string{req.Value}
-	}
-	return nil
+	return false, []string{value}, nil
 }
 
 func (d *DaemonRPC) resolveDoc(hexDoc string) ([]byte, error) {

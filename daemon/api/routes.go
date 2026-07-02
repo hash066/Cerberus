@@ -100,6 +100,23 @@ type ResolveConflictResponse struct {
 	Subject  string `json:"subject"`
 }
 
+// AssertBeliefRequest is the POST /api/v1/beliefs body: an agent asserts a
+// belief (subject -> value). Two agents asserting different values for one
+// subject surface a conflict — the write side of the conflicts panel.
+type AssertBeliefRequest struct {
+	Agent   string `json:"agent"`
+	Subject string `json:"subject"`
+	Value   string `json:"value"`
+}
+
+// AssertBeliefResponse is returned by /api/v1/beliefs.
+type AssertBeliefResponse struct {
+	Subject  string   `json:"subject"`
+	Agent    string   `json:"agent"`
+	Conflict bool     `json:"conflict"`
+	Values   []string `json:"values"`
+}
+
 // RevokeRequest is the POST /api/v1/cap/revoke body, matching the tray's
 // revoke_capability command (`{id}`).
 type RevokeRequest struct {
@@ -181,6 +198,11 @@ type Actions struct {
 	// ResolveConflict resolves a belief-conflict subject to winning, mirroring
 	// DaemonRPC.ConflictsResolve's write-gated call into daemon/state.
 	ResolveConflict func(subject, winning string) (bool, error)
+	// AssertBelief records an agent's belief assertion (the write side that lets
+	// conflicts arise), mirroring DaemonRPC.AssertBelief's write-gated call into
+	// daemon/state. Returns whether the subject is now in conflict and its live
+	// value frontier.
+	AssertBelief func(agent, subject, value string) (conflict bool, values []string, err error)
 	// RevokeCap revokes a capability by id, mirroring DaemonRPC.CapsRevoke's
 	// admin-gated call into the auth issuer.
 	RevokeCap func(id string) (bool, error)
@@ -224,6 +246,9 @@ func (s *Server) registerActionRoutes(mux *http.ServeMux) {
 	// ConflictsResolve requires "write" on the RPC (DaemonRPC.ConflictsResolve);
 	// mirror that exactly here.
 	mux.HandleFunc("/api/v1/conflicts/resolve", s.requireWrite(s.handleConflictsResolve))
+	// AssertBelief requires "write" on the RPC (DaemonRPC.AssertBelief) — the
+	// write side that creates conflicts for the panel above.
+	mux.HandleFunc("/api/v1/beliefs", s.requireWrite(s.handleAssertBelief))
 	mux.HandleFunc("/api/v1/devices", s.requireRead(s.handleDevicesList))
 	mux.HandleFunc("/api/v1/workloads", s.requireRead(s.handleWorkloadsList))
 	mux.HandleFunc("/api/v1/wallet", s.requireRead(s.handleWallet))
@@ -299,6 +324,31 @@ func (s *Server) handleConflictsResolve(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, ResolveConflictResponse{Resolved: resolved, Subject: req.Subject})
+}
+
+func (s *Server) handleAssertBelief(w http.ResponseWriter, r *http.Request) {
+	if s.actions.AssertBelief == nil {
+		http.Error(w, "belief assertion not available", http.StatusNotImplemented)
+		return
+	}
+	var req AssertBeliefRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "malformed request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Subject) == "" {
+		http.Error(w, "subject is required", http.StatusBadRequest)
+		return
+	}
+	conflict, values, err := s.actions.AssertBelief(req.Agent, req.Subject, req.Value)
+	if err != nil {
+		http.Error(w, "assert: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if values == nil {
+		values = []string{}
+	}
+	writeJSON(w, AssertBeliefResponse{Subject: req.Subject, Agent: req.Agent, Conflict: conflict, Values: values})
 }
 
 func (s *Server) handleCapRevoke(w http.ResponseWriter, r *http.Request) {

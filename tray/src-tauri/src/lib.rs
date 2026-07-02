@@ -58,8 +58,10 @@ const GATEWAY_CHAT_URL: &str = "http://127.0.0.1:8080/v1/chat/completions";
 // below) rather than staying hardcoded to 127.0.0.1:7777.
 const CONFLICTS_PATH: &str = "/api/v1/conflicts";
 const RESOLVE_PATH: &str = "/api/v1/conflicts/resolve";
+const BELIEFS_PATH: &str = "/api/v1/beliefs";
 const DEVICES_PATH: &str = "/api/v1/devices";
 const WORKLOADS_PATH: &str = "/api/v1/workloads";
+const WALLET_PATH: &str = "/api/v1/wallet";
 const REVOKE_PATH: &str = "/api/v1/cap/revoke";
 const GRANT_DEVICE_PATH: &str = "/api/v1/devices/grant";
 
@@ -158,6 +160,12 @@ fn conflicts_url() -> String {
 }
 fn resolve_conflict_url() -> String {
     resolve_url(|m| &m.api_addr, RESOLVE_PATH, &format!("http://127.0.0.1:7777{RESOLVE_PATH}"))
+}
+fn assert_belief_url() -> String {
+    resolve_url(|m| &m.api_addr, BELIEFS_PATH, &format!("http://127.0.0.1:7777{BELIEFS_PATH}"))
+}
+fn wallet_url() -> String {
+    resolve_url(|m| &m.api_addr, WALLET_PATH, &format!("http://127.0.0.1:7777{WALLET_PATH}"))
 }
 fn devices_url() -> String {
     resolve_url(|m| &m.api_addr, DEVICES_PATH, &format!("http://127.0.0.1:7777{DEVICES_PATH}"))
@@ -392,6 +400,13 @@ fn devices() -> Result<String, String> {
     auth_get(&devices_url(), "devices")
 }
 
+/// Wallet: operator compute-credit balance + recent compute transactions (the
+/// ledger's durable usage log). Real endpoint, token-gated.
+#[tauri::command]
+fn wallet() -> Result<String, String> {
+    auth_get(&wallet_url(), "wallet")
+}
+
 /// Resolve a belief-conflict by choosing the winning value. POSTs to the
 /// intended route; PENDING_DAEMON until the daemon serves it.
 #[tauri::command]
@@ -404,6 +419,26 @@ fn resolve_conflict(subject: String, winning: String) -> Result<String, String> 
         .set("Content-Type", "application/json")
         .send_json(body)
         .map_err(|e| http_err("resolve-conflict", e))?;
+    resp.into_string().map_err(|e| e.to_string())
+}
+
+/// Assert an agent belief (subject -> value). Two agents asserting different
+/// values for the same subject surface a conflict in the panel above — this is
+/// how a conflict is created from the desktop. POSTs to the write-gated route.
+#[tauri::command]
+fn assert_belief(subject: String, value: String, agent: String) -> Result<String, String> {
+    let subject = subject.trim();
+    if subject.is_empty() {
+        return Err("belief subject is required".into());
+    }
+    let token = operator_token()?;
+    let body = serde_json::json!({ "agent": agent.trim(), "subject": subject, "value": value.trim() });
+    let resp = crate::agent()
+        .post(&assert_belief_url())
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json")
+        .send_json(body)
+        .map_err(|e| http_err("assert-belief", e))?;
     resp.into_string().map_err(|e| e.to_string())
 }
 
@@ -501,7 +536,9 @@ pub fn run() {
             belief_conflicts,
             workloads,
             devices,
+            wallet,
             resolve_conflict,
+            assert_belief,
             revoke_capability,
             grant_device,
         ])

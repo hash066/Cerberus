@@ -207,6 +207,10 @@
                 <div class="result" id="token-result"></div>
               </div>
               <div class="card span-2">
+                <h2>Transactions <span class="h2-right">compute-usage log — beta records usage, credits do not move</span></h2>
+                <div id="w-tx-container"></div>
+              </div>
+              <div class="card span-2">
                 <h2>Revoke a capability</h2>
                 <div class="form-row">
                   <label class="field"><span>Capability / token id</span><input class="inp mono" id="revoke-id" placeholder="cap id (jti)" /></label>
@@ -219,6 +223,16 @@
 
           <!-- ========== Conflicts ========== -->
           <section class="view" id="view-conflicts">
+            <div class="card">
+              <h2>Assert a belief <span class="h2-right">two agents asserting different values for one subject create a conflict</span></h2>
+              <div class="form-row">
+                <label class="field"><span>Agent</span><input class="inp" id="belief-agent" placeholder="e.g. alice" /></label>
+                <label class="field"><span>Subject</span><input class="inp mono" id="belief-subject" placeholder="e.g. sky" /></label>
+                <label class="field"><span>Value</span><input class="inp mono" id="belief-value" placeholder="e.g. blue" /></label>
+                <button class="btn primary" id="btn-assert-belief">Assert</button>
+              </div>
+              <div class="result" id="belief-result"></div>
+            </div>
             <div class="card">
               <h2>Open belief-conflicts <span class="h2-right">CRDT contradictions awaiting resolution</span></h2>
               <div id="conf-container"></div>

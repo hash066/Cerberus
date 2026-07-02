@@ -220,6 +220,7 @@ function switchView(name) {
   if (name === "devices" || name === "audio") refreshDevices();
   if (name === "workloads") refreshWorkloads();
   if (name === "conflicts") refreshConflicts();
+  if (name === "wallet") refreshWallet();
 }
 
 // ---- shared table-row helpers (checkbox + name-cell + actions, Docker style) -
@@ -544,6 +545,53 @@ async function refreshConflicts() {
   }
 }
 
+async function refreshWallet() {
+  const c = $("w-tx-container");
+  if (!c) return;
+  const r = await call("wallet");
+  if (r.ok) {
+    let wal;
+    try {
+      wal = JSON.parse(r.data);
+    } catch {
+      wal = null;
+    }
+    if (wal) {
+      // Keep the balance stat in sync with the wallet route (status also sets it).
+      if (wal.balance != null) setText("w-balance", fmtNum(wal.balance));
+      const txs = wal.transactions || [];
+      if (txs.length) {
+        const tbl = el("table", "tbl");
+        tbl.innerHTML =
+          `<thead><tr><th>#</th><th>When</th><th>Model</th><th>Amount</th><th>Consumer → Provider</th><th>State</th></tr></thead><tbody></tbody>`;
+        const tb = tbl.querySelector("tbody");
+        txs.forEach((t) => {
+          const when = t.unix_time ? new Date(t.unix_time * 1000).toLocaleString() : "—";
+          const tr = el("tr");
+          tr.innerHTML =
+            `<td class="mono">${esc(String(t.id))}</td>` +
+            `<td>${esc(when)}</td>` +
+            `<td class="mono">${esc(t.model || "—")}</td>` +
+            `<td>${esc(String(t.amount))} cr</td>` +
+            `<td class="mono">${esc(t.consumer || "")} → ${esc(t.provider || "")}</td>` +
+            `<td><span class="chip">${esc(t.state || "")}</span></td>`;
+          tb.appendChild(tr);
+        });
+        c.innerHTML = "";
+        c.appendChild(tbl);
+      } else {
+        renderEmpty(c, "◈", "No transactions yet — run a workload to record one.");
+      }
+    } else {
+      renderEmpty(c, "◈", "Wallet returned no data.");
+    }
+  } else if (isPending(r.err)) {
+    renderPending(c, r.err, "Wallet transactions");
+  } else {
+    renderEmpty(c, "⚠", connected ? "Could not read wallet." : "Daemon offline.");
+  }
+}
+
 // ---- actions ----------------------------------------------------------------
 
 function wireActions() {
@@ -610,6 +658,47 @@ function wireActions() {
   });
 
   // revoke capability
+  $("btn-assert-belief").addEventListener("click", async () => {
+    const agent = $("belief-agent").value;
+    const subject = $("belief-subject").value;
+    const value = $("belief-value").value;
+    const out = $("belief-result");
+    out.className = "result";
+    if (!subject.trim()) {
+      out.className = "result bad";
+      out.textContent = "subject is required";
+      return;
+    }
+    out.textContent = "asserting…";
+    const r = await call("assert_belief", { subject, value, agent });
+    if (r.ok) {
+      let resp;
+      try {
+        resp = JSON.parse(r.data);
+      } catch {
+        resp = null;
+      }
+      if (resp && resp.conflict) {
+        out.className = "result ok";
+        out.textContent = `Asserted — subject "${resp.subject}" is now IN CONFLICT (${(resp.values || []).join(", ")})`;
+        toast(`Conflict created on ${resp.subject}`, "info");
+      } else {
+        out.className = "result ok";
+        out.textContent = `Asserted ${subject.trim()} = ${value.trim()} (no conflict)`;
+        toast("Belief asserted", "ok");
+      }
+      refreshConflicts();
+    } else if (isPending(r.err)) {
+      out.className = "result pending";
+      out.textContent = r.err;
+      toast("Belief-assert endpoint not yet exposed by the daemon", "info");
+    } else {
+      out.className = "result bad";
+      out.textContent = r.err;
+      toast(r.err, "bad");
+    }
+  });
+
   $("btn-revoke").addEventListener("click", async () => {
     const capId = $("revoke-id").value;
     const out = $("revoke-result");

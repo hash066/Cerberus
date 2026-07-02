@@ -153,6 +153,57 @@ func TestConflictsResolveWithWriteTokenSucceeds(t *testing.T) {
 	}
 }
 
+// --- POST /api/v1/beliefs (assert; the write side that creates conflicts) ----
+
+func TestAssertBeliefRequiresWriteToken(t *testing.T) {
+	iss, _ := auth.NewIssuer()
+	invoked := false
+	srv := api.NewWithGetters(iss, api.Getters{}).WithActions(api.Actions{
+		AssertBelief: func(agent, subject, value string) (bool, []string, error) {
+			invoked = true
+			return false, []string{value}, nil
+		},
+	})
+	w := doJSON(t, srv, http.MethodPost, "/api/v1/beliefs", "", api.AssertBeliefRequest{Agent: "alice", Subject: "sky", Value: "blue"})
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no token, got %d", w.Result().StatusCode)
+	}
+	readTok := readToken(t, iss, "read")
+	w = doJSON(t, srv, http.MethodPost, "/api/v1/beliefs", readTok, api.AssertBeliefRequest{Agent: "alice", Subject: "sky", Value: "blue"})
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with read-only token, got %d", w.Result().StatusCode)
+	}
+	if invoked {
+		t.Fatal("AssertBelief must not be invoked when auth fails")
+	}
+}
+
+func TestAssertBeliefWithWriteTokenSucceeds(t *testing.T) {
+	iss, _ := auth.NewIssuer()
+	var gotAgent, gotSubject, gotValue string
+	srv := api.NewWithGetters(iss, api.Getters{}).WithActions(api.Actions{
+		AssertBelief: func(agent, subject, value string) (bool, []string, error) {
+			gotAgent, gotSubject, gotValue = agent, subject, value
+			return true, []string{"blue", "green"}, nil
+		},
+	})
+	tok := readToken(t, iss, "write")
+	w := doJSON(t, srv, http.MethodPost, "/api/v1/beliefs", tok, api.AssertBeliefRequest{Agent: "bob", Subject: "sky", Value: "green"})
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, w.Body.String())
+	}
+	if gotAgent != "bob" || gotSubject != "sky" || gotValue != "green" {
+		t.Fatalf("action args: agent=%q subject=%q value=%q", gotAgent, gotSubject, gotValue)
+	}
+	var resp api.AssertBeliefResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Conflict || len(resp.Values) != 2 {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
 // Admin (operator) tokens carry "admin", which auth.Claims.allows treats as
 // satisfying any right — so the operator token (the tray's only credential)
 // must still work against the write-gated route.
