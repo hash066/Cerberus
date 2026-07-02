@@ -23,7 +23,7 @@ func (m *mockExecutor) Dispatch(ctx context.Context, t contract.ComputeTask) (co
 }
 
 func (m *mockExecutor) Resolve(ctx context.Context, p contract.PromiseHandle) (contract.ComputeResult, error) {
-	return contract.ComputeResult{Output: []byte("AI response")}, nil
+	return contract.ComputeResult{OK: true, Output: []byte("AI response")}, nil
 }
 
 const body = `{"model": "gpt", "messages": [{"role": "user", "content": "hi"}]}`

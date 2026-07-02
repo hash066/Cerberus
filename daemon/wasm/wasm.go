@@ -119,6 +119,42 @@ func RunI32(ctx context.Context, module []byte, entry string) (int32, error) {
 	return api.DecodeI32(res[0]), nil
 }
 
+// RunI32Any is like RunI32 but tries several candidate no-arg entry-point names
+// against the SAME instantiated module, calling the first that exists. Different
+// toolchains name a component's entry differently (the hello_shard fixture, a
+// hand-written "run", cargo-component's "_start"/"main"), so the executor tries
+// them in order rather than assuming one name — which is why a gateway "run"
+// against a module that only exports "hello_shard" used to silently produce no
+// result. Returns the first matching entry's i32 result, or an error naming what
+// it looked for.
+func RunI32Any(ctx context.Context, module []byte, entries []string) (int32, error) {
+	ctx, cancel := withBoundedDeadline(ctx)
+	defer cancel()
+
+	r := wazero.NewRuntimeWithConfig(ctx, governedRuntimeConfig())
+	defer r.Close(ctx)
+
+	mod, err := r.Instantiate(ctx, module)
+	if err != nil {
+		return 0, fmt.Errorf("instantiate: %w", err)
+	}
+	for _, entry := range entries {
+		fn := mod.ExportedFunction(entry)
+		if fn == nil {
+			continue
+		}
+		res, err := fn.Call(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("call %q: %w", entry, err)
+		}
+		if len(res) == 0 {
+			return 0, fmt.Errorf("function %q returned no result", entry)
+		}
+		return api.DecodeI32(res[0]), nil
+	}
+	return 0, fmt.Errorf("module exports none of the candidate entry points %v", entries)
+}
+
 // Executor runs a WebAssembly workload per dispatched task and implements
 // contract.Executor. v0.1 runs a configured module (the workload bytes resolved
 // from the task's component CID via IPLD is the next step); execution itself is
@@ -132,7 +168,13 @@ type Executor struct {
 	results map[contract.PromiseHandle]contract.ComputeResult
 }
 
-// NewExecutor builds an executor that runs `module` (entry "run") on dispatch.
+// extraEntries are additional no-arg entry-point names Dispatch tries after the
+// executor's primary `entry`, so a module built by a different toolchain (or our
+// hello_shard fixture) still runs without the caller knowing its export name.
+var extraEntries = []string{"hello_shard", "_start", "main"}
+
+// NewExecutor builds an executor that runs `module` on dispatch, trying entry
+// "run" first and then extraEntries (e.g. "hello_shard").
 func NewExecutor(module []byte) *Executor {
 	return &Executor{module: module, entry: "run", results: map[contract.PromiseHandle]contract.ComputeResult{}}
 }
@@ -144,7 +186,7 @@ func (e *Executor) Dispatch(ctx context.Context, t contract.ComputeTask) (contra
 	if len(t.Component) > 8 && isWasm(t.Component) {
 		module = t.Component
 	}
-	val, err := RunI32(ctx, module, e.entry)
+	val, err := RunI32Any(ctx, module, append([]string{e.entry}, extraEntries...))
 
 	e.mu.Lock()
 	defer e.mu.Unlock()

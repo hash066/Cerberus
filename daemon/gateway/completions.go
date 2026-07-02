@@ -103,6 +103,14 @@ func (g *Gateway) HandleCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	if !result.OK {
+		msg := result.Error
+		if msg == "" {
+			msg = "workload produced no result"
+		}
+		writeError(w, http.StatusBadGateway, "server_error", "workload failed: "+msg)
+		return
+	}
 	text := string(result.Output)
 	created := time.Now().Unix()
 	id := "cmpl-cerberus"

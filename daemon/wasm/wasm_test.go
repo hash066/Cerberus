@@ -72,6 +72,22 @@ func memoryHogModule() []byte {
 	}
 }
 
+// helloShardModule exports ONLY `hello_shard` -> i32 1337 (byte-for-byte the
+// e2e hello-shard fixture, kept in sync with test/e2e/node.helloShardWASM). It
+// deliberately does NOT export `run`, which is the exact shape that triggered
+// feature-audit #7: the gateway's Executor asks for `run` first, finds nothing,
+// and used to surface an empty OK=false result the handler swallowed into an
+// HTTP 200 with no content ("ran, said nothing").
+func helloShardModule() []byte {
+	return []byte{
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+		0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+		0x03, 0x02, 0x01, 0x00,
+		0x07, 0x0f, 0x01, 0x0b, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x5f, 0x73, 0x68, 0x61, 0x72, 0x64, 0x00, 0x00,
+		0x0a, 0x07, 0x01, 0x05, 0x00, 0x41, 0xb9, 0x0a, 0x0b,
+	}
+}
+
 func TestRunI32RealArithmetic(t *testing.T) {
 	v, err := RunI32(context.Background(), addModule(), "run")
 	if err != nil {
@@ -100,6 +116,54 @@ func TestExecutorDispatchResolve(t *testing.T) {
 	}
 	if !res.OK || string(res.Output) != "42" {
 		t.Fatalf("unexpected result ok=%v out=%q err=%q", res.OK, res.Output, res.Error)
+	}
+}
+
+// TestExecutorDispatchFallsBackToShardEntry is the #7 regression guard: an
+// Executor built exactly as the daemon builds it — NewExecutor over a module
+// that exports only `hello_shard` (the shipped fixture), primary entry "run" —
+// must Dispatch to a SUCCESSFUL result carrying "1337". Before RunI32Any this
+// produced OK=false ("no exported function run"), which the gateway returned as
+// an empty HTTP 200. If this ever regresses, "Run a workload" goes silent again.
+func TestExecutorDispatchFallsBackToShardEntry(t *testing.T) {
+	e := NewExecutor(helloShardModule())
+	h, err := e.Dispatch(context.Background(), contract.ComputeTask{TaskID: []byte{2}})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	res, err := e.Resolve(context.Background(), h)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !res.OK || string(res.Output) != "1337" {
+		t.Fatalf("expected OK result 1337 via hello_shard fallback, got ok=%v out=%q err=%q", res.OK, res.Output, res.Error)
+	}
+}
+
+// TestRunI32AnyFallsBackPastMissingEntries pins RunI32Any's contract directly:
+// it skips candidate names the module does not export and calls the first it
+// does, so a caller that lists "run" before "hello_shard" still runs a
+// shard-only module.
+func TestRunI32AnyFallsBackPastMissingEntries(t *testing.T) {
+	v, err := RunI32Any(context.Background(), helloShardModule(), []string{"run", "hello_shard", "_start"})
+	if err != nil {
+		t.Fatalf("RunI32Any: %v", err)
+	}
+	if v != 1337 {
+		t.Fatalf("got %d want 1337", v)
+	}
+}
+
+// TestRunI32AnyNoMatchingEntry proves the miss is a clear error (not a silent
+// zero): if none of the candidate names exist, RunI32Any reports which names it
+// looked for rather than fabricating a result.
+func TestRunI32AnyNoMatchingEntry(t *testing.T) {
+	_, err := RunI32Any(context.Background(), helloShardModule(), []string{"run", "main"})
+	if err == nil {
+		t.Fatal("expected an error when no candidate entry point exists")
+	}
+	if !strings.Contains(err.Error(), "candidate entry") {
+		t.Fatalf("error should name the candidate-entry miss, got: %v", err)
 	}
 }
 

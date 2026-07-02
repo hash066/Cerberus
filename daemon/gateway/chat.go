@@ -148,6 +148,17 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	// A completed dispatch can still be a FAILED run (OK=false) — e.g. the
+	// component trapped or exports no entry point. Surface that as an error rather
+	// than returning HTTP 200 with empty content (which read as "ran, said nothing").
+	if !result.OK {
+		msg := result.Error
+		if msg == "" {
+			msg = "workload produced no result"
+		}
+		writeError(w, http.StatusBadGateway, "server_error", "workload failed: "+msg)
+		return
+	}
 	content := string(result.Output)
 	created := time.Now().Unix()
 	id := "chatcmpl-cerberus"
