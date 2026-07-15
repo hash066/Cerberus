@@ -411,6 +411,89 @@ func TestLlamaRPCRefusesBuildSkew(t *testing.T) {
 	assertBackendUntouched(t, be, "build skew")
 }
 
+// capForResourceAs mints a signed cap for an ARBITRARY resource, self-issued
+// under requester's identity. Used to prove resource scoping.
+func capForResourceAs(t *testing.T, requester *Fabric, res contract.ResourceRef, right contract.Right, ttl time.Duration) []byte {
+	t.Helper()
+	ks, err := auth.NewMemoryKeyStore(requester.Identity().Seed())
+	if err != nil {
+		t.Fatalf("keystore: %v", err)
+	}
+	g, err := auth.NewGrant(res, []contract.Right{right}, nil, ttl)
+	if err != nil {
+		t.Fatalf("new grant: %v", err)
+	}
+	env, err := auth.NewSignedCap(ks).Issue(g)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	return env
+}
+
+// TestLlamaRPCDeniedWithCapForDifferentResource is the test that makes the word
+// "capability" honest on this path.
+//
+// The cap here is entirely legitimate: correctly signed, self-issued by the
+// authenticated peer, unexpired, unrevoked, and carrying RightExec. It is simply
+// scoped to a DIFFERENT resource — MeshComputeResource, i.e. permission to run a
+// WASM workload, not to run llama.cpp tensor work.
+//
+// Every other gate in this package would ACCEPT it, because none of them compares
+// grant.Resource to what is being accessed (auth.Verify does not even take the
+// resource as an argument). Accepting it here would mean a peer trusted to run a
+// sandboxed WASM job could instead open a ggml-rpc session — a CVE-2026-34159
+// pre-auth RCE surface — using a capability that never mentioned llama.
+//
+// If this test starts failing, the gate has regressed to a signed permission slip.
+func TestLlamaRPCDeniedWithCapForDifferentResource(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping networked mesh test in -short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	requester, server := twoLlamaNodes(t, ctx)
+
+	be := newEchoLlamaBackend()
+	server.ServeLlamaRPC(be, SelfIssuerResolver, nowFn, nil)
+
+	// A REAL, valid, RightExec capability — for the compute resource, not llama.
+	env := capForResourceAs(t, requester, MeshComputeResource("test"), contract.RightExec, time.Hour)
+
+	var buf bytes.Buffer
+	err := requester.OpenLlamaRPCSession(server.PeerID(), env, requester.PeerID(), testBuild, &buf)
+	if err == nil {
+		t.Fatal("a RightExec capability minted for MeshComputeResource opened a LLAMA offload " +
+			"session — the gate is not resource-scoped, so any RightExec cap grants ggml-rpc access")
+	}
+	assertBackendUntouched(t, be, "capability for a different resource")
+}
+
+// TestGrantCoversLlamaResource unit-tests the scoping predicate directly, so the
+// boundary is pinned without needing a live mesh.
+func TestGrantCoversLlamaResource(t *testing.T) {
+	want := LlamaRPCResource("site-a")
+
+	if err := grantCoversLlamaResource(auth.Grant{Resource: want}, want); err != nil {
+		t.Fatalf("exact resource match rejected: %v", err)
+	}
+	// Right kind, wrong path (another site's worker).
+	if err := grantCoversLlamaResource(auth.Grant{Resource: LlamaRPCResource("site-b")}, want); err == nil {
+		t.Fatal("a cap for another site's llama resource was accepted")
+	}
+	// Right path, wrong kind.
+	if err := grantCoversLlamaResource(auth.Grant{Resource: contract.ResourceRef{Kind: contract.KindFS, Path: want.Path}}, want); err == nil {
+		t.Fatal("a cap of the wrong Kind was accepted")
+	}
+	// The realistic attack: a valid mesh-compute cap.
+	if err := grantCoversLlamaResource(auth.Grant{Resource: MeshComputeResource("site-a")}, want); err == nil {
+		t.Fatal("a MeshComputeResource cap was accepted for llama offload")
+	}
+	// Zero grant.
+	if err := grantCoversLlamaResource(auth.Grant{}, want); err == nil {
+		t.Fatal("a zero-resource grant was accepted")
+	}
+}
+
 // TestLlamaRPCResourceNamesGPUKind pins the resource convention. KindGPU is reused
 // deliberately: minting a new ResourceKind would be a frozen-contract change
 // (schemas/capability.cddl mirrors the Go enum), and KindGPU already means "this

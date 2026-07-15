@@ -178,7 +178,7 @@ func (f *Fabric) handleLlamaRPCStream(
 	// spawned and no loopback socket is dialed until this returns nil. Everything
 	// downstream of here is reachable only by a peer holding a valid, unexpired,
 	// unrevoked RightExec capability for this node's llama-rpc resource.
-	grant, verr := verifyLlamaRPCCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked, contract.RightExec)
+	grant, verr := verifyLlamaRPCCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked, contract.RightExec, LlamaRPCResource(f.site))
 	if verr != nil {
 		_ = writeLlamaRPCAck(ss, verr.Error())
 		_ = ss.Close()
@@ -257,9 +257,39 @@ func spliceLlamaRPC(remote io.ReadWriter, local io.ReadWriter) error {
 }
 
 // verifyLlamaRPCCap extracts the signed envelope, resolves the issuer key it
-// names, and Verifies it — the single fail-closed gate applied before any local
-// process or socket exists. Mirrors shard.go's verifyShardCap and audio.go's
-// verifyAudioCap.
+// names, Verifies it, and — UNLIKE every other gate in this package — checks that
+// the grant is actually FOR this resource.
+//
+// ############ READ THIS BEFORE "SIMPLIFYING" TO MATCH THE NEIGHBOURS ############
+//
+// verifyAudioCap (audio.go), verifyShardCap (shard.go) and verifySignedCap
+// (compute.go, used by gpu.go) all stop after the right check. NONE of them ever
+// compares grant.Resource to the resource being accessed — `grep grant.Resource
+// daemon/mesh/*.go` finds nothing, and audio.go:214 / shard.go:227 literally
+// discard the grant with `if _, verr := ...`. auth.Verify CANNOT close this gap:
+// its signature is Verify(envelope, issuerPub, now, isRevoked) — the resource
+// being accessed is not an argument, so it has no idea what you are protecting.
+// MeshComputeResource/MeshGpuResource/MeshShardResource are used at MINT time and
+// never at VERIFY time.
+//
+// The consequence for THIS protocol, if it mirrored the others exactly: a peer
+// holding any valid signed cap that happens to carry RightExec — say one issued
+// for MeshComputeResource(site) so it could run a WASM workload — would pass this
+// gate and receive a ggml-rpc-server session. Given CVE-2026-34159 that is a
+// pre-auth RCE surface reachable with an unrelated capability, and it would make
+// this lane's central claim ("only a peer holding a capability FOR llama offload")
+// simply false. A capability that is not checked against its resource is not a
+// capability; it is a signed permission slip.
+//
+// So this gate scopes to LlamaRPCResource(site) on Kind AND Path. Node is not
+// compared: these per-site mesh resources are minted with a zero Node by
+// convention (see AudioResource/MeshGpuResource), so requiring it would reject
+// every legitimately minted cap.
+//
+// The same gap exists in the neighbouring protocols and is NOT fixed here — those
+// are other lanes' files. It has been reported upward.
+//
+// ###############################################################################
 func verifyLlamaRPCCap(
 	env []byte,
 	claimedIssuer contract.PeerID,
@@ -267,6 +297,7 @@ func verifyLlamaRPCCap(
 	now func() int64,
 	isRevoked auth.RevocationPredicate,
 	requiredRight contract.Right,
+	wantResource contract.ResourceRef,
 ) (auth.Grant, error) {
 	if resolveIssuer == nil {
 		return auth.Grant{}, fmt.Errorf("mesh: no issuer resolver configured for llama rpc session")
@@ -289,7 +320,23 @@ func verifyLlamaRPCCap(
 	if requiredRight != "" && !grantHasRight(grant, requiredRight) {
 		return auth.Grant{}, fmt.Errorf("mesh: llama rpc capability lacks required right %q", requiredRight)
 	}
+	if err := grantCoversLlamaResource(grant, wantResource); err != nil {
+		return auth.Grant{}, err
+	}
 	return grant, nil
+}
+
+// grantCoversLlamaResource rejects a grant minted for some OTHER resource.
+func grantCoversLlamaResource(grant auth.Grant, want contract.ResourceRef) error {
+	got := grant.Resource
+	if got.Kind != want.Kind || got.Path != want.Path {
+		return fmt.Errorf(
+			"mesh: llama rpc capability is scoped to a different resource (%s %q) than this node's "+
+				"llama offload resource (%s %q) — a capability carrying RightExec for some other "+
+				"resource does not authorize running llama.cpp tensor work here",
+			got.Kind, got.Path, want.Kind, want.Path)
+	}
+	return nil
 }
 
 // OpenLlamaRPCSession dials peer, presents the signed capability, and on ACK
