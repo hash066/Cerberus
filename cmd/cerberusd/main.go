@@ -30,6 +30,7 @@ import (
 	"github.com/hash066/cerberus/daemon/lifecycle"
 	"github.com/hash066/cerberus/daemon/mesh"
 	"github.com/hash066/cerberus/daemon/metrics"
+	"github.com/hash066/cerberus/daemon/ninep"
 	"github.com/hash066/cerberus/daemon/scheduler"
 	"github.com/hash066/cerberus/daemon/state"
 	"github.com/hash066/cerberus/daemon/store"
@@ -99,6 +100,17 @@ func main() {
 		"comma-separated peer multiaddrs to bootstrap-connect at startup (e.g. /ip4/100.x.y.z/udp/PORT/quic-v1/p2p/12D3Koo...). Use across networks where mDNS can't reach, e.g. over a Tailscale tunnel.")
 	pipelineBackend := flag.String("pipeline-backend", envOr("CERBERUS_PIPELINE_BACKEND", ""),
 		"pipeline inference backend: cpu-software (default) | llamacpp | mlx (macOS/Apple Silicon sidecar; falls back to mlx-mock and says so)")
+	// Present the 9P capability namespace as a real host filesystem, so Explorer
+	// (Windows) / a file manager or shell (Linux) can browse it. Empty = no mount,
+	// which is the historical behaviour and stays the default: a mount needs an
+	// external kernel filesystem driver (WinFsp on Windows) that not every host
+	// has, so it is strictly opt-in and never fails the daemon (see mountNamespace).
+	mountPath := flag.String("mount", "",
+		"mount the 9P capability namespace as a host filesystem at this path "+
+			"(Windows: a free drive letter like X: — requires WinFsp, https://winfsp.dev/rel/; "+
+			"Linux: an existing empty directory like /mnt/cerberus). "+
+			"Empty (default) does not mount. The mounted view is scoped to a capability and "+
+			"shows exactly what a 9P client holding the same capability sees — no ambient authority.")
 	flag.Parse()
 
 	// The composed mesh reads its listen address from this env (see
@@ -202,6 +214,7 @@ func main() {
 	var meshSite string                       // the intra-site domain the fabric was composed with (for audio-session caps)
 	var pipeRunner *system.PipelineRunner
 	var inferenceSvc *system.InferenceService
+	var namespace *ninep.Server // the composed 9P namespace (for -mount; nil if compose failed)
 	if sys, serr := system.Compose(ctx, k, "local", db); serr != nil {
 		log.Printf("cerberusd: compose system failed: %v", serr)
 	} else {
@@ -209,6 +222,7 @@ func main() {
 		sched = sys.Scheduler
 		fsSurface = sys
 		meshSite = sys.Site
+		namespace = sys.Namespace
 		if mf, ok := sys.Fabric.(*mesh.Fabric); ok {
 			meshFabric = mf
 			if pr, perr := system.NewPipelineRunner(sys, mf, nil); perr == nil {
@@ -280,6 +294,13 @@ func main() {
 			}
 		}()
 	}
+
+	// -mount: present the 9P namespace as a real host filesystem (opt-in).
+	// unmountNamespace is a no-op when -mount was not given or the mount failed;
+	// it is called explicitly on the shutdown path below so the drive letter /
+	// mountpoint is released before the process exits.
+	unmountNamespace := mountNamespace(k, namespace, *mountPath)
+	defer unmountNamespace()
 
 	// Capability auth: a persisted Ed25519 key is the daemon root of trust.
 	// Prefer OS-keychain custody (Windows Credential Manager / macOS Keychain /
@@ -750,6 +771,98 @@ func main() {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	<-sigs
 	fmt.Println("\ncerberusd shutting down...")
+}
+
+// mountNamespace implements the -mount flag: it presents the composed 9P
+// capability namespace (ns) as a real host filesystem at mountpoint, and
+// returns the function that tears it down. The returned function is always
+// safe to call (it is a no-op when nothing was mounted), so the caller can
+// defer it unconditionally.
+//
+// WHICH CAPABILITY THE MOUNT IS SCOPED TO (CLAUDE.md golden rule 5 — no
+// ambient authority). A mount is a TRANSPORT onto the namespace, not a second,
+// unguarded way in: daemon/ninep's mount dials the namespace through DialCap,
+// so every Getattr/Open/Read/Readdir the OS issues re-enters the same
+// capability-checked Walk/Open path a 9P network peer goes through. That means
+// the mount must name exactly one capability, and the view it presents is
+// whatever THAT capability authorizes — no more. We mint one here with the
+// SAME resource and rights daemon/system.Compose mints for the 9P wire server
+// (its devCap: read+alloc over /cer/dev/vram/local/0), deliberately, so the
+// drive letter and the wire server present the identical view and the
+// invariant "a mount bound to cap X sees exactly what a 9P client bound to
+// cap X sees" is true by construction rather than by coincidence. Minting a
+// second handle of the same shape (rather than reusing Compose's) is what
+// keeps this out of daemon/system: Compose does not export devCap, and the
+// namespace + kernel it DOES export are all this needs.
+//
+// HONEST LIMIT — this is capability-SHAPED, not yet capability-SCOPED. Neither
+// capability kernel in this repo actually checks the resource a handle names:
+// the default pure-Go kernel (contract/go/stub.CapKernel.Verify) ignores the
+// Request argument entirely, and the real Rust kernel behind `-tags ffi` is
+// handed only (handle, op, now) across the C ABI — cerberus_cap_verify takes no
+// resource parameter at all (core/cabi/include/cerberus.h). So today any live,
+// unrevoked handle carrying the right verb passes the check for ANY resource,
+// and this mount consequently shows the whole namespace rather than just the
+// VRAM device its handle names. Revocation and rights ARE enforced, so a
+// revoked handle really does blind the mount. This is a kernel gap, not a mount
+// gap — the mount asks the same question the wire server asks and gets the same
+// answer — but it must not be described as per-resource scoping until
+// cerberus_cap_verify learns to take the resource. Do not present this as
+// per-device isolation (CLAUDE.md "Maturity honesty").
+//
+// WHY THIS IS A PLAIN CALL AND NOT A SUPERVISED SERVICE. ninep.Mount does not
+// block: on every platform it hands the kernel driver's dispatch loop to a
+// background goroutine and returns (nil once the filesystem is live, or a
+// specific error). So it needs neither a goroutine nor a supervisor to keep
+// main from stalling. Putting it under the suture tree would only add
+// restart-on-error, which today would be actively worse: the dominant failure
+// is "the kernel driver is not installed on this host", which is permanent, and
+// retrying it on a backoff would bury one actionable install hint under a
+// restart loop. A mount that dies LATER (driver crash, external unmount) is the
+// case supervision would genuinely help, but ninep.Mount cannot report that
+// yet — its dispatch goroutine drops a late failure on the floor because the
+// channel it would report on has already been abandoned by the returning
+// Mount. Wiring supervision before that is fixed would supervise an event that
+// never arrives. See the report for the exact fix.
+//
+// A mount failure is never fatal: the daemon's whole control plane (9P wire,
+// RPC, gateway) works without it, and a host with no filesystem driver is an
+// ordinary, expected condition — same posture as bindWithFallback above.
+func mountNamespace(kernel contract.CapKernel, ns *ninep.Server, mountpoint string) func() {
+	noop := func() {}
+	if mountpoint == "" {
+		return noop // -mount not given: historical behaviour, no mount.
+	}
+	if ns == nil {
+		log.Printf("cerberusd: -mount %s ignored: the 9P namespace is unavailable (composing the system failed above)", mountpoint)
+		return noop
+	}
+
+	mountCap, err := kernel.Mint(
+		contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/local/0"},
+		[]contract.Right{contract.RightRead, contract.RightAlloc}, nil)
+	if err != nil {
+		log.Printf("cerberusd: -mount %s disabled: minting the mount capability failed: %v", mountpoint, err)
+		return noop
+	}
+
+	cfg := ninep.MountConfig{Mountpoint: mountpoint, Cap: mountCap, NS: ns}
+	if err := ninep.Mount(cfg); err != nil {
+		// The error is already specific and actionable (e.g. it names WinFsp and
+		// links the installer when the Windows driver is missing) — surface it
+		// verbatim rather than wrapping it in something vaguer.
+		log.Printf("cerberusd: -mount %s failed: %v", mountpoint, err)
+		return noop
+	}
+
+	log.Printf("cerberusd: 9P namespace mounted at %s (scoped to capability %d — the same read+alloc view the 9P wire server serves)", mountpoint, mountCap)
+	return func() {
+		if err := ninep.Unmount(cfg); err != nil {
+			log.Printf("cerberusd: unmounting %s failed: %v", mountpoint, err)
+			return
+		}
+		log.Printf("cerberusd: unmounted %s", mountpoint)
+	}
 }
 
 // bindWithFallback binds addr with net.Listen("tcp", addr). If that fails
