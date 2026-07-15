@@ -152,8 +152,9 @@ timeout; the residual risks are compute-DoS and whatever wazero bugs exist,
 which is why there's an adversarial sandbox suite and fuzzing in CI. A
 malicious *peer daemon* is the sharper question: it can refuse work, lie about
 results (general proof-of-compute is unsolved here — that's precisely the
-zk-WASM stub; today you get content-addressed tasks, a signed transcript of
-who ran what, and recompute-and-challenge in the economy path), and DoS you.
+zk-WASM stub; today you get content-addressed tasks (CIDs), the signed
+capability chain saying who was *allowed* to run what, and
+recompute-and-challenge in the economy path), and DoS you.
 It **cannot** touch your resources without presenting a capability you minted,
 and everything it does is bounded by that token's rights/quota/expiry, which
 you can revoke. Also worth conceding plainly: the daemon itself runs as you on
