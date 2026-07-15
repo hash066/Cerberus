@@ -25,6 +25,7 @@ import (
 	"github.com/hash066/cerberus/daemon/economy"
 	"github.com/hash066/cerberus/daemon/ffi"
 	"github.com/hash066/cerberus/daemon/gateway"
+	"github.com/hash066/cerberus/daemon/gpu"
 	"github.com/hash066/cerberus/daemon/inference"
 	"github.com/hash066/cerberus/daemon/ledger"
 	"github.com/hash066/cerberus/daemon/lifecycle"
@@ -272,8 +273,11 @@ func main() {
 		// audio endpoint (sys.AudioDevices) alongside the static VRAM device,
 		// so a new device kind Compose starts registering later shows up here
 		// too without another change at this call site.
+		// The VRAM quota reported here MUST be the one Compose registered against
+		// the namespace (measured VRAM — see daemon/gpu/vramprobe*.go), or the API
+		// advertises a device the namespace will not actually grant.
 		devices = []deviceInfo{
-			{Path: "/cer/dev/vram/local/0", Kind: string(contract.KindVRAM), QuotaBytes: 2 * 1024 * 1024 * 1024},
+			{Path: "/cer/dev/vram/local/0", Kind: string(contract.KindVRAM), QuotaBytes: gpu.VRAMSnapshot().Total()},
 			{Path: "/cer/dev/cpu/local/0", Kind: string(contract.KindCPU), QuotaBytes: 64 * 1024 * 1024},
 		}
 		for _, ad := range sys.AudioDevices {

@@ -254,7 +254,13 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	// auto-route an opened device to the placement result — those accounting steps
 	// remain. None of this is a §8 Frontier item (no fake zk-WASM / RDMA).
 	ns := ninep.New(kernel)
-	q := contract.Quota{Bytes: 2 * 1024 * 1024 * 1024}
+	// The VRAM device's quota is this node's MEASURED VRAM, not a guess. When the
+	// probe cannot see a GPU (no driver, unsupported OS — see daemon/gpu/vramprobe*.go)
+	// Total() is 0 and the device is registered with a zero quota, which fails
+	// closed: a grant against it can carry no bytes. That is the honest outcome —
+	// the previous fixed 2 GiB was advertised regardless of whether the machine had
+	// any VRAM at all.
+	q := contract.Quota{Bytes: gpu.VRAMSnapshot().Total()}
 	ns.Register("/cer/dev/vram/local/0",
 		contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/local/0", Quota: &q})
 	gpuQ := contract.Quota{Bytes: 16 * 1024 * 1024} // 16 MiB per-request ceiling for an f32 kernel session
@@ -540,10 +546,25 @@ func localTelemetry(self contract.PeerID) contract.NodeTelemetry {
 	if availFlops < 0 {
 		availFlops = 0
 	}
+	// VRAM is MEASURED (daemon/gpu/vramprobe*.go: nvidia-smi, amdgpu sysfs).
+	// A node that cannot probe reports zero rather than a plausible number:
+	// scheduler.PlaceGPU ranks by free VRAM, so an invented figure silently
+	// misplaces work — the prior hardcoded 8GB/6GB literal was ~2x this dev
+	// box's real 4GB card and would have OOM'd it. Zero is honest and simply
+	// loses the ranking; a lie loses the job.
+	//
+	// RAM is still a literal — that is daemon/system/telemetry work in flight
+	// on another lane; do not read these two numbers as equally trustworthy.
+	vram := gpu.VRAMSnapshot()
 	return contract.NodeTelemetry{
 		PeerID:  self,
 		Compute: contract.Compute{PCores: cores, Flops: availFlops},
-		Memory:  contract.Memory{RAMTotal: 16_000_000_000, RAMFree: 8_000_000_000, VRAMTotal: 8_000_000_000, VRAMFree: 6_000_000_000},
+		Memory: contract.Memory{
+			RAMTotal:  16_000_000_000,
+			RAMFree:   8_000_000_000,
+			VRAMTotal: vram.Total(),
+			VRAMFree:  vram.Free(),
+		},
 		Thermal: contract.Thermal{HeadroomC: 30},
 		Power:   contract.Power{Src: contract.PowerAC},
 	}
