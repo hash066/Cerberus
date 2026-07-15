@@ -374,7 +374,8 @@ func main() {
 	// silently unreachable.
 	gw := gateway.NewGateway(workloadExec, issuer)
 	if inferenceSvc != nil {
-		gw.SetInference(&gateway.SystemInference{Svc: inferenceSvc})
+		// Chat models come from daemon/llama (real llama.cpp), not from the
+		// split-MLP fixture. The fixture is reachable via `cerberus pipeline-run`.
 		// BuiltinInferenceModels() is empty by design: every entry it used to hold
 		// was a mock. Real chat models are registered by daemon/llama when a
 		// llama-server pack is present. The split-MLP fixture is deliberately NOT
