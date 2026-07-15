@@ -21,6 +21,7 @@ import (
 	"github.com/hash066/cerberus/daemon/api"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/compute"
+	"github.com/hash066/cerberus/daemon/dataplane"
 	"github.com/hash066/cerberus/daemon/discovery"
 	"github.com/hash066/cerberus/daemon/economy"
 	"github.com/hash066/cerberus/daemon/ffi"
@@ -97,6 +98,10 @@ func main() {
 		"mesh QUIC listen multiaddr; 0.0.0.0 makes this node reachable from other machines (LAN or a Tailscale/WireGuard overlay). Use a fixed udp port to pin a firewall rule.")
 	peers := flag.String("peer", "",
 		"comma-separated peer multiaddrs to bootstrap-connect at startup (e.g. /ip4/100.x.y.z/udp/PORT/quic-v1/p2p/12D3Koo...). Use across networks where mDNS can't reach, e.g. over a Tailscale tunnel.")
+	dpListen := flag.String("dataplane-listen", "0.0.0.0:0",
+		"data-plane QUIC listen address (host:port) for bulk bytes; 0.0.0.0 makes this node's data plane reachable from other machines. Previously hardcoded to 127.0.0.1:0, which made cross-machine bulk transfer impossible.")
+	dpAdvertise := flag.String("dataplane-advertise", "",
+		"host advertised to peers in data-plane endpoints. Empty = ask the OS routing table which local address reaches the peer (correct on a multi-homed box). Set this only where the routing table cannot be asked, e.g. behind a NAT/port-forward.")
 	pipelineBackend := flag.String("pipeline-backend", envOr("CERBERUS_PIPELINE_BACKEND", ""),
 		"pipeline inference backend: cpu-software (default) | llamacpp | mlx (macOS/Apple Silicon sidecar; falls back to mlx-mock and says so)")
 	flag.Parse()
@@ -106,6 +111,17 @@ func main() {
 	// a routable address while unit tests keep the loopback default.
 	if *meshListen != "" {
 		_ = os.Setenv("CERBERUS_MESH_LISTEN", *meshListen)
+	}
+	// Same split for the DATA plane (bulk bytes), which had no override at all:
+	// daemon/system composed it with a hardcoded 127.0.0.1:0, so every endpoint it
+	// handed a peer named loopback and the peer dialed its own machine. The daemon
+	// binds a routable address here; unit tests keep dataplane.ListenAddrFromEnv's
+	// loopback default and stay isolated, exactly as they do for the mesh.
+	if *dpListen != "" {
+		_ = os.Setenv(dataplane.EnvListen, *dpListen)
+	}
+	if *dpAdvertise != "" {
+		_ = os.Setenv(dataplane.EnvAdvertise, *dpAdvertise)
 	}
 
 	if *e2eNode {
