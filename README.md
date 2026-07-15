@@ -109,14 +109,14 @@ Tailscale).
 ## How it fits together
 
 ```
-        you                          your AI agents
-  ┌───────────┐ ┌──────────┐   ┌──────────────┐ ┌─────────────────────┐
-  │ cerberus  │ │ tray app │   │ cerberus-mcp │ │ any OpenAI SDK      │
+        you                            your AI agents
+  ┌───────────┐ ┌──────────┐   ┌───────────────┐ ┌────────────────────┐
+  │ cerberus  │ │ tray app │   │ cerberus-mcp  │ │ any OpenAI SDK     │
   │   (CLI)   │ │ (Tauri)  │   │(Claude/Cursor)│ │ base_url=:8080/v1  │
-  └─────┬─────┘ └────┬─────┘   └───────┬──────┘ └──────────┬──────────┘
-        └────────────┴─── every call presents a capability token ──┘
-                             │
-  ┌──────────────────────────▼───────────────────────────────────────┐
+  └─────┬─────┘ └────┬─────┘   └───────┬───────┘ └─────────┬──────────┘
+        └────────────┴──────┬──────────┴───────────────────┘
+                            │ every call presents a capability token
+  ┌─────────────────────────▼─────────────────────────────────────────┐
   │                      cerberusd  (Go daemon)                       │
   │                                                                   │
   │  OCap kernel (Rust): Ed25519 caps — mint / attenuate / revoke,    │
@@ -128,9 +128,9 @@ Tailscale).
           │ CONTROL: libp2p/QUIC                      │ DATA: QUIC
           │ mDNS discovery, signed caps,              │ mTLS, PeerID-pinned
           │ small messages only                       │ tensors/files/audio
-  ┌───────▼─────────┐        ┌─────────────────┐     ▼
-  │ cerberusd       │  ...   │ cerberusd       │  (bulk bytes never
-  │ (your other PC) │        │ (friend's box)  │   touch the control plane)
+  ┌───────▼─────────┐        ┌─────────────────┐      ▼
+  │ cerberusd       │  ...   │ cerberusd       │   (bulk bytes never
+  │ (your other PC) │        │ (friend's box)  │    touch the control plane)
   └─────────────────┘        └─────────────────┘
 ```
 

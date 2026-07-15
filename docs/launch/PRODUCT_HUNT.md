@@ -28,7 +28,9 @@ Developer Tools · Open Source · Privacy · Artificial Intelligence
 
 ## Links
 
-- Website: https://cerberus-mesh.vercel.app *(replace with the live URL from web/)*
+- Website: `<YOUR-LIVE-URL>` — the `web/` site once deployed (no production URL
+  is configured in the repo yet; CHECKLIST.md gates launch on the site being
+  live). Until then, use the GitHub URL as the primary link.
 - GitHub: https://github.com/hash066/Cerberus
 
 ## Description (gallery text)
