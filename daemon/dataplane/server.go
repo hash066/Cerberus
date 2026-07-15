@@ -31,6 +31,17 @@ type quotaFor func(transferID uint64, cap contract.CapHandle) (contract.Quota, b
 // reader is valid only for the duration of the call.
 type Sink func(transferID uint64, r io.Reader) error
 
+// Responder is the request/response counterpart of a Sink: it consumes a fully
+// received (quota-bounded) request blob and returns a response blob that the
+// server sends back to the client on the SAME data-plane session (in the success
+// ack body). It is how a granted data-plane session carries actual work, not just
+// a one-way bulk transfer — e.g. opening a 9P /cer/dev/gpu `.../ctl` mints a
+// transfer whose Responder decodes an f32 kernel request, runs it on the node's
+// GPU backend, and returns the result buffer. An error aborts the transfer with
+// that message (the client sees a denial); the response bytes are returned only
+// on success. Registered per transfer via RegisterResponder.
+type Responder func(transferID uint64, req []byte) (resp []byte, err error)
+
 // SignedCapVerifier cryptographically checks the signed capability envelope a
 // sender presents in the transfer header, BEFORE any payload byte is read. It is
 // how the data plane retires the opaque-handle demo model: the receiver trusts a
@@ -67,11 +78,12 @@ type Server struct {
 	// SetClientObserver; nil by default.
 	onAuthClient func(transferID uint64, client contract.PeerID)
 
-	mu     sync.Mutex
-	grants map[uint64]grant           // transferID -> authorized grant
-	authBy map[uint64]contract.PeerID // transferID -> last authenticated client PeerID
-	ln     *quic.Listener
-	closed bool
+	mu         sync.Mutex
+	grants     map[uint64]grant           // transferID -> authorized grant
+	responders map[uint64]Responder       // transferID -> request/response handler (optional)
+	authBy     map[uint64]contract.PeerID // transferID -> last authenticated client PeerID
+	ln         *quic.Listener
+	closed     bool
 }
 
 type grant struct {
@@ -90,11 +102,12 @@ type grant struct {
 // rather than generate a new one per server.
 func NewServer(kernel contract.CapKernel, now int64, identity ed25519.PrivateKey) *Server {
 	return &Server{
-		kernel:   kernel,
-		now:      now,
-		identity: identity,
-		grants:   map[uint64]grant{},
-		authBy:   map[uint64]contract.PeerID{},
+		kernel:     kernel,
+		now:        now,
+		identity:   identity,
+		grants:     map[uint64]grant{},
+		responders: map[uint64]Responder{},
+		authBy:     map[uint64]contract.PeerID{},
 	}
 }
 
@@ -154,6 +167,34 @@ func (s *Server) RegisterSignedGrant(transferID uint64, cap contract.CapHandle, 
 		SignedCap:    envelope,
 		Issuer:       issuer,
 		ServerPeerID: s.PeerID(), // caller already knows which server it is dialing: pin it.
+	}
+}
+
+// RegisterResponder records that transferID is a REQUEST/RESPONSE session
+// authorized under cap with the given quota: instead of draining the payload into
+// the Sink, the server buffers the (quota-bounded) request blob, invokes r, and
+// sends r's response back to the client on the same session. This is what turns a
+// granted data-plane session into an actual work channel (e.g. a 9P
+// /cer/dev/gpu ctl grant whose responder runs an f32 kernel and returns the
+// result). It returns the Endpoint descriptor the control plane hands the holder,
+// exactly like RegisterGrant. The request is still authorized (cap + quota, and a
+// signed verifier if configured) BEFORE r ever runs.
+func (s *Server) RegisterResponder(transferID uint64, cap contract.CapHandle, quota contract.Quota, r Responder) Endpoint {
+	s.mu.Lock()
+	s.grants[transferID] = grant{cap: cap, quota: quota}
+	s.responders[transferID] = r
+	addr := ""
+	if s.ln != nil {
+		addr = s.ln.Addr().String()
+	}
+	s.mu.Unlock()
+	return Endpoint{
+		Kind:         EndpointQUIC,
+		Addr:         addr,
+		TransferID:   transferID,
+		Cap:          cap,
+		Quota:        quota,
+		ServerPeerID: s.PeerID(),
 	}
 }
 
@@ -321,6 +362,31 @@ func (s *Server) handleStream(st *quic.Stream, client contract.PeerID, sink Sink
 	// detect an overrun without ever copying it onward.
 	limited := io.LimitReader(st, int64(g.quota.Bytes)+1)
 	guard := &quotaReader{src: limited, limit: g.quota.Bytes}
+
+	// Request/response session: if a Responder is registered for this transfer,
+	// buffer the (quota-bounded) request, run the responder, and send its result
+	// back on the same session. This is the "granted session carries real work"
+	// path (e.g. a 9P /cer/dev/gpu ctl grant that runs an f32 kernel), distinct
+	// from the one-way Sink drain used by bulk transfers.
+	if resp, ok := s.responderFor(h.TransferID); ok {
+		req, rerr := io.ReadAll(guard)
+		if rerr != nil {
+			ack(ackErr, rerr.Error())
+			return
+		}
+		if guard.err != nil {
+			ack(ackErr, guard.err.Error())
+			return
+		}
+		out, herr := resp(h.TransferID, req)
+		if herr != nil {
+			ack(ackErr, herr.Error())
+			return
+		}
+		ack(ackOK, string(out))
+		return
+	}
+
 	consume := sink
 	if consume == nil {
 		// No sink: drain to discard, still bounded by the guard.
@@ -351,6 +417,15 @@ func (s *Server) lookup(transferID uint64) (grant, bool) {
 	defer s.mu.Unlock()
 	g, ok := s.grants[transferID]
 	return g, ok
+}
+
+// responderFor returns the request/response handler registered for transferID, if
+// any. A transfer with no responder falls through to the one-way Sink path.
+func (s *Server) responderFor(transferID uint64) (Responder, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.responders[transferID]
+	return r, ok
 }
 
 // recordClient stores the authenticated client PeerID for an authorized transfer

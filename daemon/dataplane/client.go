@@ -85,24 +85,57 @@ func NewClientWithIdentity(identity ed25519.PrivateKey) (*Client, error) {
 // Send returns nil only if the server acknowledged a complete, in-quota transfer.
 // An over-quota or unauthorized transfer returns a contract.CapError.
 func (c *Client) Send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) error {
+	_, err := c.send(ctx, ep, r, n)
+	return err
+}
+
+// Request runs a request/response transfer against a server-side Responder
+// (registered via Server.RegisterResponder): it sends req over the granted
+// session and returns the response blob the responder produced. It is the
+// requester side of a data-plane WORK session — e.g. dispatching an f32 kernel to
+// a peer's /cer/dev/gpu device after opening its ctl. The request is bounded by
+// ep.Quota exactly as Send is; the response is whatever the server sent back in
+// the success ack. A denial/failure returns a contract.CapError with the server's
+// reason (no fabricated response).
+func (c *Client) Request(ctx context.Context, ep Endpoint, req []byte) ([]byte, error) {
+	return c.send(ctx, ep, bytes.NewReader(req), uint64(len(req)))
+}
+
+// send streams a blob to the server described by ep, authorized by ep.Cap and
+// bounded by ep.Quota.Bytes, and returns the server's ack body (empty for a
+// plain one-way transfer; the responder's output for a request/response session).
+// Send and Request are thin wrappers over it.
+//
+// If ep.ServerPeerID is set, the QUIC/TLS dial PINS the server's certificate to
+// that exact Ed25519 key (see tls.go's VerifyPeerCertificate): a network MITM
+// terminating the handshake with its own certificate — even a validly
+// self-signed one — is rejected during the dial, before the header or any
+// payload byte is written. If ep.ServerPeerID is the zero PeerID (the caller did
+// not know which peer it intended to reach ahead of the dial), no pinning
+// happens and the transfer is authorized only by the in-band capability checks
+// below — a documented gap, not a silent one (see tls.go / endpoint.go).
+//
+// send returns a nil error only if the server acknowledged a complete, in-quota
+// transfer. An over-quota or unauthorized transfer returns a contract.CapError.
+func (c *Client) send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) ([]byte, error) {
 	if ep.Kind != EndpointQUIC {
-		return fmt.Errorf("dataplane: unsupported endpoint kind %q", ep.Kind)
+		return nil, fmt.Errorf("dataplane: unsupported endpoint kind %q", ep.Kind)
 	}
 	// Local guard: do not even open a stream for a blob that cannot fit the grant.
 	if n > ep.Quota.Bytes {
-		return contract.Errf(contract.ErrQuotaExceeded,
+		return nil, contract.Errf(contract.ErrQuotaExceeded,
 			fmt.Sprintf("blob %d bytes exceeds quota %d", n, ep.Quota.Bytes))
 	}
 
 	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(ep.ServerPeerID, c.cert), &quic.Config{})
 	if err != nil {
-		return contract.Errf(contract.ErrPartitioned, err.Error())
+		return nil, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
 	defer conn.CloseWithError(0, "done")
 
 	st, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		return contract.Errf(contract.ErrPartitioned, err.Error())
+		return nil, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
 	defer st.CancelRead(0)
 
@@ -113,7 +146,7 @@ func (c *Client) Send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) e
 		SignedCap:  ep.SignedCap, // cross-kernel authority; verified before bytes flow
 		Issuer:     ep.Issuer,
 	}); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Write the payload and read the ack concurrently. The server may reject a
@@ -132,18 +165,18 @@ func (c *Client) Send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) e
 		writeErr <- st.Close()
 	}()
 
-	ackResult := readAck(st)
+	body, ackErr := readAckBody(st)
 	werr := <-writeErr
 
 	// The ack is authoritative: if the server explicitly denied/accepted, honor
 	// that. A write error only matters when the server gave us no usable ack.
-	if ackResult != nil {
-		return ackResult
+	if ackErr != nil {
+		return nil, ackErr
 	}
 	if werr != nil {
-		return contract.Errf(contract.ErrPartitioned, werr.Error())
+		return nil, contract.Errf(contract.ErrPartitioned, werr.Error())
 	}
-	return nil
+	return body, nil
 }
 
 // SendBytes is the convenience form of Send for an in-memory blob.
@@ -151,27 +184,37 @@ func (c *Client) SendBytes(ctx context.Context, ep Endpoint, blob []byte) error 
 	return c.Send(ctx, ep, bytes.NewReader(blob), uint64(len(blob)))
 }
 
-// readAck reads the server's single-byte status (plus optional message) and maps
-// it to a contract error.
+// readAck reports only the server's ack status, discarding any response body. It
+// is the error-only form used where the caller does not expect a response (the
+// one-way transfer path and the low-level test harnesses).
 func readAck(st *quic.Stream) error {
+	_, err := readAckBody(st)
+	return err
+}
+
+// readAckBody reads the server's single-byte status (plus optional body) and maps
+// it to a contract error. On success it returns the trailing body bytes (the
+// responder's output for a request/response session; empty for a one-way
+// transfer); on failure it returns the mapped contract.CapError.
+func readAckBody(st *quic.Stream) ([]byte, error) {
 	buf, err := io.ReadAll(st)
 	if err != nil {
-		return contract.Errf(contract.ErrPartitioned, err.Error())
+		return nil, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
 	if len(buf) == 0 {
-		return contract.Errf(contract.ErrPartitioned, "no ack from server")
+		return nil, contract.Errf(contract.ErrPartitioned, "no ack from server")
 	}
 	if buf[0] == ackOK {
-		return nil
+		return buf[1:], nil
 	}
 	msg := string(buf[1:])
 	// Surface the server's category when it is a known code; otherwise denied.
 	switch {
 	case strings.Contains(msg, string(contract.ErrQuotaExceeded)):
-		return contract.Errf(contract.ErrQuotaExceeded, msg)
+		return nil, contract.Errf(contract.ErrQuotaExceeded, msg)
 	case strings.Contains(msg, string(contract.ErrRevoked)):
-		return contract.Errf(contract.ErrRevoked, msg)
+		return nil, contract.Errf(contract.ErrRevoked, msg)
 	default:
-		return contract.Errf(contract.ErrDenied, msg)
+		return nil, contract.Errf(contract.ErrDenied, msg)
 	}
 }

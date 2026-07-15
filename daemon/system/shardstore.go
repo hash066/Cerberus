@@ -38,6 +38,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -211,7 +212,11 @@ func (r *RemoteScatterShardStore) PutShard(c cid.Cid, shard []byte) (string, err
 	if err != nil {
 		return "", err
 	}
-	return placement, nil
+	_ = placement
+	// Record this node's own PeerID so any reader holding the Manifest can dial
+	// the correct peer directly (see GetPlacedShard) instead of relying on a
+	// blind fan-out that may miss under load.
+	return remotePlacementPrefix + encodePeer(r.fabric.PeerID()), nil
 }
 
 // getShardResult is one fan-out worker's outcome, for the first-success
@@ -220,6 +225,28 @@ type getShardResult struct {
 	data []byte
 	err  error
 	peer contract.PeerID
+}
+
+// GetPlacedShard fetches a shard using the Manifest placement hint recorded at
+// PutShard time (always "mesh:<owner PeerID>" for this store).
+func (r *RemoteScatterShardStore) GetPlacedShard(c cid.Cid, placement string) ([]byte, error) {
+	if strings.HasPrefix(placement, remotePlacementPrefix) {
+		peer, err := decodePeer(strings.TrimPrefix(placement, remotePlacementPrefix))
+		if err != nil {
+			return nil, err
+		}
+		if peer == r.fabric.PeerID() {
+			return r.local.GetShard(c)
+		}
+		env, ok := r.mintShardCap(contract.RightRead)
+		if !ok {
+			return nil, fmt.Errorf("dfs: shard %s on %x: no signed-cap issuer configured", c, peer[:8])
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), meshShardTimeout)
+		defer cancel()
+		return r.fabric.RequestGetShard(ctx, peer, c.Bytes(), env, r.issuerID)
+	}
+	return r.GetShard(c)
 }
 
 // GetShard fetches the shard from wherever PutShard placed it: locally, or from
@@ -306,6 +333,19 @@ func (r *RemoteScatterShardStore) pickPeer() (contract.PeerID, bool) {
 // base64 string recorded in Manifest.Placement.
 func encodePeer(p contract.PeerID) string { return base64.StdEncoding.EncodeToString(p[:]) }
 
+func decodePeer(b64 string) (contract.PeerID, error) {
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return contract.PeerID{}, fmt.Errorf("decode peer id: %w", err)
+	}
+	if len(raw) != len(contract.PeerID{}) {
+		return contract.PeerID{}, fmt.Errorf("decode peer id: bad length %d", len(raw))
+	}
+	var p contract.PeerID
+	copy(p[:], raw)
+	return p, nil
+}
+
 // LocalShardServer adapts a dfs.ShardStore to mesh.ShardServer so this node can
 // serve OTHER peers' remote-placed shard put/get requests against its own local
 // store. Compose installs this via fabric.ServeShards so a peer that picks THIS
@@ -337,4 +377,5 @@ func (l *LocalShardServer) GetShard(cidBytes []byte) ([]byte, error) {
 }
 
 var _ dfs.ShardStore = (*RemoteScatterShardStore)(nil)
+var _ dfs.PlacedShardStore = (*RemoteScatterShardStore)(nil)
 var _ mesh.ShardServer = (*LocalShardServer)(nil)

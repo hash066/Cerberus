@@ -128,6 +128,79 @@ func TestPlacePipelineNoNodes(t *testing.T) {
 	}
 }
 
+func TestPlaceGPUPicksNodeWithMostFreeVRAM(t *testing.T) {
+	s := New(nil)
+	s.UpdateNode(node(1, 2_000_000_000, false, true))  // 2GB, below need
+	s.UpdateNode(node(2, 12_000_000_000, false, true)) // 12GB free -> best fit
+	s.UpdateNode(node(3, 8_000_000_000, false, true))  // 8GB free -> standby
+	s.UpdateNode(node(4, 24_000_000_000, true, true))  // throttling -> excluded
+
+	plan, err := s.PlaceGPU([]byte{7}, 6_000_000_000) // need 6GB VRAM
+	if err != nil {
+		t.Fatalf("PlaceGPU: %v", err)
+	}
+	if plan.Placements[0].Node != (contract.PeerID{2}) {
+		t.Fatalf("expected node 2 (most free VRAM meeting the need) primary, got %v", plan.Placements[0].Node[0])
+	}
+	if len(plan.Standbys) != 1 || plan.Standbys[0].Node != (contract.PeerID{3}) {
+		t.Fatalf("expected node 3 standby (next-most free VRAM)")
+	}
+	// The recorded plan must be reroutable off the primary, proving PlaceGPU
+	// participates in the same reroute machinery as Place.
+	np, err := s.Reroute([]byte{7}, plan.Placements[0].Node)
+	if err != nil {
+		t.Fatalf("reroute gpu task: %v", err)
+	}
+	if np.Placements[0].Node != (contract.PeerID{3}) {
+		t.Fatalf("expected standby node 3 promoted, got %v", np.Placements[0].Node[0])
+	}
+}
+
+func TestPlaceGPUFailsWhenNoNodeHasEnoughVRAM(t *testing.T) {
+	s := New(nil)
+	s.UpdateNode(node(1, 1_000_000_000, false, true))
+	s.UpdateNode(node(2, 3_000_000_000, false, true))
+	if _, err := s.PlaceGPU([]byte{8}, 8_000_000_000); err == nil {
+		t.Fatal("expected error when no node meets the VRAM need")
+	}
+}
+
+// TestPlacePrefersLeastLoadedByAvailableFlops proves the cost model is
+// load-aware: given two remote nodes identical in cores, VRAM, thermal, and AC
+// power, the one advertising MORE available FLOPS (i.e. less loaded — the
+// telemetry FLOPS is peak scaled by live host utilization, see
+// daemon/system.localTelemetry) is chosen as primary for a CPU-bound task.
+func TestPlacePrefersLeastLoadedByAvailableFlops(t *testing.T) {
+	s := New(nil)
+	busy := contract.NodeTelemetry{ // heavily loaded => low available FLOPS
+		PeerID:  contract.PeerID{1},
+		Compute: contract.Compute{PCores: 8, Flops: 0.1e12},
+		Memory:  contract.Memory{VRAMFree: 8_000_000_000},
+		Thermal: contract.Thermal{HeadroomC: 20},
+		Power:   contract.Power{Src: contract.PowerAC},
+	}
+	idle := contract.NodeTelemetry{ // lightly loaded => high available FLOPS
+		PeerID:  contract.PeerID{2},
+		Compute: contract.Compute{PCores: 8, Flops: 0.9e12},
+		Memory:  contract.Memory{VRAMFree: 8_000_000_000},
+		Thermal: contract.Thermal{HeadroomC: 20},
+		Power:   contract.Power{Src: contract.PowerAC},
+	}
+	s.UpdateNode(busy)
+	s.UpdateNode(idle)
+
+	plan, err := s.Place(task(70))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Placements[0].Node != (contract.PeerID{2}) {
+		t.Fatalf("expected least-loaded node 2 (more available FLOPS) as primary, got %v", plan.Placements[0].Node[0])
+	}
+	if len(plan.Standbys) != 1 || plan.Standbys[0].Node != (contract.PeerID{1}) {
+		t.Fatalf("expected loaded node 1 as standby")
+	}
+}
+
 func TestMinVRAMConstraint(t *testing.T) {
 	s := New(DefaultCostModel{MinVRAM: 6_000_000_000})
 	s.UpdateNode(node(1, 4_000_000_000, false, true)) // below min -> infeasible

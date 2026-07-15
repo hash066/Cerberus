@@ -5,7 +5,7 @@ package chaos
 // raceEnabled is true only when the test binary is built with -race.
 //
 // The real-process suite (TestRealProcessKillAndRestartConvergesRevocation)
-// spawns cerberusd as separate OS processes that buildCerberusd compiles with a
+// spawns cerberusd as separate OS processes that testdaemon builds with a
 // plain `go build` (NOT -race), so the race detector never instruments the code
 // actually under test. Running that test under -race therefore yields zero
 // additional race coverage while adding 2-10x CPU load across the whole `go test

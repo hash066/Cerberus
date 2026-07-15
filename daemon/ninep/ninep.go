@@ -22,8 +22,9 @@ import (
 type EndpointKind string
 
 const (
-	EndpointQUIC EndpointKind = "quic"
-	EndpointRDMA EndpointKind = "rdma"
+	EndpointQUIC      EndpointKind = "quic"
+	EndpointRDMA      EndpointKind = "rdma"
+	EndpointMeshAudio EndpointKind = "mesh-audio" // pooled remote audio: media rides the mesh session, not the raw data plane
 )
 
 // DataEndpoint is what `open .../ctl` returns: a handle to the data plane, not bytes.
@@ -84,6 +85,16 @@ func (s *Server) Register(dir string, ref contract.ResourceRef) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.devices[strings.TrimRight(dir, "/")] = ref
+}
+
+// Unregister removes a previously registered device directory. It is a no-op if
+// the path was not registered. Used by the audio pool to drop stale remote
+// endpoints when a peer disconnects or its device list changes.
+func (s *Server) Unregister(dir string) {
+	dir = strings.TrimRight(dir, "/")
+	s.mu.Lock()
+	delete(s.devices, dir)
+	s.mu.Unlock()
 }
 
 // IsAncestorDir reports whether path is a structural ancestor directory of some

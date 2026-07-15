@@ -44,6 +44,15 @@ import (
 // gpuProto is the libp2p protocol id for capability-gated cross-node GPU dispatch.
 const gpuProto = "/cerberus/gpu/1.0.0"
 
+// MeshGpuResource returns the per-site resource a mesh GPU dispatch capability
+// must name: contract.KindGPU at "cerberus/<site>/mesh-gpu". Production daemons
+// mint a signed RightExec capability against this resource (self-issued under the
+// mesh identity key, stream-bound — see shard.go's issuer trust model) before
+// calling RequestGpuSigned.
+func MeshGpuResource(site string) contract.ResourceRef {
+	return contract.ResourceRef{Kind: contract.KindGPU, Path: "cerberus/" + site + "/mesh-gpu"}
+}
+
 // GpuRequest is one element-wise f32 GPU kernel to run on a peer. KernelID mirrors
 // the daemon/gpu + core/cabi ABI (0=VectorAdd, 1=Saxpy(alpha=Param), 2=ScalarMul
 // (scalar=Param); B is ignored for ScalarMul). It is the argument a verified

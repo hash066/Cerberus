@@ -9,4 +9,4 @@ package contract
 
 // ContractVersion is bumped on any breaking change to this package or the
 // proto/WIT/CDDL it mirrors. Lanes pin against it.
-const ContractVersion = "0.1.0"
+const ContractVersion = "0.1.1"

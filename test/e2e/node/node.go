@@ -40,6 +40,7 @@ import (
 	"github.com/hash066/cerberus/contract/go/stub"
 	"github.com/hash066/cerberus/daemon/auth"
 	"github.com/hash066/cerberus/daemon/mesh"
+	"github.com/hash066/cerberus/daemon/system"
 	"github.com/hash066/cerberus/daemon/wasm"
 	"github.com/ipfs/go-cid"
 	ic "github.com/libp2p/go-libp2p/core/crypto"
@@ -69,12 +70,10 @@ type Config struct {
 	Ready      io.Writer
 	Log        io.Writer
 	// SkipHelloShardSeed, if true, does NOT pre-populate this node's content
-	// store with the hello-shard bytes. It exists so a test can prove the
-	// mesh peer-component-fetch path is real: a node built with this set must
-	// fetch the component from a peer over the mesh rather than already
-	// having it cached locally. The production e2e demo (test/e2e) leaves
-	// this false, matching its historical both-nodes-embed-the-bytes setup.
 	SkipHelloShardSeed bool
+	// Pipeline, if true, wires split-MLP pipeline worker surfaces (data plane +
+	// PipelineRunner) for the test/pipeline_e2e harness.
+	Pipeline bool
 }
 
 // Peer is a discovered node. Addr is its HTTP control URL; MeshPeerID is the
@@ -162,6 +161,10 @@ type server struct {
 	mu          sync.Mutex
 	peers       map[string]Peer
 	trustedKeys map[contract.PeerID]ed25519.PublicKey // issuer PeerID -> exchanged pubkey
+
+	pipelineWorker *system.PipelineWorker
+	pipelineRunner *system.PipelineRunner
+	inferenceSvc   *system.InferenceService
 }
 
 func HelloShardWASM() []byte {
@@ -286,11 +289,20 @@ func Run(ctx context.Context, cfg Config) error {
 		auth.RevocationPredicateFromIssuer(nil),
 	)
 
+	if cfg.Pipeline {
+		if err := node.wirePipeline(ctx); err != nil {
+			return fmt.Errorf("pipeline wire: %w", err)
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", node.handleHealth)
 	mux.HandleFunc("GET /peers", node.handlePeers)
 	mux.HandleFunc("POST /discover", node.handleDiscover)
 	mux.HandleFunc("POST /dispatch", node.handleDispatch)
+	if cfg.Pipeline {
+		mux.HandleFunc("POST /pipeline-run", node.handlePipelineRun)
+	}
 
 	httpServer := &http.Server{Handler: mux}
 	serveErr := make(chan error, 1)
@@ -555,6 +567,9 @@ func (s *server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 // signed grant is now the authority; there is no ambient authority and no opaque
 // shared-kernel handle in the trust decision.
 func (s *server) handleComputeSigned(ctx context.Context, task contract.ComputeTask, grant auth.Grant) (contract.ComputeResult, error) {
+	if s.isPipelineTask(task) {
+		return s.pipelineComputeDispatch(ctx, task, grant)
+	}
 	taskID := string(task.TaskID)
 	_ = grant // authority already verified by the mesh signed-cap gate
 

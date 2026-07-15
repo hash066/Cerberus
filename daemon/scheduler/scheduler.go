@@ -18,18 +18,33 @@ type CostModel interface {
 	Score(t contract.ComputeTask, n contract.NodeTelemetry) (score float64, feasible bool)
 }
 
-// DefaultCostModel: a node is feasible if it is not thermally throttling and has
-// free VRAM at least MinVRAM. Score rewards free VRAM and thermal headroom, with
-// an AC-power bonus and a penalty for slow links.
+// DefaultCostModel: a node is feasible if it is not thermally throttling, has
+// free VRAM at least MinVRAM, and has at least one free CPU thread in the pool.
+// Score rewards free CPU (primary for WASM/thread-pool dispatch), free VRAM, and
+// thermal headroom, with an AC-power bonus and a penalty for slow links.
 type DefaultCostModel struct {
 	MinVRAM uint64
+	Pool    *Scheduler // optional; when set, saturated nodes are infeasible
 }
 
 func (m DefaultCostModel) Score(_ contract.ComputeTask, n contract.NodeTelemetry) (float64, bool) {
 	if n.Thermal.Throttling || n.Memory.VRAMFree < m.MinVRAM {
 		return 0, false
 	}
-	score := float64(n.Memory.VRAMFree)/1e9 + n.Thermal.HeadroomC
+	freeCPU := float64(TotalCores(n))
+	if m.Pool != nil {
+		freeCPU = float64(m.Pool.FreeCPU(n.PeerID))
+		if freeCPU <= 0 {
+			return 0, false
+		}
+	}
+	// Compute.Flops is the node's currently-AVAILABLE FLOPS (peak scaled by live
+	// host CPU utilization — see daemon/system.localTelemetry). Rewarding it makes
+	// placement load-aware: between two nodes with equal free threads, VRAM, and
+	// thermal headroom, the less-loaded one (more available FLOPS) wins, so a
+	// CPU-bound task lands on the idlest node in the mesh. Normalized to TFLOPS so
+	// it is a soft tie-breaker, not a term that dwarfs the free-thread signal.
+	score := freeCPU*5 + n.Compute.Flops/1e12 + float64(n.Memory.VRAMFree)/1e9 + n.Thermal.HeadroomC
 	if n.Power.Src == contract.PowerAC {
 		score += 10
 	}
@@ -51,27 +66,50 @@ func (m DefaultCostModel) Score(_ contract.ComputeTask, n contract.NodeTelemetry
 type Scheduler struct {
 	mu         sync.Mutex
 	nodes      map[contract.PeerID]contract.NodeTelemetry
+	cpuMu      sync.Mutex
+	cpu        map[contract.PeerID]cpuSlot
 	cost       CostModel
 	placements map[string]contract.Plan
 }
 
-// New builds a scheduler with the given cost model (nil = DefaultCostModel).
+// New builds a scheduler with the given cost model (nil = DefaultCostModel wired
+// to this scheduler's CPU pool).
 func New(cost CostModel) *Scheduler {
-	if cost == nil {
-		cost = DefaultCostModel{}
-	}
-	return &Scheduler{
+	s := &Scheduler{
 		nodes:      map[contract.PeerID]contract.NodeTelemetry{},
-		cost:       cost,
+		cpu:        map[contract.PeerID]cpuSlot{},
 		placements: map[string]contract.Plan{},
 	}
+	if cost == nil {
+		cost = DefaultCostModel{Pool: s}
+	} else if dcm, ok := cost.(DefaultCostModel); ok && dcm.Pool == nil {
+		dcm.Pool = s
+		cost = dcm
+	}
+	s.cost = cost
+	return s
 }
 
-// UpdateNode records the latest telemetry for a node.
+// UpdateNode records the latest telemetry for a node, preserving in-flight CPU
+// occupancy for that peer.
 func (s *Scheduler) UpdateNode(t contract.NodeTelemetry) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.nodes[t.PeerID] = t
+	s.mu.Unlock()
+	s.cpuMu.Lock()
+	s.syncCPUSlot(t.PeerID, t)
+	s.cpuMu.Unlock()
+}
+
+// NodeSnapshots returns the latest telemetry for every known node (local + peers).
+func (s *Scheduler) NodeSnapshots() []contract.NodeTelemetry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]contract.NodeTelemetry, 0, len(s.nodes))
+	for _, t := range s.nodes {
+		out = append(out, t)
+	}
+	return out
 }
 
 // rank returns feasible nodes (excluding `exclude`) best-first.
@@ -137,6 +175,52 @@ func (s *Scheduler) PlacePipeline(taskID []byte, shards []contract.Shard) (contr
 			standby := ranked[(i+1)%len(ranked)]
 			plan.Standbys = append(plan.Standbys, contract.Placement{Shard: sh, Node: standby})
 		}
+	}
+	s.placements[hex.EncodeToString(taskID)] = plan
+	return plan, nil
+}
+
+// PlaceGPU places a GPU/VRAM-bound task on the node that has the most free VRAM
+// among those meeting minVRAM, reading live telemetry (NodeTelemetry.Memory.
+// VRAMFree). It is the placement path for work that must run on a real GPU with
+// enough headroom — e.g. a ComputeTask whose worker will open a peer's
+// /cer/dev/gpu device and dispatch kernels over the data plane. A thermally
+// throttling node is never chosen even if it reports free VRAM (the same hard
+// constraint DefaultCostModel applies). The best-fit node is primary and the
+// next-best a hot standby, exactly as Place does; ErrThermalShed is returned when
+// no node has enough free VRAM.
+//
+// Unlike Place (which ranks through the configured CostModel), this ranks strictly
+// by free VRAM so a GPU-bound task lands where the tensors will actually fit,
+// independent of the CPU-oriented cost weighting. It records the plan under taskID
+// so Reroute/RerouteNode apply to it too.
+func (s *Scheduler) PlaceGPU(taskID []byte, minVRAM uint64) (contract.Plan, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	type scored struct {
+		id   contract.PeerID
+		vram uint64
+	}
+	var cands []scored
+	for id, tel := range s.nodes {
+		if tel.Thermal.Throttling || tel.Memory.VRAMFree < minVRAM {
+			continue
+		}
+		cands = append(cands, scored{id, tel.Memory.VRAMFree})
+	}
+	if len(cands) == 0 {
+		return contract.Plan{}, contract.Errf(contract.ErrThermalShed, "no node with enough free VRAM")
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].vram > cands[j].vram })
+
+	shard := contract.Shard{Kind: contract.ShardData}
+	plan := contract.Plan{
+		TaskID:     taskID,
+		Placements: []contract.Placement{{Shard: shard, Node: cands[0].id}},
+	}
+	if len(cands) > 1 {
+		plan.Standbys = []contract.Placement{{Shard: shard, Node: cands[1].id}}
 	}
 	s.placements[hex.EncodeToString(taskID)] = plan
 	return plan, nil

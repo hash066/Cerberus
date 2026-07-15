@@ -1,5 +1,6 @@
 # Taskfile for Cerberus. Install runner: go install github.com/go-task/task/v3/cmd/task@latest
 # Every target also documents the raw command so it can be run without `task`.
+# Windows without task: pwsh build/task.ps1 [build|test|lint|demo|ci]
 version: "3"
 
 tasks:

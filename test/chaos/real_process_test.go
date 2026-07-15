@@ -57,7 +57,6 @@ package chaos
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -71,6 +70,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hash066/cerberus/test/testdaemon"
 )
 
 // ---- RPC wire types --------------------------------------------------------
@@ -146,6 +147,8 @@ type realNode struct {
 
 	mu      sync.Mutex
 	cmd     *exec.Cmd
+	stdout  io.Closer
+	stderr  io.Closer
 	logs    *rpSafeBuffer
 	waitErr chan error
 }
@@ -167,38 +170,6 @@ func (b *rpSafeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.b.String()
-}
-
-// buildCerberusd builds the real daemon binary once, exactly like
-// test/e2e/main.go's buildDaemon, so both real-process nodes exec the same
-// tested artifact rather than `go run`-ing per node.
-func buildCerberusd(t *testing.T, repoRoot, outDir string) string {
-	t.Helper()
-	binPath := filepath.Join(outDir, executableName("cerberusd"))
-	// Generous ceiling: this `go build` competes for CPU with the rest of the
-	// suite when run as part of `go test ./...`, so a tight 2m budget produced
-	// spurious build-timeout failures on a contended runner. 5m only ever trips
-	// on a genuinely stuck build, not on load.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, "./cmd/cerberusd")
-	cmd.Dir = repoRoot
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	start := time.Now()
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("build cerberusd: %v\n%s", err, out.String())
-	}
-	t.Logf("[real-process] built cerberusd in %s", time.Since(start))
-	return binPath
-}
-
-func executableName(name string) string {
-	if runtime.GOOS == "windows" {
-		return name + ".exe"
-	}
-	return name
 }
 
 // freePort asks the OS for an unused TCP port on 127.0.0.1. There is an
@@ -286,6 +257,8 @@ func (n *realNode) start(t *testing.T) {
 
 	n.mu.Lock()
 	n.cmd = cmd
+	n.stdout = stdout
+	n.stderr = stderr
 	n.logs = logs
 	n.waitErr = waitErr
 	n.mu.Unlock()
@@ -309,6 +282,8 @@ func (n *realNode) kill(t *testing.T) {
 	n.mu.Lock()
 	cmd := n.cmd
 	waitErr := n.waitErr
+	stdout := n.stdout
+	stderr := n.stderr
 	n.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
 		t.Fatalf("%s: kill called before start", n.id)
@@ -322,6 +297,15 @@ func (n *realNode) kill(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("%s: process did not exit within 5s of Kill()", n.id)
 	}
+	if stdout != nil {
+		_ = stdout.Close()
+	}
+	if stderr != nil {
+		_ = stderr.Close()
+	}
+	n.mu.Lock()
+	n.stdout, n.stderr = nil, nil
+	n.mu.Unlock()
 	t.Logf("[real-process] %s: killed pid=%d in %s (hard OS kill, not graceful shutdown)", n.id, cmd.Process.Pid, time.Since(killedAt))
 }
 
@@ -331,17 +315,14 @@ func (n *realNode) stop() {
 	n.mu.Lock()
 	cmd := n.cmd
 	waitErr := n.waitErr
+	stdout := n.stdout
+	stderr := n.stderr
+	n.cmd = nil
+	n.waitErr = nil
+	n.stdout = nil
+	n.stderr = nil
 	n.mu.Unlock()
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	_ = cmd.Process.Kill()
-	if waitErr != nil {
-		select {
-		case <-waitErr:
-		case <-time.After(2 * time.Second):
-		}
-	}
+	testdaemon.TerminateProcess(cmd, stdout, stderr, waitErr, 10*time.Second)
 }
 
 func (n *realNode) logString() string {
@@ -521,13 +502,14 @@ func TestRealProcessKillAndRestartConvergesRevocation(t *testing.T) {
 		t.Fatalf("repo root guess %q does not contain go.mod: %v", repoRoot, err)
 	}
 
-	binDir := t.TempDir()
-	binaryPath := buildCerberusd(t, repoRoot, binDir)
+	// Shared binary lives outside t.TempDir() so Windows can delete config dirs
+	// without fighting an exe lock left inside the per-test temp tree.
+	binaryPath := testdaemon.Cerberusd(t, repoRoot)
 
 	a := newRealNode(t, repoRoot, binaryPath, "a")
 	b := newRealNode(t, repoRoot, binaryPath, "b")
-	t.Cleanup(a.stop)
 	t.Cleanup(b.stop)
+	t.Cleanup(a.stop)
 
 	startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer startCancel()

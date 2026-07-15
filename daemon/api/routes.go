@@ -39,6 +39,12 @@ type NamespaceDevice struct {
 	Path   string   `json:"path"`
 	Kind   string   `json:"kind"`
 	Rights []string `json:"rights"`
+	// Name is the platform-friendly device name when known (audio endpoints).
+	Name string `json:"name,omitempty"`
+	// Peer is the hex Ed25519 PeerID of the node that owns a pooled remote device.
+	Peer string `json:"peer,omitempty"`
+	// Pooled is true when this device was discovered on a remote mesh peer.
+	Pooled bool `json:"pooled,omitempty"`
 }
 
 // WorkloadEntry is one row in the /api/v1/workloads history. Field names/JSON
@@ -218,10 +224,11 @@ type Actions struct {
 // struct (which assembles the single /api/v1/status Snapshot) since these
 // back their own top-level list routes rather than fields of Snapshot.
 type ListGetters struct {
-	Conflicts func() []ConflictView
-	Devices   func() []NamespaceDevice
-	Workloads func() []WorkloadEntry
-	Wallet    func() WalletView
+	Conflicts        func() []ConflictView
+	Devices          func() []NamespaceDevice
+	Workloads        func() []WorkloadEntry
+	Wallet           func() WalletView
+	ClusterResources func() ClusterResources
 }
 
 // WithActions attaches the write-side Actions to a Server built by New or
@@ -252,6 +259,7 @@ func (s *Server) registerActionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/devices", s.requireRead(s.handleDevicesList))
 	mux.HandleFunc("/api/v1/workloads", s.requireRead(s.handleWorkloadsList))
 	mux.HandleFunc("/api/v1/wallet", s.requireRead(s.handleWallet))
+	mux.HandleFunc("/api/v1/cluster/resources", s.requireRead(s.handleClusterResources))
 	// CapsRevoke and CapsMint both require "admin" on the RPC; mirror that
 	// exactly here rather than the weaker "write" (the operator token carries
 	// "admin" so this is not a behavior change for the tray's only credential,

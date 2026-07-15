@@ -62,7 +62,14 @@ func ShardCID(shard []byte) (cid.Cid, error) {
 	return cid.NewCidV1(cid.Raw, mh), nil
 }
 
-// ShardStore is the placement interface: where a shard's bytes physically live.
+// PlacedShardStore extends ShardStore with placement-aware fetch. When a
+// Manifest records where each shard lives (mesh:<peer>), Get can dial the
+// owner directly instead of probing every peer.
+type PlacedShardStore interface {
+	ShardStore
+	GetPlacedShard(c cid.Cid, placement string) ([]byte, error)
+}
+
 // The in-memory implementation below is for tests and the v0.1 single-node path.
 // PEER SCATTER IS A LATER STEP — a real store puts each shard on a remote peer
 // (placement recorded in Manifest.Placement) and fetches it over the data plane.
@@ -80,8 +87,8 @@ type ShardStore interface {
 // are data shards, the last m are parity), their placement hints, and the
 // original (pre-padding) chunk length so Get can trim Reed-Solomon zero padding.
 type ChunkManifest struct {
-	ShardCIDs  []cid.Cid `json:"shard_cids"` // length k+m, data shards first
-	Placement  []string  `json:"placement"`  // length k+m, parallel to ShardCIDs
+	ShardCIDs  []cid.Cid `json:"shard_cids"`  // length k+m, data shards first
+	Placement  []string  `json:"placement"`   // length k+m, parallel to ShardCIDs
 	ChunkBytes int       `json:"chunk_bytes"` // original chunk length before padding
 }
 
@@ -255,7 +262,11 @@ func (f *FS) getChunk(enc reedsolomon.Encoder, cm ChunkManifest, k int) ([]byte,
 	shards := make([][]byte, len(cm.ShardCIDs))
 	present := 0
 	for i, c := range cm.ShardCIDs {
-		b, err := f.store.GetShard(c)
+		var placement string
+		if i < len(cm.Placement) {
+			placement = cm.Placement[i]
+		}
+		b, err := f.getShard(c, placement)
 		if err != nil {
 			shards[i] = nil // unavailable — Reconstruct will try to rebuild it
 			continue
@@ -296,6 +307,14 @@ func (f *FS) getChunk(enc reedsolomon.Encoder, cm ChunkManifest, k int) ([]byte,
 		return nil, fmt.Errorf("dfs: join shards: %w", err)
 	}
 	return chunk.Bytes(), nil
+}
+
+// getShard fetches one shard, using placement hints when the store supports them.
+func (f *FS) getShard(c cid.Cid, placement string) ([]byte, error) {
+	if ps, ok := f.store.(PlacedShardStore); ok && placement != "" {
+		return ps.GetPlacedShard(c, placement)
+	}
+	return f.store.GetShard(c)
 }
 
 // MemShardStore is an in-memory ShardStore for tests and the v0.1 single-node

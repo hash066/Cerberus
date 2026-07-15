@@ -44,14 +44,18 @@ const (
 )
 
 // Model is one entry the gateway advertises on /v1/models. A Cerberus "model" is
-// a WASM component/agent addressable by CID; ID is the string an OpenAI client
-// passes as "model" and ComponentCID is the component the executor should run.
+// either a WASM component/agent addressable by CID, or a pipeline inference model.
+// ID is the string an OpenAI client passes as "model".
 type Model struct {
 	// ID is the OpenAI-facing model name (what a client sets as "model").
 	ID string
+	// Kind selects the dispatch path: WASM executor (default) or pipeline inference.
+	Kind ModelKind
 	// ComponentCID is the content id of the WASM component this model runs.
 	// Surfaced to clients (as metadata) and used to build the ComputeTask.
 	ComponentCID string
+	// Inference holds registry metadata when Kind is ModelKindInference.
+	Inference InferenceModelMeta
 	// OwnedBy is the "owned_by" field OpenAI clients expect (default "cerberus").
 	OwnedBy string
 	// Created is the advertised creation time (unix seconds); 0 → gateway start.
@@ -65,6 +69,7 @@ type Model struct {
 type DispatchEvent struct {
 	TaskID string // hex/opaque task identifier, as recorded in the ComputeTask
 	Model  string // the OpenAI-facing model name the client requested
+	Node   string // "local" or hex peer id where the task ran
 	OK     bool
 	Error  string
 }
@@ -79,8 +84,9 @@ type OnDispatchFunc func(DispatchEvent)
 // capability token (Authorization: Bearer <token>) granting "exec" — there is no
 // unauthenticated access, so multiple users/agents can share a daemon safely.
 type Gateway struct {
-	executor contract.Executor
-	authz    auth.Authorizer
+	executor  contract.Executor
+	authz     auth.Authorizer
+	inference InferenceRunner
 
 	mu         sync.RWMutex
 	models     map[string]Model // keyed by Model.ID
@@ -206,20 +212,34 @@ func (g *Gateway) dispatch(ctx context.Context, subject, model string) (contract
 	}
 	promise, err := g.executor.Dispatch(ctx, task)
 	if err != nil {
-		g.reportDispatch(task, model, false, err.Error())
+		g.reportDispatch(task, model, "local", false, err.Error())
 		return contract.ComputeResult{}, err
 	}
 	res, err := g.executor.Resolve(ctx, promise)
+	node := dispatchNode(g.executor, promise)
 	if err != nil {
-		g.reportDispatch(task, model, false, err.Error())
+		g.reportDispatch(task, model, node, false, err.Error())
 		return contract.ComputeResult{}, err
 	}
 	// Record settlement for a completed, priced task (no-op unless a real
 	// settler was wired). Never fails the request: settlement is a side effect
 	// of a successful compute, not part of the response contract.
 	g.recordSettlement(ctx, task, subject, res)
-	g.reportDispatch(task, model, res.OK, res.Error)
+	g.reportDispatch(task, model, node, res.OK, res.Error)
 	return res, nil
+}
+
+// dispatchNode returns where a promise ran when the executor exposes LastWhere.
+func dispatchNode(exec contract.Executor, p contract.PromiseHandle) string {
+	type whereProvider interface {
+		LastWhere(contract.PromiseHandle) string
+	}
+	if wp, ok := exec.(whereProvider); ok {
+		if w := wp.LastWhere(p); w != "" {
+			return w
+		}
+	}
+	return "local"
 }
 
 // reportDispatch invokes the optional OnDispatch hook (if one is wired), never
@@ -227,14 +247,17 @@ func (g *Gateway) dispatch(ctx context.Context, subject, model string) (contract
 // itself may do anything (append to a ring buffer, etc.) but a slow/faulty
 // hook is the composition's problem to fix, not something dispatch guards
 // against here (mirrors recordSettlement's "never fails the request" posture).
-func (g *Gateway) reportDispatch(task contract.ComputeTask, model string, ok bool, errMsg string) {
+func (g *Gateway) reportDispatch(task contract.ComputeTask, model, node string, ok bool, errMsg string) {
 	g.mu.RLock()
 	hook := g.onDispatch
 	g.mu.RUnlock()
 	if hook == nil {
 		return
 	}
-	hook(DispatchEvent{TaskID: string(task.TaskID), Model: model, OK: ok, Error: errMsg})
+	if node == "" {
+		node = "local"
+	}
+	hook(DispatchEvent{TaskID: string(task.TaskID), Model: model, Node: node, OK: ok, Error: errMsg})
 }
 
 // Handler returns the gateway's HTTP mux (the OpenAI-compatible routes).

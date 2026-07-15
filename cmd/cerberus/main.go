@@ -153,6 +153,8 @@ func run(args []string) int {
 		return cmdStatus(rest, jsonOut)
 	case "run":
 		return cmdRun(rest, jsonOut)
+	case "pipeline-run":
+		return cmdPipelineRun(rest, jsonOut)
 	case "nodes":
 		return cmdNodes(rest, jsonOut)
 	case "devices":
@@ -193,6 +195,7 @@ Usage:
 Commands:
   status                              Daemon health, identity, uptime, balance
   run <component.wasm> [--on <peer>]  Execute a WASM workload; print the real result
+  pipeline-run [--model ID] [--backend NAME]  Run a pipeline inference model
   nodes                               List mesh peers (this node + connected)
   devices                             List the 9P namespace devices
   wallet [owner]                      Compute-credit balance from the durable ledger
@@ -204,7 +207,8 @@ Commands:
   components list                     List registered components (name, CID, size)
   fs put <local-file> [/cer/fs/name]  Store a file in the distributed FS (erasure-coded, scattered)
   fs get /cer/fs/name [local-file]    Reconstruct a stored file (to a file, or stdout)
-  fs ls                               List files stored in /cer/fs
+  fs cat /cer/fs/name                 Print a stored file to stdout (remote paths over mesh)
+  fs ls                               List files stored in /cer/fs (includes remote peers)
   gpu <kernel> <a> [b] [--param N]    Run a compute kernel (vector-add|saxpy|scalar-mul); reports backend (gpu-wgpu with task build:gpu; see docs/gpu.md)
   audio loopback [--freq HZ] [--frames N]  Run a real audio session over the QUIC data plane; report delivery
   audio play --on <peerHexID>          Capture this node's mic and stream it to the PEER's speaker (mesh)
@@ -325,6 +329,58 @@ func cmdRun(args []string, jsonOut bool) int {
 	return exitErr
 }
 
+func cmdPipelineRun(args []string, jsonOut bool) int {
+	model, args := extractValueFlag(args, "--model")
+	backend, args := extractValueFlag(args, "--backend")
+	if len(args) > 0 {
+		fmt.Fprintf(os.Stderr, "pipeline-run: unexpected argument %q\n", args[0])
+		fmt.Fprintln(os.Stderr, "usage: cerberus pipeline-run [--model ID] [--backend NAME]")
+		return exitUsage
+	}
+
+	token, code := loadToken()
+	if code != exitOK {
+		return code
+	}
+	client, code := dial()
+	if code != exitOK {
+		return code
+	}
+	defer client.Close()
+
+	var resp PipelineRunResponse
+	req := &PipelineRunRequest{Token: token, Model: model, Backend: backend}
+	if err := client.Call("DaemonRPC.PipelineRun", req, &resp); err != nil {
+		return rpcErr("pipeline-run", err)
+	}
+	if jsonOut {
+		return printJSON(resp)
+	}
+	if resp.Model != "" {
+		fmt.Printf("Model:   %s\n", resp.Model)
+	}
+	fmt.Printf("Backend: %s\n", resp.Backend)
+	for _, st := range resp.Stages {
+		where := "local"
+		if st.Remote {
+			where = "remote"
+		}
+		fmt.Printf("  layers %d-%d on %s (%s) %s\n", st.LayerLo, st.LayerHi, st.Node, where, st.Duration)
+		if !st.OK {
+			fmt.Printf("    error: %s\n", st.Error)
+		}
+	}
+	if resp.Content != "" {
+		fmt.Printf("Content: %s\n", resp.Content)
+	}
+	if resp.OK {
+		fmt.Printf("Output (%d bytes): %x\n", len(resp.Output), resp.Output)
+		return exitOK
+	}
+	fmt.Fprintf(os.Stderr, "pipeline-run FAILED: %s\n", resp.Error)
+	return exitErr
+}
+
 func cmdNodes(_ []string, jsonOut bool) int {
 	token, code := loadToken()
 	if code != exitOK {
@@ -382,7 +438,15 @@ func cmdDevices(_ []string, jsonOut bool) int {
 	}
 	fmt.Printf("9P namespace devices (%d):\n", len(resp.Devices))
 	for _, d := range resp.Devices {
-		fmt.Printf("  %-28s kind=%-6s quota=%s\n", d.Path, d.Kind, humanBytes(d.QuotaBytes))
+		tag := ""
+		if d.Pooled && d.Peer != "" {
+			tag = fmt.Sprintf("  peer=%s", short(d.Peer))
+		}
+		name := ""
+		if d.Name != "" {
+			name = fmt.Sprintf("  name=%q", d.Name)
+		}
+		fmt.Printf("  %-36s kind=%-6s quota=%s%s%s\n", d.Path, d.Kind, humanBytes(d.QuotaBytes), name, tag)
 	}
 	return exitOK
 }
@@ -791,13 +855,14 @@ func parseFloats(s string) ([]float32, error) {
 // gpuUsage is the detailed help for `cerberus gpu`, including the exact steps a
 // Windows + NVIDIA user runs to make the daemon dispatch on the real GPU. Printed
 // on `cerberus gpu` with no args (or `--help`).
-const gpuUsage = `usage: cerberus gpu <vector-add|saxpy|scalar-mul> <a,b,c> [<d,e,f>] [--param N]
+const gpuUsage = `usage: cerberus gpu <vector-add|saxpy|scalar-mul> <a,b,c> [<d,e,f>] [--param N] [--on <peer>]
 
 Runs an element-wise f32 kernel on the daemon and prints the result plus the
 backend that ACTUALLY ran it. Examples:
   cerberus gpu vector-add 1,2,3 4,5,6          # [5 7 9]
   cerberus gpu saxpy 1,2,3 0.5,0.5,0.5 --param 2   # 2*x + y
   cerberus gpu scalar-mul 1,2,3 --param 3      # x * 3
+  cerberus gpu vector-add 1,2,3 4,5,6 --on <peerHexID>   # run on peer GPU
 
 Backends (the "backend:" line never lies about what ran):
   cpu-software  real CPU compute; the default build, works with no GPU/toolchain
@@ -814,6 +879,7 @@ To get backend: gpu-wgpu on Windows + NVIDIA (one-time), see docs/gpu.md:
 
 func cmdGPU(args []string, jsonOut bool) int {
 	paramStr, args := extractValueFlag(args, "--param")
+	onPeer, args := extractValueFlag(args, "--on")
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		fmt.Fprint(os.Stderr, gpuUsage)
 		return exitUsage
@@ -860,7 +926,7 @@ func cmdGPU(args []string, jsonOut bool) int {
 	}
 	defer client.Close()
 
-	req := &GpuDispatchRequest{Token: token, Kernel: int(kernel), Param: param, A: a, B: b}
+	req := &GpuDispatchRequest{Token: token, Kernel: int(kernel), Param: param, A: a, B: b, On: onPeer}
 	var resp GpuDispatchResponse
 	if err := client.Call("DaemonRPC.GpuDispatch", req, &resp); err != nil {
 		return rpcErr("gpu", err)
@@ -870,6 +936,9 @@ func cmdGPU(args []string, jsonOut bool) int {
 	}
 	fmt.Printf("%s(%s) = %v\n", kernel, formatParam(kernel, param), resp.Output)
 	fmt.Printf("backend: %s\n", resp.Backend)
+	if resp.Remote {
+		fmt.Printf("where: peer %s\n", resp.Where)
+	}
 	// Honest nudge: if a real GPU did not run, point at the exact way to get one.
 	// (Only "cpu-software" means no GPU ran; "gpu-wgpu" or any ffi-fallback string
 	// that already names the reason is left as-is.)
@@ -895,7 +964,7 @@ func formatParam(k gpu.Kernel, param float32) string {
 
 func cmdFS(args []string, jsonOut bool) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "fs: need a subcommand: put | get | ls")
+		fmt.Fprintln(os.Stderr, "fs: need a subcommand: put | get | cat | ls")
 		return exitUsage
 	}
 	sub := args[0]
@@ -960,6 +1029,22 @@ func cmdFS(args []string, jsonOut bool) int {
 		os.Stdout.Write(resp.Data) // no local file given: stream to stdout
 		return exitOK
 
+	case "cat":
+		if len(rest) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: cerberus fs cat /cer/fs/<name>")
+			return exitUsage
+		}
+		remote := rest[0]
+		var resp FSGetResponse
+		if err := client.Call("DaemonRPC.FSGet", &FSGetRequest{Token: token, Path: remote}, &resp); err != nil {
+			return rpcErr("fs cat", err)
+		}
+		if jsonOut {
+			return printJSON(map[string]any{"path": resp.Path, "bytes": len(resp.Data)})
+		}
+		os.Stdout.Write(resp.Data)
+		return exitOK
+
 	case "ls":
 		var resp FSListResponse
 		if err := client.Call("DaemonRPC.FSList", &FSListRequest{Token: token}, &resp); err != nil {
@@ -979,7 +1064,7 @@ func cmdFS(args []string, jsonOut bool) int {
 		return exitOK
 
 	default:
-		fmt.Fprintf(os.Stderr, "fs: unknown subcommand %q (put | get | ls)\n", sub)
+		fmt.Fprintf(os.Stderr, "fs: unknown subcommand %q (put | get | cat | ls)\n", sub)
 		return exitUsage
 	}
 }

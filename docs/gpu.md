@@ -131,45 +131,92 @@ backend is present; on a GPU box they exercise the real wgpu path end to end.
 
 ## Cross-node GPU dispatch (`--on <peer>`) — status
 
-**Available as a tested mesh primitive; composed-daemon wiring is the next step.**
+**Wired in the composed daemon (v0.1).**
 
 The mesh transport for "run this kernel on a *peer's* GPU, capability-gated" is
-implemented and unit-tested in
+implemented in
 [`daemon/mesh/gpu.go`](../daemon/mesh/gpu.go) (`ServeGpuSigned` /
 `RequestGpuSigned`), mirroring the signed WASM compute path
 ([`daemon/mesh/compute.go`](../daemon/mesh/compute.go)):
 
 - The kernel + input buffers travel over a point-to-point libp2p/QUIC stream
   (`/cerberus/gpu/1.0.0`), encrypted and PeerID-authenticated by the handshake.
-- The worker **verifies an Ed25519-signed capability** (`RightExec` on a GPU
-  resource) against the granting node's issuer key — exchanged out of band at
-  discovery — **before any kernel runs**. Same fail-closed gate as signed compute:
-  an unknown issuer, a revoked cap, a missing right, or a tampered envelope is
-  denied before the handler is reached. See `daemon/mesh/gpu_test.go`.
+- The worker **verifies an Ed25519-signed capability** (`RightExec` on
+  `mesh.MeshGpuResource(site)`) with **byte/FLOP quota bounds** before any kernel
+  runs. Same fail-closed gate as signed compute.
 - The worker runs the kernel on **its own** best backend and returns the result
-  buffer **plus the backend name it actually used**, so the requester can report
-  truthfully whether the peer used `gpu-wgpu` or fell back to `cpu-software`.
+  buffer **plus the backend name it actually used**.
 
-**What is not wired yet (the honest next step):** the shipping `cerberusd`
-composition does not register `ServeGpuSigned`, and — unlike the `test/e2e/node`
-demo — it does not yet exchange issuer trust anchors at discovery. Those two are
-the prerequisites for a composed `cerberus gpu <kernel> … --on <peer>` end to end.
-The plan is a direct mirror of the WASM path that already ships in the e2e demo
-(`test/e2e/node/node.go`: `ServeComputeSigned` + `grantExecCap` + `resolveIssuerKey`
-at discovery, driven by `RequestComputeSigned`):
+**Composed daemon wiring (shipped):**
 
-1. In `cmd/cerberusd` composition, call `fabric.ServeGpuSigned(handler, …)` with a
-   handler that calls `daemon/gpu.Dispatch` and returns the result + backend name.
-2. Reuse the discovery issuer-key exchange the e2e node already implements so the
-   composed daemon holds a trusted issuer key per peer (the `resolveIssuer` gate).
-3. Add an `On string` field to `GpuDispatchRequest`/`DaemonRPC.GpuDispatch`
-   (exactly like `RunRequest.On`) and a `--on <peer>` flag to `cmdGPU`, routing
-   through `RequestGpuSigned` when set.
+1. `system.Compose` calls `gpu.WireWorker` → `fabric.ServeGpuSigned` with a
+   handler that calls `daemon/gpu.Dispatch` and enforces grant quotas.
+2. Production daemons use the **self-issued** mesh identity trust model
+   (`mesh.SelfIssuerResolver`) — same as mesh compute, shards, and audio.
+3. `DaemonRPC.GpuDispatch` and `cerberus gpu … --on <peer>` route through
+   `gpu.DispatchRemote` → `RequestGpuSigned` when `--on` is set.
+4. Peer VRAM telemetry is consumed by the scheduler via
+   `system.schedulerLoop` (subscribes to `cerberus/<site>/telemetry/**`) and
+   exposed in the tray status API as `gpu_pool`.
 
-This was deliberately left as documented scope rather than shipped half-working:
-the mesh primitive is complete and safe on its own, and the composition wiring
-depends on cross-node issuer-trust plumbing that today lives only in the e2e
-harness.
+---
+
+## Mount a peer's GPU as a device (`/cer/dev/gpu`) — the 9P + data-plane path
+
+Besides the point-to-point `--on <peer>` RPC above, a node's GPU is exposed as a
+**capability-addressed 9P device** — the "mount a remote GPU as a file" model
+(vertical 04, ARCHITECTURE §4.1). This is the control-plane/data-plane split done
+properly:
+
+```
+holder                          serving node
+  │  9P walk /cer/dev/gpu/local/0        (cap-checked: read)
+  │  9P open .../ctl                     (cap-checked: alloc)
+  │        └──> mints a data-plane GRANT (a QUIC transfer id + quota) ──┐
+  │                                                                     ▼
+  │  dial the granted QUIC data-plane session ───────────►  dataplane.Responder
+  │  send f32 kernel request  ──────────────────────────►  gpu.Serve → Dispatch
+  │  ◄──────────────────────────────  result + backend name (same session)
+```
+
+- **9P is control-only.** Walking the device and opening `ctl` are each
+  capability-checked (`daemon/ninep`). No kernel byte ever crosses the 9P wire
+  (vertical 04 §3.5); opening `ctl` returns a **data-plane endpoint**.
+- **The data plane carries the work.** The grant is a real
+  capability+quota-bound QUIC transfer (`daemon/dataplane`). A `KindGPU` device
+  registers a `dataplane.Responder` (`Server.RegisterResponder`) instead of the
+  one-way byte-drain a VRAM/bulk grant uses: the request blob is decoded by
+  `gpu.Serve`, run through `gpu.Dispatch`, and the result is returned on the same
+  session. `gpu.RequestSession` is the requester side.
+- **Same honest backend string.** The session reports `gpu-wgpu` or
+  `cpu-software` exactly like the CLI/mesh paths — a peer that fell back to
+  software says so.
+
+Wired in `daemon/system.Compose` (the `SetGranter` closure branches on
+`ref.Kind == KindGPU`). Proven end-to-end (no GPU hardware needed, default
+software backend) by `TestComposeGpuDeviceRunsKernelOverDataPlane`
+(`daemon/system`) and `TestGpuOverNinePDataPlaneSession` (`daemon/gpu`).
+
+## Scheduler placement of GPU/VRAM-bound work
+
+`scheduler.PlaceGPU(taskID, minVRAM)` places a GPU/VRAM-bound task on the node
+with the most **free VRAM** meeting `minVRAM`, read from live telemetry
+(`NodeTelemetry.Memory.VRAMFree`), skipping thermally-throttling nodes; the
+next-best node becomes a hot standby, and the plan participates in the same
+`Reroute`/`RerouteNode` machinery as CPU placement. Peer VRAM telemetry reaches
+the scheduler via `system.schedulerLoop` (subscribed to
+`cerberus/<site>/telemetry/**`).
+
+### Honest remaining gaps (not faked, not §8 Frontier)
+
+- **Live VRAM quota accounting.** `PlaceGPU` reads free VRAM to *choose* a node,
+  but the composed daemon does not yet *debit* a node's live VRAM as device
+  sessions run, nor auto-route an opened device to the placement result. Those
+  accounting/auto-routing steps remain.
+- **RDMA / true zero-copy** for the GPU data-plane session is Frontier (vertical
+  04 §10); the session streams over QUIC (the "zero-copy intent"), not RDMA.
+- **zk-WASM proof-of-inference** and **host-TEE memory shielding** stay documented
+  stubs (ARCHITECTURE §8) — nothing here fakes them.
 
 ---
 
@@ -181,6 +228,8 @@ harness.
 | `core/cabi/src/lib.rs` | `cerberus_gpu_submit` / `cerberus_gpu_backend` C-ABI (honest backend string) |
 | `core/cabi/Cargo.toml` | the `gpu` feature (forwards to `cerberus-runtime/gpu`) |
 | `daemon/gpu/` | the daemon's dispatch surface (software default; `-tags ffi` routes to Rust) |
+| `daemon/gpu/session.go` | GPU-over-data-plane session codec (`Serve` / `RequestSession`) for the 9P `/cer/dev/gpu` device path |
+| `daemon/dataplane/server.go` | `RegisterResponder` — the request/response session a GPU ctl grant uses |
 | `daemon/ffi/gpu_ffi.go` | cgo binding to `cerberus_gpu_submit` (`-tags ffi`) |
 | `daemon/ffi/gpu_ffi_ld.go` | extra Win32 link flags for the GPU build (`-tags "ffi ffigpu"`) |
 | `daemon/mesh/gpu.go` | cross-node GPU dispatch primitive (capability-gated) |

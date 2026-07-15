@@ -3,10 +3,14 @@
 //! Mirrors `contract/go`, `proto/`, `components/wit/`, and `schemas/`. Do not
 //! change except via a contract PR reviewed by all lanes (see CONTRACT.md).
 
+mod compute;
+
+pub use compute::*;
+
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any breaking change to the contract. Must match Go `ContractVersion`.
-pub const CONTRACT_VERSION: &str = "0.1.0";
+pub const CONTRACT_VERSION: &str = "0.1.1";
 
 /// Ed25519 public key — the only notion of node identity.
 pub type PeerId = [u8; 32];

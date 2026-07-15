@@ -69,6 +69,23 @@ type Health struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+// ClusterCPUView is pooled CPU thread capacity across the mesh as seen by the
+// scheduler (total / free / busy cores, per-node breakdown).
+type ClusterCPUView struct {
+	TotalCores uint32        `json:"total_cores"`
+	FreeCores  uint32        `json:"free_cores"`
+	BusyCores  uint32        `json:"busy_cores"`
+	Nodes      []NodeCPUView `json:"nodes,omitempty"`
+}
+
+// NodeCPUView is one node's CPU pool slice in ClusterCPUView.
+type NodeCPUView struct {
+	PeerID string `json:"peer_id"`
+	Total  uint32 `json:"total"`
+	Free   uint32 `json:"free"`
+	Busy   uint32 `json:"busy"`
+}
+
 // Snapshot is the full state the dashboard renders.
 //
 // The first block of fields is the original v1 shape (unchanged for backward
@@ -99,6 +116,28 @@ type Snapshot struct {
 	Metrics MetricsSummary `json:"metrics"`
 	// Subsystems is per-subsystem health for the dashboard's status column.
 	Subsystems []Health `json:"subsystems,omitempty"`
+	// GpuPool is pooled GPU/VRAM capacity across this node and mesh peers
+	// (from scheduler telemetry). Additive for v3 tray clients.
+	GpuPool GpuPoolView `json:"gpu_pool,omitempty"`
+	// ClusterCPU is pooled CPU thread capacity across the mesh (scheduler view).
+	ClusterCPU ClusterCPUView `json:"cluster_cpu,omitempty"`
+}
+
+// GpuNodeView is one node's VRAM/GPU telemetry as the dashboard lists it.
+type GpuNodeView struct {
+	PeerID    string  `json:"peer_id"`
+	VRAMTotal uint64  `json:"vram_total"`
+	VRAMFree  uint64  `json:"vram_free"`
+	Flops     float64 `json:"flops,omitempty"`
+	GpuC      float64 `json:"gpu_c,omitempty"`
+	Self      bool    `json:"self,omitempty"`
+}
+
+// GpuPoolView rolls up mesh-wide VRAM capacity for placement and the tray.
+type GpuPoolView struct {
+	TotalVRAM     uint64        `json:"total_vram_total"`
+	TotalVRAMFree uint64        `json:"total_vram_free"`
+	Nodes         []GpuNodeView `json:"nodes,omitempty"`
 }
 
 // Getters is the set of closures the composition injects so the api package can
@@ -119,6 +158,8 @@ type Getters struct {
 	BeliefConflicts func() int
 	Metrics         func() MetricsSummary
 	Subsystems      func() []Health
+	GpuPool         func() GpuPoolView
+	ClusterCPU      func() ClusterCPUView
 	Power           func() PowerView
 }
 
@@ -164,8 +205,14 @@ func (g Getters) Snapshot() Snapshot {
 	if g.Subsystems != nil {
 		s.Subsystems = g.Subsystems()
 	}
+	if g.GpuPool != nil {
+		s.GpuPool = g.GpuPool()
+	}
 	if g.Power != nil {
 		s.Power = g.Power()
+	}
+	if g.ClusterCPU != nil {
+		s.ClusterCPU = g.ClusterCPU()
 	}
 	// Reconcile the legacy balance and the wallet so a client reading either is
 	// consistent. Prefer an explicit wallet balance; otherwise mirror the legacy.

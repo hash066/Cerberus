@@ -9,11 +9,13 @@ import (
 // component_cid field is a Cerberus addition (ignored by vanilla OpenAI clients)
 // that tells a caller which WASM component/agent backs the model.
 type modelObject struct {
-	ID           string `json:"id"`
-	Object       string `json:"object"`
-	Created      int64  `json:"created"`
-	OwnedBy      string `json:"owned_by"`
-	ComponentCID string `json:"component_cid,omitempty"`
+	ID           string              `json:"id"`
+	Object       string              `json:"object"`
+	Created      int64               `json:"created"`
+	OwnedBy      string              `json:"owned_by"`
+	Kind         string              `json:"kind,omitempty"`
+	ComponentCID string              `json:"component_cid,omitempty"`
+	Inference    *InferenceModelMeta `json:"inference,omitempty"`
 }
 
 // modelList is the OpenAI list envelope.
@@ -38,13 +40,21 @@ func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
 	models := g.listModels()
 	data := make([]modelObject, 0, len(models))
 	for _, m := range models {
-		data = append(data, modelObject{
+		obj := modelObject{
 			ID:           m.ID,
 			Object:       "model",
 			Created:      m.Created,
 			OwnedBy:      m.OwnedBy,
 			ComponentCID: m.ComponentCID,
-		})
+		}
+		if m.Kind == ModelKindInference {
+			obj.Kind = string(ModelKindInference)
+			inf := m.Inference
+			obj.Inference = &inf
+		} else if m.Kind != "" {
+			obj.Kind = string(m.Kind)
+		}
+		data = append(data, obj)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

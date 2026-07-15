@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/hash066/cerberus/test/e2e/node"
+	"github.com/hash066/cerberus/test/testdaemon"
 )
 
 const (
@@ -53,8 +54,8 @@ func run() error {
 	}
 	defer os.RemoveAll(workDir)
 
-	binaryPath := filepath.Join(workDir, executableName("cerberusd"))
-	if err := buildDaemon(ctx, repoRoot, binaryPath); err != nil {
+	binaryPath, err := testdaemon.BuildCerberusd(repoRoot)
+	if err != nil {
 		return err
 	}
 	wasmPath := filepath.Join(workDir, "hello-shard.wasm")
@@ -101,19 +102,6 @@ func run() error {
 		return attachLogs("unexpected hello-shard return value", fmt.Errorf("got %d want %d", result.Value, node.HelloShardValue), requester, worker)
 	}
 	fmt.Printf("[harness] remote hello-shard returned %d from %s\n", result.Value, result.PeerID)
-	return nil
-}
-
-func buildDaemon(ctx context.Context, repoRoot, binaryPath string) error {
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "./cmd/cerberusd")
-	cmd.Dir = repoRoot
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("build cerberusd: %w\n%s", err, strings.TrimSpace(output.String()))
-	}
-	fmt.Printf("[harness] built %s\n", binaryPath)
 	return nil
 }
 

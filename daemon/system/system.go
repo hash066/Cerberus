@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"time"
 
 	contract "github.com/hash066/cerberus/contract/go"
@@ -16,6 +17,7 @@ import (
 	"github.com/hash066/cerberus/daemon/audiolink"
 	"github.com/hash066/cerberus/daemon/dataplane"
 	"github.com/hash066/cerberus/daemon/dfs"
+	"github.com/hash066/cerberus/daemon/gpu"
 	"github.com/hash066/cerberus/daemon/mesh"
 	"github.com/hash066/cerberus/daemon/ninep"
 	"github.com/hash066/cerberus/daemon/scheduler"
@@ -73,6 +75,14 @@ type System struct {
 	// the new /api/v1/devices HTTP route lists.
 	AudioDevices []DeviceRef
 
+	// DeviceCatalog holds local + pooled remote devices for RPC/API listing.
+	// Populated at Compose time and refreshed by AudioPool when the mesh has peers.
+	DeviceCatalog *DeviceCatalog
+
+	// Pool aggregates local + peer peripherals (storage scatter, GPU worker,
+	// CPU-aware scheduler feed, audio registry) for the cluster resources API.
+	Pool *PeripheralPool
+
 	// fsStore and localShards are kept for white-box tests (same package) that
 	// need to inspect the /cer/fs Manifest a write produced or a node's own local
 	// shard store directly — e.g. to prove a shard genuinely left this node for a
@@ -80,6 +90,7 @@ type System struct {
 	// pass under an all-local placement bug). Not part of the public API.
 	fsStore     *dfsFSStore
 	localShards *dfs.MemShardStore
+	fsMeta      MetaStore // replicated metadata store backing /cer/fs
 }
 
 // DeviceRef is a namespace device Compose registered, for callers (the
@@ -88,6 +99,8 @@ type System struct {
 type DeviceRef struct {
 	Path string
 	Kind contract.ResourceKind
+	// Name is the platform-friendly device name when known (audio endpoints).
+	Name string
 }
 
 // registerAudioDevices enumerates every real OS audio endpoint (Windows via
@@ -98,21 +111,12 @@ type DeviceRef struct {
 // zero audio devices are registered, exactly like a machine with no
 // microphone plugged in — maturity honesty, not a hard dependency.
 //
-// DOCUMENTED STUB — cross-node audio SESSIONS are not composed here. This
-// registers/discovers audio endpoints (so they list in `cerberus devices` and
-// are capability-grantable), and the streaming transport exists as a tested
-// library (daemon/audiolink over the QUIC data plane). A driveable SESSION now
-// exists: `cerberus audio loopback` / DaemonRPC.AudioLoopback runs the full
-// pipeline (control-plane grant, data-plane bytes, jitter-buffered
-// reconstruction) over the REAL data plane on one node (audiolink.RunLoopback).
-// What is NOT yet composed is a cross-NODE mic-to-speaker session: node B opening
-// THIS node's registered speaker endpoint over the mesh and streaming its mic to
-// it. That needs the device ctl-open to bind to a live speaker sink / mic source
-// on each side plus a second node, and its end-to-end verification needs real
-// audio hardware on two machines. Endpoints are registered + grantable and the
-// transport is proven; the remaining gap is the cross-node device-open
-// composition. Do not present remote mic/speaker sharing as working yet
-// (maturity honesty).
+// Local audio endpoints are registered here; cross-node SESSIONS are composed in
+// Compose via fab.ServeAudio (daemon/mesh/audio.go) and driven by `cerberus
+// audio play/monitor --on <peer>`. Remote peer endpoints are pooled into the
+// namespace by AudioPool (audio_pool.go). Opening a pooled remote device's ctl
+// auto-starts the matching mesh audio session (audio_ctl.go) and returns a
+// mesh-audio endpoint descriptor; local audio ctl opens still mint a dataplane grant.
 func registerAudioDevices(ns *ninep.Server) []DeviceRef {
 	endpoints, err := audio.EnumerateEndpoints()
 	if err != nil {
@@ -130,7 +134,7 @@ func registerAudioDevices(ns *ninep.Server) []DeviceRef {
 		counts[ep.Kind] = idx + 1
 		path := fmt.Sprintf("/cer/dev/audio/%s/%d", kindDir, idx)
 		ns.Register(path, contract.ResourceRef{Kind: contract.KindAudio, Path: path})
-		refs = append(refs, DeviceRef{Path: path, Kind: contract.KindAudio})
+		refs = append(refs, DeviceRef{Path: path, Kind: contract.KindAudio, Name: ep.Name})
 	}
 	return refs
 }
@@ -182,14 +186,13 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 		}
 	}()
 
-	var self contract.PeerID
 	pub, err := telemetry.New(telemetry.Config{
 		Fabric: fab,
 		Cap:    topicCap,
 		Site:   site,
-		PeerID: self,
+		PeerID: fab.PeerID(),
 		Hz:     2,
-		Sample: func() contract.NodeTelemetry { return localTelemetry(self) },
+		Sample: func() contract.NodeTelemetry { return localTelemetry(fab.PeerID()) },
 		Tracer: tracer,
 	})
 	if err != nil {
@@ -226,25 +229,47 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	// drained within its quota exactly as the prior nil sink did.
 	router := newSinkRouter()
 
-	// 9P capability namespace with a sample local VRAM device.
+	// 9P capability namespace with a local VRAM device and a local GPU device.
 	//
-	// GPU compute dispatch is now WIRED: daemon/gpu.Dispatch runs f32 kernels via
-	// core/cabi's cerberus_gpu_submit (real wgpu device under `-tags ffi` +
-	// `--features gpu` when an adapter is present, else a real pure-Go/Rust
-	// software backend), exposed as `cerberus gpu <kernel>` / DaemonRPC.GpuDispatch
-	// — and the result honestly reports which backend actually ran.
+	// GPU compute dispatch is WIRED two ways, both running daemon/gpu.Dispatch
+	// (real wgpu under `-tags ffi --features gpu` when an adapter is present, else a
+	// real pure-Go/Rust software backend — the result always reports which one
+	// actually ran):
+	//   1. The mesh path (`cerberus gpu <kernel> --on <peer>` / DaemonRPC.GpuDispatch)
+	//      — a point-to-point signed-capability RPC (gpu.WireWorker, wired in
+	//      peripheral.go).
+	//   2. The 9P DEVICE path (this block): /cer/dev/gpu/local/0 is a
+	//      capability-gated namespace device. A peer that holds a capability walks
+	//      it and opens its ctl, which mints a real data-plane grant; the peer then
+	//      dials that QUIC data-plane session and dispatches an f32 kernel over it
+	//      (gpu.Serve, wired as the data-plane Responder below). This is the
+	//      "mount a peer's GPU as a device" model (vertical 04 §3): the control
+	//      plane grants, the data plane carries the work — no kernel byte touches 9P.
 	//
-	// This VRAM entry, however, is still only a capability-grantable namespace
-	// resource: it lists in `cerberus devices` and opening its ctl mints a
-	// data-plane grant, but the GPU dispatch path above does NOT yet place work
-	// against this VRAM quota or route through the scheduler for remote placement —
-	// so a peer cannot yet target THIS node's GPU by opening its device. Wiring
-	// dispatch to the scheduler + VRAM-quota accounting is the remaining step;
-	// none of it is a §8 Frontier item.
+	// The VRAM device stays a one-way byte-transfer grant (its ctl mints a bulk
+	// data-plane session, e.g. for staging tensors). HONEST REMAINING GAP: the
+	// scheduler can now PLACE a GPU/VRAM-bound task on a node by free-VRAM
+	// telemetry (scheduler.PlaceGPU), but the composed daemon does not yet
+	// automatically debit a node's live VRAM quota as sessions run, nor does it
+	// auto-route an opened device to the placement result — those accounting steps
+	// remain. None of this is a §8 Frontier item (no fake zk-WASM / RDMA).
 	ns := ninep.New(kernel)
 	q := contract.Quota{Bytes: 2 * 1024 * 1024 * 1024}
 	ns.Register("/cer/dev/vram/local/0",
 		contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/local/0", Quota: &q})
+	gpuQ := contract.Quota{Bytes: 16 * 1024 * 1024} // 16 MiB per-request ceiling for an f32 kernel session
+	ns.Register("/cer/dev/gpu/local/0",
+		contract.ResourceRef{Kind: contract.KindGPU, Path: "/cer/dev/gpu/local/0", Quota: &gpuQ})
+
+	// Local CPU compute device. Opening its ctl mints a capability-bound
+	// data-plane grant (like VRAM); remote peers' CPU devices are pooled into
+	// /cer/dev/cpu/<peer8>/0 by CPUPool below, driven by the same live telemetry
+	// the placement brain uses. This is the namespace face of remote CPU sharing
+	// (vertical 04 + 06). Registered up front so /cer/dev/cpu/local/0 is openable
+	// the instant the namespace serves, independent of the pool's first tick.
+	cpuQ := contract.Quota{Bytes: cpuIOQuotaBytes, Flops: uint64(basePeakFlops)}
+	ns.Register("/cer/dev/cpu/local/0",
+		contract.ResourceRef{Kind: contract.KindCPU, Path: "/cer/dev/cpu/local/0", Quota: &cpuQ})
 
 	// Real audio devices (Windows: every active WASAPI mic/speaker endpoint;
 	// other platforms: none yet — see daemon/audio.EnumerateEndpoints). Each
@@ -264,9 +289,11 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	// Metadata durability: the path→Manifest map is BoltMetaStore (bbolt-backed,
 	// metastore.go) when db is non-nil, so it survives a daemon restart; nil falls
 	// back to the in-memory MemMetaStore.
-	var meta MetaStore
+	var localMeta MetaStore
 	if db != nil {
-		meta = NewBoltMetaStore(db)
+		localMeta = NewBoltMetaStore(db)
+	} else {
+		localMeta = NewMemMetaStore()
 	}
 
 	// Shard placement: this node's own local shard store, wrapped so every Nth
@@ -289,7 +316,9 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	}
 	localShards := dfs.NewMemShardStore()
 	fab.ServeShards(NewLocalShardServer(localShards), mesh.SelfIssuerResolver, func() int64 { return time.Now().Unix() }, nil)
+	fab.ServeMeta(NewLocalMetaServer(localMeta), mesh.SelfIssuerResolver, func() int64 { return time.Now().Unix() }, nil)
 	scatterShards := NewRemoteScatterShardStore(localShards, fab, shardSigner, site)
+	meta := NewReplicatedMetaStore(localMeta, fab, shardSigner, site)
 
 	// Cross-node real-time audio (mic/speaker sharing): serve the responder side of
 	// a capability-gated mesh audio session (daemon/mesh/audio.go). A remote peer
@@ -309,10 +338,42 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 		nil,
 	)
 
+	// Cross-node audio device enumeration: peers can query THIS node's WASAPI
+	// endpoints (cap-gated) so their AudioPool can register them as pooled
+	// peripherals. Uses the same self-issued stream-bound trust model as shards.
+	fab.ServeAudioDevices(
+		osAudioLister{},
+		mesh.SelfIssuerResolver,
+		func() int64 { return time.Now().Unix() },
+		nil,
+	)
+
+	// Device catalog + audio pool: merge local endpoints with remote peers' mics
+	// and speakers into one listing for RPC/tray. The pool runs under supervision.
+	catalog := &DeviceCatalog{}
+	localCatalog := []CatalogEntry{
+		{Path: "/cer/dev/vram/local/0", Kind: string(contract.KindVRAM), QuotaBytes: q.Bytes},
+		{Path: "/cer/dev/gpu/local/0", Kind: string(contract.KindGPU), QuotaBytes: gpuQ.Bytes},
+	}
+	for _, ad := range audioDevices {
+		localCatalog = append(localCatalog, CatalogEntry{
+			Path: ad.Path, Kind: string(ad.Kind), Name: ad.Name,
+		})
+	}
+	catalog.set(localCatalog)
+	audioPool := NewAudioPool(ns, fab, shardSigner, site, localCatalog, catalog)
+
 	fsStore, err := newDFSFSStore(dp, router, scatterShards, meta)
 	if err != nil {
 		return nil, fmt.Errorf("dfs fs store: %w", err)
 	}
+
+	// Pipeline worker: signed mesh compute for split-MLP shards + activation grants
+	// on the data plane (vertical 03 layer-split demo path).
+	if err := registerPipelineServices(dp, fab, kernel, router, site); err != nil {
+		return nil, fmt.Errorf("pipeline: %w", err)
+	}
+
 	// The /cer/fs subtree is served by the namespace's own WalkFS/OpenFSWrite/
 	// OpenFSRead methods (not the device Register path), so we install the backend
 	// rather than registering a device resource. Wiring the backend also makes
@@ -325,8 +386,27 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	// holder dials — the control plane mints the grant, the data plane moves the
 	// bytes. The capability that opened ctl is the same one the data-plane server
 	// will verify when the holder connects, so the grant is end-to-end authorized.
-	ns.SetGranter(func(cap contract.CapHandle, _ contract.ResourceRef, transferID uint64, quota contract.Quota) (ninep.DataEndpoint, error) {
-		ep := dp.RegisterGrant(transferID, cap, quota)
+	//
+	// A KindGPU device grants a REQUEST/RESPONSE session (a dataplane.Responder
+	// running gpu.Serve): the holder streams an f32 kernel over the granted session
+	// and the node runs it on its GPU backend and returns the result. Every other
+	// device (VRAM/bulk) grants the one-way byte transfer as before. Pooled remote
+	// audio devices auto-start a mesh audio session (audio_ctl.go) and return a
+	// mesh-audio endpoint instead. All are authorized by the capability the 9P
+	// open checked.
+	audioBinder := NewAudioCtlBinder(fab, shardSigner, site)
+	ns.SetGranter(func(cap contract.CapHandle, ref contract.ResourceRef, transferID uint64, quota contract.Quota) (ninep.DataEndpoint, error) {
+		if ep, bound, err := audioBinder.TryBind(ref.Path, transferID, quota); bound || err != nil {
+			return ep, err
+		}
+		var ep dataplane.Endpoint
+		if ref.Kind == contract.KindGPU {
+			ep = dp.RegisterResponder(transferID, cap, quota, func(_ uint64, req []byte) ([]byte, error) {
+				return gpu.Serve(req)
+			})
+		} else {
+			ep = dp.RegisterGrant(transferID, cap, quota)
+		}
 		return ninep.DataEndpoint{
 			Kind:         ninep.EndpointKind(ep.Kind),
 			Endpoint:     ep.Addr,
@@ -358,11 +438,27 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 
 	// Seed the scheduler with the local node so it can place work.
 	sched := scheduler.New(nil)
-	sched.UpdateNode(localTelemetry(self))
+	localSample := func() contract.NodeTelemetry { return localTelemetry(fab.PeerID()) }
+	sched.UpdateNode(localSample())
+
+	// CPU device pool: exposes this node's and every telemetry-known peer's CPU
+	// as capability-gated /cer/dev/cpu/<node>/0 devices, refreshed from the live
+	// scheduler node view. refresh() once now so the local CPU device and catalog
+	// entry are present at Compose return; the supervised Run keeps peers current.
+	cpuPool := NewCPUPool(ns, sched, fab.PeerID(), catalog)
+	cpuPool.refresh()
 
 	tree := supervisor.New("cerberusd")
 	tree.Supervise(supervisor.Permanent, runFunc(pub.Run))
-	tree.Supervise(supervisor.Permanent, runFunc(func(c context.Context) error { return schedulerLoop(c, sched) }))
+	tree.Supervise(supervisor.Permanent, runFunc(func(c context.Context) error {
+		return schedulerLoop(c, schedulerLoopConfig{
+			Sched:    sched,
+			Fabric:   fab,
+			Site:     site,
+			TopicCap: topicCap,
+			Sample:   localSample,
+		})
+	}))
 	// Serve the data-plane receiver. The router sink dispatches each authorized
 	// transfer: an FS write streams into dfs.Put, everything else drains within its
 	// quota (the prior nil-sink behaviour for device grants).
@@ -378,9 +474,17 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 		}
 		return nil
 	}))
+	tree.Supervise(supervisor.Permanent, runFunc(func(c context.Context) error {
+		audioPool.Run(c)
+		return c.Err()
+	}))
+	tree.Supervise(supervisor.Permanent, runFunc(func(c context.Context) error {
+		cpuPool.Run(c)
+		return c.Err()
+	}))
 
 	composeOK = true
-	return &System{
+	sys := &System{
 		Kernel:        kernel,
 		Fabric:        fab,
 		Scheduler:     sched,
@@ -390,11 +494,15 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 		NinePAddr:     nineLn.Addr().String(),
 		DataPlaneAddr: dp.Addr(),
 		AudioDevices:  audioDevices,
+		DeviceCatalog: catalog,
 		tree:          tree,
 		traceShutdown: traceShutdown,
 		fsStore:       fsStore,
 		localShards:   localShards,
-	}, nil
+		fsMeta:        meta,
+	}
+	sys.Pool = wirePeripherals(sys, nil)
+	return sys, nil
 }
 
 // Serve runs the supervision tree until ctx is cancelled, then flushes tracing.
@@ -410,24 +518,31 @@ func (s *System) Serve(ctx context.Context) error {
 	return err
 }
 
-// schedulerLoop keeps the scheduler service alive and is where periodic
-// re-placement/telemetry consumption is wired in.
-func schedulerLoop(ctx context.Context, _ *scheduler.Scheduler) error {
-	t := time.NewTicker(2 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
-		}
-	}
-}
+// basePeakFlops is this node's nominal peak compute used as the reference the
+// live host CPU utilization is applied against, so a busy box advertises fewer
+// available FLOPS to the placement brain (see localTelemetry).
+const basePeakFlops = 1e12
 
+// localTelemetry samples this node's live resource picture for the placement
+// brain and the telemetry publisher. CPU cores are real (runtime.NumCPU) and
+// FLOPS are LOAD-ADJUSTED: available = peak × (1 − hostUtilization), sampled
+// from the OS (daemon/system/cpuload*.go). A heavily loaded node therefore
+// advertises less available compute, so the scheduler's cost model (which now
+// rewards available FLOPS) keeps CPU-bound work off a saturated node and prefers
+// an idle remote peer — the telemetry-driven placement of vertical 06.
 func localTelemetry(self contract.PeerID) contract.NodeTelemetry {
+	cores := uint32(runtime.NumCPU())
+	if cores == 0 {
+		cores = 1
+	}
+	load := hostCPULoad.Sample() // [0,1]; 0 on first read / unsupported OS
+	availFlops := basePeakFlops * (1 - load)
+	if availFlops < 0 {
+		availFlops = 0
+	}
 	return contract.NodeTelemetry{
 		PeerID:  self,
-		Compute: contract.Compute{PCores: 8, Flops: 1e12},
+		Compute: contract.Compute{PCores: cores, Flops: availFlops},
 		Memory:  contract.Memory{RAMTotal: 16_000_000_000, RAMFree: 8_000_000_000, VRAMTotal: 8_000_000_000, VRAMFree: 6_000_000_000},
 		Thermal: contract.Thermal{HeadroomC: 30},
 		Power:   contract.Power{Src: contract.PowerAC},

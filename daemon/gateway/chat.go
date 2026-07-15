@@ -143,6 +143,11 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	// Dispatch the component. The subject comes from the verified token, never
 	// from client-supplied input.
+	if g.isInferenceModel(req.Model) {
+		g.handleInferenceChat(w, r, claims.Subject, req)
+		return
+	}
+
 	result, err := g.dispatch(r.Context(), claims.Subject, req.Model)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())

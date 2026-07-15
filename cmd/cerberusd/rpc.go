@@ -29,6 +29,7 @@ import (
 	"github.com/hash066/cerberus/daemon/audio"
 	"github.com/hash066/cerberus/daemon/audiolink"
 	"github.com/hash066/cerberus/daemon/auth"
+	"github.com/hash066/cerberus/daemon/compute"
 	"github.com/hash066/cerberus/daemon/economy"
 	"github.com/hash066/cerberus/daemon/gpu"
 	"github.com/hash066/cerberus/daemon/ledger"
@@ -37,6 +38,7 @@ import (
 	"github.com/hash066/cerberus/daemon/metrics"
 	"github.com/hash066/cerberus/daemon/scheduler"
 	"github.com/hash066/cerberus/daemon/state"
+	"github.com/hash066/cerberus/daemon/system"
 	"github.com/hash066/cerberus/daemon/wasm"
 )
 
@@ -47,6 +49,9 @@ type deviceInfo struct {
 	Path       string
 	Kind       string
 	QuotaBytes uint64
+	Name       string
+	Peer       string
+	Pooled     bool
 }
 
 // mintedToken is a record of a token this daemon issued via `caps mint` /
@@ -99,7 +104,8 @@ type DaemonRPC struct {
 	lifecycle *lifecycle.Monitor
 	fabric    *mesh.Fabric // may be nil if the mesh failed to compose
 	sched     *scheduler.Scheduler
-	exec      *wasm.Executor
+	exec      contract.Executor
+	cstore    *wasm.ContentStore // content-addressed components for mesh dispatch
 	ledger    *ledger.Ledger
 	settler   *economy.Settler // optimistic compute-settlement layer wrapping ledger
 	crdt      *state.Engine
@@ -108,6 +114,8 @@ type DaemonRPC struct {
 	daemonDoc []byte    // the CRDT doc id the daemon checkpoints belief state under
 
 	devices []deviceInfo
+	// catalog, when set, is the live local+pooled device list from system.DeviceCatalog.
+	catalog *system.DeviceCatalog
 	caps    *capRegistry
 	wlog    *workloadLog // recent workload dispatch history for `cerberus workloads` / /api/v1/workloads; nil-safe
 
@@ -116,6 +124,9 @@ type DaemonRPC struct {
 	// so it must match the site the serving peer's ServeAudio gate uses (both come
 	// from the same system.Compose site value). Empty falls back to "local".
 	site string
+
+	pipeline  *system.PipelineRunner // layer-split pipeline orchestrator; nil if compose failed
+	inference *system.InferenceService
 
 	profile string
 	kernel  string
@@ -189,13 +200,10 @@ type RunResponse struct {
 
 // Run dispatches a WASM workload and returns the real result. Requires exec.
 //
-// Local path (default): the daemon's wazero-backed executor runs the component
-// now and resolves the promise — real execution, not a canned value.
-// Remote path (--on <peer>): if the composed mesh can reach that peer, the task
-// is dispatched over the capability-gated QUIC compute stream. The composed
-// daemon does not itself register a worker-side compute handler, so a remote
-// dispatch to a peer that is not serving compute returns a clear error rather
-// than a fake success (maturity honesty).
+// When mesh peers are connected the default path prefers remote dispatch over
+// the capability-gated QUIC compute stream (same signed-cap + CID model as the
+// e2e harness), falling back to local wazero execution when no worker peer is
+// available or remote dispatch fails. --on forces a specific peer.
 func (d *DaemonRPC) Run(req *RunRequest, resp *RunResponse) error {
 	claims, err := d.authz.Authorize(req.Token, "exec", "")
 	if err != nil {
@@ -220,7 +228,7 @@ func (d *DaemonRPC) Run(req *RunRequest, resp *RunResponse) error {
 
 	task := contract.ComputeTask{TaskID: taskID, Component: req.Component}
 
-	// Remote dispatch requested.
+	// Remote dispatch to an explicit peer.
 	if strings.TrimSpace(req.On) != "" {
 		peer, perr := parsePeerID(req.On)
 		if perr != nil {
@@ -233,37 +241,143 @@ func (d *DaemonRPC) Run(req *RunRequest, resp *RunResponse) error {
 		resp.Where = req.On
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		// In the shared-kernel demo model the cap handle travels in-band; the
-		// worker's kernel is the authority. We present 0 (worker authorizes).
-		result, rerr := d.fabric.RequestCompute(ctx, peer, task, contract.CapHandle(0))
+		site := d.site
+		if site == "" {
+			site = "local"
+		}
+		result, rerr := compute.DispatchRemote(ctx, d.fabric, site, peer, task, d.cstore)
 		if rerr != nil {
 			return fmt.Errorf("run --on %s: %w", short(req.On), rerr)
 		}
 		fillRunResult(resp, result)
 		d.countExec()
-		d.recordWorkload(resp, req.On)
+		d.recordWorkload(resp, short(req.On))
 		return nil
 	}
 
-	// Local dispatch: real wazero execution via the composed executor.
+	// Default: prefer-remote executor when wired, else local wazero.
 	if d.exec == nil {
 		return fmt.Errorf("run: no executor composed")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	h, derr := d.exec.Dispatch(ctx, task)
+	promise, derr := d.exec.Dispatch(ctx, task)
 	if derr != nil {
 		return fmt.Errorf("run: dispatch: %w", derr)
 	}
-	result, rerr := d.exec.Resolve(ctx, h)
+	result, rerr := d.exec.Resolve(ctx, promise)
 	if rerr != nil {
 		return fmt.Errorf("run: resolve: %w", rerr)
 	}
-	resp.Where = "local"
+	where := "local"
+	if wp, ok := d.exec.(interface {
+		LastWhere(contract.PromiseHandle) string
+	}); ok {
+		if w := wp.LastWhere(promise); w != "" {
+			where = w
+		}
+	}
+	resp.Where = where
+	resp.Remote = where != "local"
 	fillRunResult(resp, result)
 	d.countExec()
-	d.recordWorkload(resp, "local")
+	d.recordWorkload(resp, where)
 	return nil
+}
+
+// ---- pipeline (layer-split MLP demo) ----------------------------------------
+
+type PipelineRunRequest struct {
+	Token   string
+	Model   string // inference model id; default split-mlp-demo
+	Backend string // optional backend override (llamacpp, mlx, cpu-software)
+	// Input is optional little-endian f32 activation bytes (16 bytes for the
+	// split-MLP fixture). Empty uses the default demo input [1,0,0,0].
+	Input []byte
+}
+
+type PipelineStageResponse struct {
+	LayerLo  uint32
+	LayerHi  uint32
+	Node     string
+	OK       bool
+	Error    string
+	Remote   bool
+	Duration string
+}
+
+type PipelineRunResponse struct {
+	OK      bool
+	Output  []byte
+	Content string
+	Model   string
+	Error   string
+	Backend string
+	Stages  []PipelineStageResponse
+}
+
+// PipelineRun executes a pipeline-backed inference model across placed shards
+// (scheduler.PlacePipeline → mesh compute → dataplane activations). Requires exec.
+func (d *DaemonRPC) PipelineRun(req *PipelineRunRequest, resp *PipelineRunResponse) error {
+	claims, err := d.authz.Authorize(req.Token, "exec", "")
+	if err != nil {
+		return fmt.Errorf("unauthorized: %w", err)
+	}
+	if d.inference == nil {
+		return fmt.Errorf("pipeline-run: pipeline runner not composed (system mesh down?)")
+	}
+	modelID := strings.TrimSpace(req.Model)
+	if modelID == "" {
+		modelID = system.SplitMLPDemoModel.ID
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	result, err := d.inference.RunWithBackend(ctx, claims.Subject, modelID, req.Backend, req.Input)
+	resp.Model = modelID
+	resp.OK = result.OK
+	resp.Output = result.Output
+	resp.Content = result.Content
+	resp.Error = result.Error
+	resp.Backend = result.Backend
+	for _, st := range result.Stages {
+		resp.Stages = append(resp.Stages, PipelineStageResponse{
+			LayerLo:  st.Shard.LayerLo,
+			LayerHi:  st.Shard.LayerHi,
+			Node:     system.FormatPeerID(st.Node),
+			OK:       st.OK,
+			Error:    st.Error,
+			Remote:   st.Remote,
+			Duration: st.Duration.String(),
+		})
+	}
+	node := result.Node
+	if node == "" {
+		node = "local"
+	}
+	d.recordPipelineWorkload(claims.Subject, modelID, node, result.OK, result.Error)
+	if err != nil {
+		return err
+	}
+	if d.metrics != nil && result.OK {
+		d.metrics.WasmExecsTotal.Inc()
+	}
+	return nil
+}
+
+func (d *DaemonRPC) recordPipelineWorkload(subject, model, node string, ok bool, errMsg string) {
+	if d.wlog == nil {
+		return
+	}
+	state := "done"
+	if !ok {
+		state = "error"
+	}
+	d.wlog.record(api.WorkloadEntry{
+		ID:    subject + ":inference:" + model,
+		Model: model,
+		Node:  node,
+		State: state,
+	})
 }
 
 // recordWorkload appends a completed dispatch (from the CLI's `cerberus run`
@@ -344,20 +458,34 @@ type DeviceEntry struct {
 	Path       string
 	Kind       string
 	QuotaBytes uint64
+	Name       string
+	Peer       string
+	Pooled     bool
 }
 type DevicesResponse struct {
 	Devices []DeviceEntry
 }
 
-// Devices lists the 9P namespace devices the daemon exposes. Requires read.
+// Devices lists the 9P namespace devices the daemon exposes (local + pooled
+// remote audio endpoints). Requires read.
 func (d *DaemonRPC) Devices(req *DevicesRequest, resp *DevicesResponse) error {
 	if _, err := d.authz.Authorize(req.Token, "read", ""); err != nil {
 		return fmt.Errorf("unauthorized: %w", err)
 	}
-	for _, dev := range d.devices {
-		resp.Devices = append(resp.Devices, DeviceEntry{
-			Path: dev.Path, Kind: dev.Kind, QuotaBytes: dev.QuotaBytes,
-		})
+	if d.catalog != nil {
+		for _, e := range d.catalog.Snapshot() {
+			resp.Devices = append(resp.Devices, DeviceEntry{
+				Path: e.Path, Kind: e.Kind, QuotaBytes: e.QuotaBytes,
+				Name: e.Name, Peer: e.Peer, Pooled: e.Pooled,
+			})
+		}
+	} else {
+		for _, dev := range d.devices {
+			resp.Devices = append(resp.Devices, DeviceEntry{
+				Path: dev.Path, Kind: dev.Kind, QuotaBytes: dev.QuotaBytes,
+				Name: dev.Name, Peer: dev.Peer, Pooled: dev.Pooled,
+			})
+		}
 	}
 	sort.Slice(resp.Devices, func(i, j int) bool { return resp.Devices[i].Path < resp.Devices[j].Path })
 	return nil
@@ -687,19 +815,46 @@ type GpuDispatchRequest struct {
 	Param  float32
 	A      []float32
 	B      []float32 // ignored for ScalarMul
+	// On, if set, is the hex Ed25519 PeerID of a mesh worker whose GPU runs the kernel.
+	On string
 }
 type GpuDispatchResponse struct {
 	Output  []float32
 	Backend string // which backend actually ran: "cpu-software" or "gpu-wgpu"/…
+	Where   string // "local" or short peer id when remote
+	Remote  bool
 }
 
-// GpuDispatch runs an element-wise f32 kernel via daemon/gpu, which uses the real
-// GPU (wgpu) when the daemon is built `-tags ffi` with cabi `--features gpu` and
-// an adapter is present, else a real pure-Go CPU backend. The response reports
+// GpuDispatch runs an element-wise f32 kernel via daemon/gpu locally, or on a
+// remote peer when On is set (signed mesh GPU dispatch). The response reports
 // which backend actually ran. Requires exec (it runs compute).
 func (d *DaemonRPC) GpuDispatch(req *GpuDispatchRequest, resp *GpuDispatchResponse) error {
 	if _, err := d.authz.Authorize(req.Token, "exec", ""); err != nil {
 		return fmt.Errorf("unauthorized (gpu requires exec): %w", err)
+	}
+	if strings.TrimSpace(req.On) != "" {
+		peer, perr := parsePeerID(req.On)
+		if perr != nil {
+			return fmt.Errorf("gpu --on: %w", perr)
+		}
+		if d.fabric == nil {
+			return fmt.Errorf("gpu --on: mesh not composed on this daemon")
+		}
+		site := d.site
+		if site == "" {
+			site = "local"
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		out, backend, where, err := gpu.DispatchRemote(ctx, d.fabric, site, peer, gpu.Kernel(req.Kernel), req.Param, req.A, req.B)
+		if err != nil {
+			return err
+		}
+		resp.Output = out
+		resp.Backend = backend
+		resp.Where = where
+		resp.Remote = true
+		return nil
 	}
 	out, backend, err := gpu.Dispatch(gpu.Kernel(req.Kernel), req.Param, req.A, req.B)
 	if err != nil {
@@ -707,6 +862,7 @@ func (d *DaemonRPC) GpuDispatch(req *GpuDispatchRequest, resp *GpuDispatchRespon
 	}
 	resp.Output = out
 	resp.Backend = backend
+	resp.Where = "local"
 	return nil
 }
 

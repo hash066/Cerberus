@@ -3,6 +3,44 @@ package cerberus.v1;
 
 option go_package = "github.com/hash066/cerberus/contract/go/gen/cerberusv1;cerberusv1";
 
+// Tensor element type for activation payloads.
+enum TensorDType {
+  TENSOR_DTYPE_UNSPECIFIED = 0;
+  TENSOR_DTYPE_F32 = 1;
+  TENSOR_DTYPE_F16 = 2;
+  TENSOR_DTYPE_BF16 = 3;
+  TENSOR_DTYPE_I8 = 4;
+}
+
+// Compression applied (or requested) for an activation payload on the data plane.
+// COMPRESSION_FRONTIER_ZK is a documented stub — zk-compressed proof bundles are
+// research-frontier and not implemented in v0.1.
+enum CompressionHint {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_NONE = 1;
+  COMPRESSION_ZSTD = 2;
+  COMPRESSION_LZ4 = 3;
+  COMPRESSION_FRONTIER_ZK = 4;
+}
+
+// ActivationFrame is the canonical wire descriptor for inter-shard activations.
+// Bulk tensor bytes ride the QUIC data plane; this message tags shape/dtype so
+// receivers can validate before decode. See docs/verticals/03-compute-orchestration.md.
+message ActivationFrame {
+  bytes payload = 1;              // raw tensor bytes (row-major)
+  repeated uint32 shape = 2;        // e.g. [batch, seq, hidden]
+  TensorDType dtype = 3;
+  CompressionHint compression = 4;
+  uint32 stage_index = 5;         // pipeline stage this activation feeds
+}
+
+// PipelineStageMeta records placement metadata for one shard in a pipeline plan.
+message PipelineStageMeta {
+  uint32 stage_index = 1;
+  Shard shard = 2;
+  bytes node = 3;                   // peer-id (Ed25519 pubkey)
+}
+
 // Compute task allocation + promise pipelining. See ARCHITECTURE.md §3.4, docs/verticals/03.
 message ComputeTask {
   bytes task_id = 1;
@@ -11,6 +49,18 @@ message ComputeTask {
   repeated bytes caps = 4;      // capabilities granted to this task
   repeated Promise deps = 5;    // promise-pipelined inputs (CapTP-style)
   bytes result_cap = 6;         // where to deliver / settle
+  ActivationFrame activation = 7; // structured inbound activation (optional; caps[1] still valid in v0.1)
+  uint32 pipeline_stage = 8;    // index in the pipeline plan (optional)
+}
+
+// InferenceTask is an explicit pipeline/inference view over ComputeTask. Fields
+// mirror ComputeTask.activation / pipeline_stage for callers that dispatch
+// inference shards without re-parsing caps slots.
+message InferenceTask {
+  ComputeTask task = 1;
+  ActivationFrame activation = 2;
+  uint32 pipeline_stage = 3;
+  repeated PipelineStageMeta stages = 4; // optional full-plan metadata
 }
 
 message Shard {

@@ -54,6 +54,16 @@ const capSlot = 0
 // computeProto is the libp2p protocol id for capability-gated compute dispatch.
 const computeProto = "/cerberus/compute/1.0.0"
 
+// MeshComputeResource returns the per-site resource a mesh compute dispatch
+// capability must name: contract.KindGPU at "cerberus/<site>/mesh-compute".
+// Production daemons mint a signed RightExec capability against this resource
+// (self-issued under the mesh identity key, stream-bound — see shard.go's
+// issuer trust model) before calling RequestComputeSigned; e2e nodes mint
+// against a per-node wasm-exec path instead, but the wire shape is the same.
+func MeshComputeResource(site string) contract.ResourceRef {
+	return contract.ResourceRef{Kind: contract.KindGPU, Path: "cerberus/" + site + "/mesh-compute"}
+}
+
 // ComputeHandler runs a dispatched task on the worker side. It is given the task
 // and the in-band capability handle the requester presented; the implementation
 // is responsible for authorizing that capability (it owns the CapKernel that
@@ -97,19 +107,98 @@ type computeRequest struct {
 // computeTaskWire is the JSON projection of contract.ComputeTask. We project
 // explicitly rather than tagging the frozen contract struct so the contract is
 // not edited from this lane.
+type shardWire struct {
+	Kind    uint8  `json:"kind"`
+	LayerLo uint32 `json:"layer_lo,omitempty"`
+	LayerHi uint32 `json:"layer_hi,omitempty"`
+	TPRank  uint32 `json:"tp_rank,omitempty"`
+	TPWorld uint32 `json:"tp_world,omitempty"`
+}
+
+type activationWire struct {
+	Payload     []byte   `json:"payload,omitempty"`
+	Shape       []uint32 `json:"shape,omitempty"`
+	DType       uint8    `json:"dtype,omitempty"`
+	Compression uint8    `json:"compression,omitempty"`
+	StageIndex  uint32   `json:"stage_index,omitempty"`
+}
+
 type computeTaskWire struct {
-	TaskID    []byte   `json:"task_id"`
-	Component []byte   `json:"component"` // IPLD CID bytes of the WASM component
-	Caps      [][]byte `json:"caps,omitempty"`
-	ResultCap []byte   `json:"result_cap,omitempty"`
+	TaskID        []byte         `json:"task_id"`
+	Component     []byte         `json:"component"` // IPLD CID bytes of the WASM component
+	Shard         shardWire      `json:"shard,omitempty"`
+	Caps          [][]byte       `json:"caps,omitempty"`
+	Deps          []byte         `json:"deps,omitempty"` // v0.1: activation transfer id (8 bytes LE) when set
+	Input         []byte         `json:"input,omitempty"`
+	ResultCap     []byte         `json:"result_cap,omitempty"`
+	Activation    activationWire `json:"activation,omitempty"`
+	PipelineStage uint32         `json:"pipeline_stage,omitempty"`
+}
+
+func activationToWire(f contract.ActivationFrame) activationWire {
+	return activationWire{
+		Payload: append([]byte(nil), f.Payload...),
+		Shape:   append([]uint32(nil), f.Shape...),
+		DType:   uint8(f.DType), Compression: uint8(f.Compression), StageIndex: f.StageIndex,
+	}
+}
+
+func (w activationWire) toActivation() contract.ActivationFrame {
+	return contract.ActivationFrame{
+		Payload:     append([]byte(nil), w.Payload...),
+		Shape:       append([]uint32(nil), w.Shape...),
+		DType:       contract.TensorDType(w.DType),
+		Compression: contract.CompressionHint(w.Compression),
+		StageIndex:  w.StageIndex,
+	}
 }
 
 func taskToWire(t contract.ComputeTask) computeTaskWire {
-	return computeTaskWire{TaskID: t.TaskID, Component: t.Component, Caps: t.Caps, ResultCap: t.ResultCap}
+	w := computeTaskWire{
+		TaskID: t.TaskID, Component: t.Component, ResultCap: t.ResultCap,
+		PipelineStage: t.PipelineStage,
+		Shard: shardWire{
+			Kind: uint8(t.Shard.Kind), LayerLo: t.Shard.LayerLo, LayerHi: t.Shard.LayerHi,
+			TPRank: t.Shard.TPRank, TPWorld: t.Shard.TPWorld,
+		},
+	}
+	if len(t.Caps) > 0 {
+		w.Caps = append(w.Caps, t.Caps[0])
+	}
+	if len(t.Caps) > 1 {
+		w.Input = append([]byte(nil), t.Caps[1]...)
+	}
+	if len(t.Deps) > 0 {
+		w.Deps = append([]byte(nil), t.Deps[0].PromiseID...)
+	}
+	if len(t.Activation.Payload) > 0 || len(t.Activation.Shape) > 0 {
+		w.Activation = activationToWire(t.Activation)
+	}
+	return w
 }
 
 func (w computeTaskWire) toTask() contract.ComputeTask {
-	return contract.ComputeTask{TaskID: w.TaskID, Component: w.Component, Caps: w.Caps, ResultCap: w.ResultCap}
+	t := contract.ComputeTask{
+		TaskID: w.TaskID, Component: w.Component, ResultCap: w.ResultCap,
+		PipelineStage: w.PipelineStage,
+		Shard: contract.Shard{
+			Kind: contract.ShardKind(w.Shard.Kind), LayerLo: w.Shard.LayerLo, LayerHi: w.Shard.LayerHi,
+			TPRank: w.Shard.TPRank, TPWorld: w.Shard.TPWorld,
+		},
+	}
+	if len(w.Caps) > 0 {
+		t.Caps = append(t.Caps, w.Caps[0])
+	}
+	if len(w.Input) > 0 {
+		t.Caps = append(t.Caps, w.Input)
+	}
+	if len(w.Deps) > 0 {
+		t.Deps = []contract.Promise{{PromiseID: append([]byte(nil), w.Deps...)}}
+	}
+	if len(w.Activation.Payload) > 0 || len(w.Activation.Shape) > 0 {
+		t.Activation = w.Activation.toActivation()
+	}
+	return t
 }
 
 // computeResponse is the on-wire result frame.
@@ -212,6 +301,17 @@ func (f *Fabric) handleSignedComputeStream(
 		// Fail closed: no bytes/work — report the denial to the requester.
 		_ = writeComputeError(ss, task.TaskID, verr.Error())
 		return
+	}
+
+	// Self-issued mesh compute caps (production daemon path): the grant's issuer
+	// is the authenticated remote peer on this stream — mirror shard.go's binding.
+	// E2E worker-granted caps name the worker as issuer while the remote peer is
+	// the requester, so this check is skipped when grant.Issuer != remotePeer.
+	if remotePeer, verified := ss.RemotePeerID(); verified && grant.Issuer == remotePeer {
+		if req.Issuer != remotePeer {
+			_ = writeComputeError(ss, task.TaskID, "mesh: compute request issuer does not match the authenticated mesh peer for this stream")
+			return
+		}
 	}
 
 	res, herr := h(f.ctx, task, grant)

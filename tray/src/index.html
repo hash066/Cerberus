@@ -83,6 +83,10 @@
                 <div class="value" id="ov-tasks">—</div>
               </div>
               <div class="cell">
+                <div class="label">◈ VRAM pooled</div>
+                <div class="value" id="ov-vram">—</div>
+              </div>
+              <div class="cell">
                 <div class="label">◈ Compute credits</div>
                 <div class="value" id="ov-balance">—</div>
               </div>
@@ -104,6 +108,14 @@
                 <div class="kv"><span>Readiness</span><b id="h-ready">—</b></div>
                 <div class="kv"><span>Reason</span><b id="h-reason" class="mono">—</b></div>
                 <div class="muted" style="margin-top:8px">/healthz + /readyz on :7779 (open probes)</div>
+              </div>
+
+              <div class="card">
+                <h2>GPU / VRAM pool</h2>
+                <div class="kv"><span>Total VRAM</span><b id="gp-vram-total">—</b></div>
+                <div class="kv"><span>Free VRAM</span><b id="gp-vram-free">—</b></div>
+                <div class="kv"><span>Nodes</span><b id="gp-node-count">—</b></div>
+                <div id="gp-node-container" class="muted" style="margin-top:8px;font-size:12px"></div>
               </div>
 
               <div class="card">
@@ -158,7 +170,8 @@
               </div>
               <div id="audio-container"></div>
             </div>
-            <div class="muted">Microphones and speakers this node's real WASAPI capture/playback backend can see, presented the same way as any other 9P device — grant one to expose it to the mesh. On a host with no audio hardware (or on non-Windows, where this is still a documented stub) this list is honestly empty rather than faked.</div>
+            <div id="audio-pool-hint" class="muted" style="margin-bottom:8px"></div>
+            <div class="muted">Local devices come from this node's WASAPI backend (Windows only; honest empty list elsewhere). Pooled devices are discovered from connected mesh peers and appear at <code>/cer/dev/audio/&lt;peer&gt;/…</code>. Grant a device to delegate access; stream live audio with <code>cerberus audio play/monitor --on &lt;peer&gt;</code>.</div>
           </section>
 
           <!-- ========== Workloads ========== -->

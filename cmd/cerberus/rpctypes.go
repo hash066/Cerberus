@@ -40,6 +40,32 @@ type RunResponse struct {
 	Remote bool
 }
 
+// pipeline-run (layer-split inference demo)
+type PipelineRunRequest struct {
+	Token   string
+	Model   string
+	Backend string
+	Input   []byte
+}
+type PipelineStageResponse struct {
+	LayerLo  uint32
+	LayerHi  uint32
+	Node     string
+	OK       bool
+	Error    string
+	Remote   bool
+	Duration string
+}
+type PipelineRunResponse struct {
+	OK      bool
+	Output  []byte
+	Content string
+	Model   string
+	Error   string
+	Backend string
+	Stages  []PipelineStageResponse
+}
+
 // nodes
 type NodesRequest struct{ Token string }
 type NodeEntry struct {
@@ -59,6 +85,9 @@ type DeviceEntry struct {
 	Path       string
 	Kind       string
 	QuotaBytes uint64
+	Name       string
+	Peer       string
+	Pooled     bool
 }
 type DevicesResponse struct {
 	Devices []DeviceEntry
@@ -210,10 +239,13 @@ type GpuDispatchRequest struct {
 	Param  float32
 	A      []float32
 	B      []float32
+	On     string
 }
 type GpuDispatchResponse struct {
 	Output  []float32
 	Backend string
+	Where   string
+	Remote  bool
 }
 
 // /cer/fs (distributed filesystem)

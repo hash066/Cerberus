@@ -27,8 +27,13 @@
 // mesh peer and fetch them back over a real mesh RPC (daemon/mesh, modeled
 // directly on compute.go's request/response pattern), instead of always keeping
 // every shard on this node. See shardstore.go for the v1 round-robin placement
-// policy; Manifest.Placement records, per shard, either "local" or "mesh:<peer>"
-// so a later read knows where to fetch from.
+// policy; Manifest.Placement records, per shard, "mesh:<base64 PeerID>" so a
+// reader on any node dials the owning peer directly (PlacedShardStore).
+//
+// METADATA REPLICATION (this step): path→Manifest records replicate to mesh
+// peers over daemon/mesh/meta.go (capability-gated put/get/list) via
+// ReplicatedMetaStore (remotemeta.go), so a file written on node B is visible
+// to node A's FSList/FSGet without a separate metadata cluster.
 //
 // DOCUMENTED STUB (still true): the shard placement policy is a simple
 // round-robin over currently-known mesh peers — no load balancing, no

@@ -2,6 +2,7 @@ package mesh
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -101,5 +102,30 @@ func TestRequestComputeDeniedWithoutCap(t *testing.T) {
 	}
 	if res.OK {
 		t.Fatal("worker executed a task with no valid capability")
+	}
+}
+
+func TestComputeTaskWireRoundTripPreservesShard(t *testing.T) {
+	task := contract.ComputeTask{
+		TaskID:    []byte("pipe"),
+		Component: []byte("splitmlp/go-fixture"),
+		Shard:     contract.Shard{Kind: contract.ShardPipeline, LayerLo: 2, LayerHi: 3},
+		Caps:      [][]byte{[]byte("signed-cap"), []byte("activation")},
+	}
+	w := taskToWire(task)
+	raw, err := json.Marshal(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded computeTaskWire
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	back := decoded.toTask()
+	if back.Shard.LayerLo != 2 || back.Shard.LayerHi != 3 {
+		t.Fatalf("shard not preserved: got [%d,%d]", back.Shard.LayerLo, back.Shard.LayerHi)
+	}
+	if len(back.Caps) != 2 || string(back.Caps[1]) != "activation" {
+		t.Fatalf("caps/input not preserved: %+v", back.Caps)
 	}
 }

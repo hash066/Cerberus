@@ -17,9 +17,8 @@ import (
 //	[H bytes]    JSON header (transfer id, capability handle, declared length)
 //	[Length bytes] raw payload, streamed in chunks
 //
-// JSON for the header keeps it inspectable and dependency-free, matching the
-// convention in daemon/mesh (codec.go / compute.go); the payload itself is raw
-// bytes — it is the bulk path, so it is never wrapped or re-encoded.
+// The payload is raw tensor bytes (typically ActivationFrame.Payload); shape/dtype
+// metadata travels on the control-plane ComputeTask.activation field.
 
 // maxHeaderLen caps the JSON header so a malicious/garbled length prefix cannot
 // force a huge allocation before we have authorized anything.

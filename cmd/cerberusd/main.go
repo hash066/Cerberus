@@ -20,10 +20,12 @@ import (
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/daemon/api"
 	"github.com/hash066/cerberus/daemon/auth"
+	"github.com/hash066/cerberus/daemon/compute"
 	"github.com/hash066/cerberus/daemon/discovery"
 	"github.com/hash066/cerberus/daemon/economy"
 	"github.com/hash066/cerberus/daemon/ffi"
 	"github.com/hash066/cerberus/daemon/gateway"
+	"github.com/hash066/cerberus/daemon/inference"
 	"github.com/hash066/cerberus/daemon/ledger"
 	"github.com/hash066/cerberus/daemon/lifecycle"
 	"github.com/hash066/cerberus/daemon/mesh"
@@ -83,6 +85,7 @@ func main() {
 	e2eID := flag.String("e2e-id", "node", "E2E demo node ID")
 	e2eListen := flag.String("e2e-listen", "127.0.0.1:0", "E2E demo listen address")
 	e2ePeers := flag.String("e2e-peer", "", "comma-separated E2E peer base URLs")
+	e2ePipeline := flag.Bool("e2e-pipeline", false, "enable split-MLP pipeline surfaces on an E2E demo node")
 	// Bind-address overrides. Defaults preserve the historical fixed ports, so
 	// existing deployments are unaffected; overrides let a second instance run on
 	// the same box (e.g. for a local demo or a per-user daemon).
@@ -94,6 +97,8 @@ func main() {
 		"mesh QUIC listen multiaddr; 0.0.0.0 makes this node reachable from other machines (LAN or a Tailscale/WireGuard overlay). Use a fixed udp port to pin a firewall rule.")
 	peers := flag.String("peer", "",
 		"comma-separated peer multiaddrs to bootstrap-connect at startup (e.g. /ip4/100.x.y.z/udp/PORT/quic-v1/p2p/12D3Koo...). Use across networks where mDNS can't reach, e.g. over a Tailscale tunnel.")
+	pipelineBackend := flag.String("pipeline-backend", envOr("CERBERUS_PIPELINE_BACKEND", ""),
+		"pipeline inference backend: cpu-software (default) | llamacpp | mlx (macOS/Apple Silicon sidecar; falls back to mlx-mock and says so)")
 	flag.Parse()
 
 	// The composed mesh reads its listen address from this env (see
@@ -108,6 +113,7 @@ func main() {
 			ID:         *e2eID,
 			ListenAddr: *e2eListen,
 			PeerAddrs:  splitCSV(*e2ePeers),
+			Pipeline:   *e2ePipeline,
 			Ready:      os.Stdout,
 			Log:        os.Stderr,
 		}); err != nil {
@@ -187,11 +193,15 @@ func main() {
 	// Compose the real control plane: OCap kernel + libp2p/QUIC mesh + telemetry
 	// + scheduler + 9P namespace, under one supervision tree.
 	var fabric contract.Fabric
-	var meshFabric *mesh.Fabric    // concrete type for RequestCompute / PeerID
-	var sched *scheduler.Scheduler // the live placement brain
-	var devices []deviceInfo       // the 9P devices Compose registered (for `cerberus devices`)
-	var fsSurface fsBackend        // /cer/fs put/get/ls surface (nil if compose failed)
-	var meshSite string            // the intra-site domain the fabric was composed with (for audio-session caps)
+	var meshFabric *mesh.Fabric               // concrete type for RequestCompute / PeerID
+	var sched *scheduler.Scheduler            // the live placement brain
+	var devices []deviceInfo                  // fallback static list when catalog is nil
+	var deviceCatalog *system.DeviceCatalog   // live local+pooled devices from AudioPool
+	var peripheralPool *system.PeripheralPool // unified cluster resource inventory
+	var fsSurface fsBackend                   // /cer/fs put/get/ls surface (nil if compose failed)
+	var meshSite string                       // the intra-site domain the fabric was composed with (for audio-session caps)
+	var pipeRunner *system.PipelineRunner
+	var inferenceSvc *system.InferenceService
 	if sys, serr := system.Compose(ctx, k, "local", db); serr != nil {
 		log.Printf("cerberusd: compose system failed: %v", serr)
 	} else {
@@ -201,6 +211,21 @@ func main() {
 		meshSite = sys.Site
 		if mf, ok := sys.Fabric.(*mesh.Fabric); ok {
 			meshFabric = mf
+			if pr, perr := system.NewPipelineRunner(sys, mf, nil); perr == nil {
+				pipeRunner = pr
+				if be, berr := inference.ParseBackend(*pipelineBackend); berr != nil {
+					log.Printf("cerberusd: -pipeline-backend: %v (using cpu-software)", berr)
+				} else {
+					pr.Backend = be
+				}
+				inferenceSvc = system.NewInferenceService(pr, system.BuiltinInferenceModels())
+				// ReportedBackend is honest: "mlx" only when the sidecar genuinely
+				// computes on this node, "mlx-mock"/"llamacpp-mock" otherwise.
+				log.Printf("cerberusd: pipeline runner ready (split-MLP layer-split demo, backend=%s)",
+					inference.ReportedBackend(pr.Backend))
+			} else {
+				log.Printf("cerberusd: pipeline runner disabled: %v", perr)
+			}
 			// Surface this node's dialable multiaddrs so an operator can hand one
 			// to another machine for explicit pairing (copy-paste bootstrap).
 			for _, a := range meshFabric.DialableAddrs() {
@@ -235,10 +260,13 @@ func main() {
 		// too without another change at this call site.
 		devices = []deviceInfo{
 			{Path: "/cer/dev/vram/local/0", Kind: string(contract.KindVRAM), QuotaBytes: 2 * 1024 * 1024 * 1024},
+			{Path: "/cer/dev/cpu/local/0", Kind: string(contract.KindCPU), QuotaBytes: 64 * 1024 * 1024},
 		}
 		for _, ad := range sys.AudioDevices {
-			devices = append(devices, deviceInfo{Path: ad.Path, Kind: string(ad.Kind)})
+			devices = append(devices, deviceInfo{Path: ad.Path, Kind: string(ad.Kind), Name: ad.Name})
 		}
+		deviceCatalog = sys.DeviceCatalog
+		peripheralPool = sys.Pool
 		log.Printf("cerberusd: 9P namespace has %d device(s) (%d audio)", len(devices), len(sys.AudioDevices))
 		// Wire the lid-drop choreography: SLEEP_IMMINENT -> checkpoint -> promote
 		// standbys for this node's shards (ARCHITECTURE §4.2).
@@ -301,9 +329,40 @@ func main() {
 	// command. It runs whatever WASM bytes the task carries (falling back to the
 	// embedded hello-shard when a task carries none), so `cerberus run` executes
 	// real WebAssembly and returns the real i32 result.
-	localExec := wasm.NewExecutor(e2enode.HelloShardWASM())
+	helloWASM := e2enode.HelloShardWASM()
+	componentStore := wasm.NewContentStore()
+	localExec := wasm.NewExecutor(helloWASM)
 
-	// Start Gateway with the real executor (no mock), auth-gated.
+	// Workload executor: prefer mesh remote dispatch when worker peers exist,
+	// falling back to local wazero (same signed-cap + CID path as test/e2e).
+	workloadExec := contract.Executor(localExec)
+	if meshFabric != nil {
+		site := meshSite
+		if site == "" {
+			site = "local"
+		}
+		if err := compute.WireWorker(meshFabric, compute.WorkerConfig{
+			Site:      site,
+			Store:     componentStore,
+			Exec:      localExec,
+			Revoked:   auth.RevocationPredicateFromIssuer(issuer),
+			SeedBytes: helloWASM,
+			Sched:     sched,
+		}); err != nil {
+			log.Printf("cerberusd: mesh compute worker wiring failed: %v", err)
+		} else {
+			workloadExec = compute.NewPreferRemoteExecutor(compute.PreferRemoteConfig{
+				Fabric: meshFabric,
+				Site:   site,
+				Local:  localExec,
+				Store:  componentStore,
+				Sched:  sched,
+			})
+			log.Println("cerberusd: mesh compute active (CPU-pool placement across peers)")
+		}
+	}
+
+	// Start Gateway with the mesh-preferring executor (no mock), auth-gated.
 	//
 	// Bind happens HERE, synchronously, before the goroutine — not inside
 	// Gateway.Start — so a conflict on *gwAddr (another process, or a second
@@ -312,7 +371,25 @@ func main() {
 	// mode: Start's internal http.ListenAndServe fails deep in a goroutine, the
 	// error is merely logged, and the daemon carries on with the gateway
 	// silently unreachable.
-	gw := gateway.NewGateway(localExec, issuer)
+	gw := gateway.NewGateway(workloadExec, issuer)
+	if inferenceSvc != nil {
+		gw.SetInference(&gateway.SystemInference{Svc: inferenceSvc})
+		for _, m := range system.BuiltinInferenceModels() {
+			gw.RegisterModel(gateway.Model{
+				ID:      m.ID,
+				Kind:    gateway.ModelKindInference,
+				OwnedBy: "cerberus",
+				Inference: gateway.InferenceModelMeta{
+					Backend:    string(m.Backend),
+					LayerCount: m.LayerCount,
+					ModelPath:  m.ModelPath,
+					Fixture:    string(m.Fixture),
+				},
+			})
+		}
+		log.Printf("cerberusd: %d inference model(s) registered on gateway", len(system.BuiltinInferenceModels()))
+	}
+	gw.RegisterModel(gateway.Model{ID: "hello-shard", ComponentCID: "hello-shard"})
 
 	// Workload history: a small in-memory ring buffer recording every dispatch
 	// through either surface that can run a workload — the OpenAI-compatible
@@ -325,7 +402,7 @@ func main() {
 		if !ev.OK {
 			state = "error"
 		}
-		wlog.record(api.WorkloadEntry{ID: ev.TaskID, Model: ev.Model, Node: "local", State: state})
+		wlog.record(api.WorkloadEntry{ID: ev.TaskID, Model: ev.Model, Node: ev.Node, State: state})
 	})
 
 	// Wallet transactions (#10): price every completed gateway workload at a flat
@@ -390,6 +467,50 @@ func main() {
 				Hint:       hintStr(pw.Hint),
 			}
 		},
+		ClusterCPU: func() api.ClusterCPUView {
+			if sched == nil {
+				return api.ClusterCPUView{}
+			}
+			pool := sched.ClusterCPU()
+			out := api.ClusterCPUView{
+				TotalCores: pool.TotalCores,
+				FreeCores:  pool.FreeCores,
+				BusyCores:  pool.BusyCores,
+			}
+			for _, n := range pool.Nodes {
+				out.Nodes = append(out.Nodes, api.NodeCPUView{
+					PeerID: n.PeerID,
+					Total:  n.Total,
+					Free:   n.Free,
+					Busy:   n.Busy,
+				})
+			}
+			return out
+		},
+		GpuPool: func() api.GpuPoolView {
+			if sched == nil {
+				return api.GpuPoolView{}
+			}
+			self := ""
+			if meshFabric != nil {
+				self = hex.EncodeToString(peerBytes(meshFabric.PeerID()))
+			}
+			out := api.GpuPoolView{}
+			for _, n := range sched.NodeSnapshots() {
+				pid := hex.EncodeToString(peerBytes(n.PeerID))
+				out.TotalVRAM += n.Memory.VRAMTotal
+				out.TotalVRAMFree += n.Memory.VRAMFree
+				out.Nodes = append(out.Nodes, api.GpuNodeView{
+					PeerID:    pid,
+					VRAMTotal: n.Memory.VRAMTotal,
+					VRAMFree:  n.Memory.VRAMFree,
+					Flops:     n.Compute.Flops,
+					GpuC:      n.Thermal.GPUc,
+					Self:      pid == self,
+				})
+			}
+			return out
+		},
 	}).WithListGetters(api.ListGetters{
 		// GET /api/v1/conflicts — backed by the same daemon/state CRDT engine
 		// DaemonRPC.ConflictsList reads (see cmd/cerberusd/rpc.go).
@@ -414,9 +535,24 @@ func main() {
 		// the 9P namespace (the `devices` mirror list built above), so it
 		// automatically includes the real audio endpoints alongside VRAM.
 		Devices: func() []api.NamespaceDevice {
-			out := make([]api.NamespaceDevice, 0, len(devices))
-			for _, d := range devices {
-				out = append(out, api.NamespaceDevice{Path: d.Path, Kind: d.Kind, Rights: []string{"read"}})
+			var src []system.CatalogEntry
+			if deviceCatalog != nil {
+				src = deviceCatalog.Snapshot()
+			} else {
+				for _, d := range devices {
+					src = append(src, system.CatalogEntry{Path: d.Path, Kind: d.Kind, Name: d.Name, Peer: d.Peer, Pooled: d.Pooled, QuotaBytes: d.QuotaBytes})
+				}
+			}
+			out := make([]api.NamespaceDevice, 0, len(src))
+			for _, d := range src {
+				rights := []string{"read"}
+				if d.Kind == string(contract.KindVRAM) || d.Kind == string(contract.KindCPU) {
+					rights = []string{"read", "alloc"}
+				}
+				out = append(out, api.NamespaceDevice{
+					Path: d.Path, Kind: d.Kind, Rights: rights,
+					Name: d.Name, Peer: d.Peer, Pooled: d.Pooled,
+				})
 			}
 			return out
 		},
@@ -441,6 +577,12 @@ func main() {
 				})
 			}
 			return out
+		},
+		ClusterResources: func() api.ClusterResources {
+			if peripheralPool == nil {
+				return api.ClusterResources{}
+			}
+			return clusterResourcesAPI(peripheralPool.Snapshot())
 		},
 	}).WithActions(api.Actions{
 		// POST /api/v1/conflicts/resolve — same daemon/state call
@@ -546,7 +688,8 @@ func main() {
 		lifecycle: mon,
 		fabric:    meshFabric,
 		sched:     sched,
-		exec:      localExec,
+		exec:      workloadExec,
+		cstore:    componentStore,
 		ledger:    lg,
 		settler:   settler,
 		crdt:      crdtEngine,
@@ -554,9 +697,12 @@ func main() {
 		fs:        fsSurface,
 		daemonDoc: []byte("daemon-doc"),
 		devices:   devices,
+		catalog:   deviceCatalog,
 		caps:      caps,
 		wlog:      wlog,
 		site:      meshSite,
+		pipeline:  pipeRunner,
+		inference: inferenceSvc,
 		profile:   *profile,
 		kernel:    ffi.Backend(),
 		started:   started,
@@ -634,6 +780,14 @@ func bindWithFallback(name, addr string) net.Listener {
 	}
 	log.Printf("%s: %s unavailable, falling back to ephemeral port %s", name, addr, ln.Addr().String())
 	return ln
+}
+
+// envOr returns the env value for key when set, else fallback (flag defaults).
+func envOr(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func splitCSV(s string) []string {

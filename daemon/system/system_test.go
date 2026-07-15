@@ -20,6 +20,8 @@ import (
 
 	contract "github.com/hash066/cerberus/contract/go"
 	"github.com/hash066/cerberus/contract/go/stub"
+	"github.com/hash066/cerberus/daemon/dataplane"
+	"github.com/hash066/cerberus/daemon/gpu"
 )
 
 // TestComposeRevocationTakesEffectEndToEnd proves the capability kernel Compose
@@ -79,6 +81,81 @@ func TestComposeRevocationTakesEffectEndToEnd(t *testing.T) {
 	}
 	if err := sys.Namespace.Walk("/cer/dev/vram/local/0", capH2); err != nil {
 		t.Fatalf("walk with a fresh cap denied after an unrelated cap was revoked: %v", err)
+	}
+}
+
+// TestComposeGpuDeviceRunsKernelOverDataPlane proves the headline path through
+// the FULLY COMPOSED daemon: /cer/dev/gpu/local/0 is a capability-gated 9P device
+// whose ctl open mints a real data-plane grant, and dispatching an f32 kernel over
+// that granted QUIC session runs it on this node's GPU backend and returns the
+// result — no kernel byte traversing 9P (vertical 04 §3.5). This exercises the
+// exact granter+responder wiring Compose installs (KindGPU -> dataplane.Responder
+// -> gpu.Serve), not a hand-wired stand-in. Runs on any machine via the default
+// build's real software backend (a -tags ffi --features gpu build runs it on wgpu).
+func TestComposeGpuDeviceRunsKernelOverDataPlane(t *testing.T) {
+	kernel := stub.NewCapKernel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sys, err := Compose(ctx, kernel, "gpu-device-test", nil)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	// The GPU session dials the composed data plane, so the supervision tree
+	// (which serves it) must actually be running — Compose alone only wires it.
+	done := startSystemForTest(sys, ctx)
+	defer stopSystemForTest(t, cancel, done)
+
+	const dev = "/cer/dev/gpu/local/0"
+	ref := contract.ResourceRef{Kind: contract.KindGPU, Path: dev}
+	capH, err := sys.Kernel.Mint(ref, []contract.Right{contract.RightRead, contract.RightAlloc}, nil)
+	if err != nil {
+		t.Fatalf("mint gpu cap: %v", err)
+	}
+
+	if err := sys.Namespace.Walk(dev, capH); err != nil {
+		t.Fatalf("walk gpu device through composed namespace: %v", err)
+	}
+	ep, err := sys.Namespace.Open(dev+"/ctl", capH)
+	if err != nil {
+		t.Fatalf("open gpu ctl through composed namespace: %v", err)
+	}
+	if ep.Endpoint != sys.DataPlaneAddr {
+		t.Fatalf("gpu ctl must return the live data-plane addr %q, got %q", sys.DataPlaneAddr, ep.Endpoint)
+	}
+
+	client := dataplane.NewClient()
+	dpEP := dataplane.Endpoint{
+		Kind: dataplane.EndpointQUIC, Addr: ep.Endpoint, TransferID: ep.StreamID,
+		Cap: capH, Quota: ep.Quota, ServerPeerID: ep.ServerPeerID,
+	}
+	sctx, scancel := context.WithTimeout(ctx, 10*time.Second)
+	defer scancel()
+	out, backend, err := gpu.RequestSession(sctx, client, dpEP, gpu.Saxpy, 2,
+		[]float32{1, 2, 3}, []float32{0.5, 0.5, 0.5}) // 2*x + y
+	if err != nil {
+		t.Fatalf("gpu session dispatch over the composed data plane: %v", err)
+	}
+	want := []float32{2.5, 4.5, 6.5}
+	if len(out) != len(want) {
+		t.Fatalf("output len = %d, want %d", len(out), len(want))
+	}
+	for i := range want {
+		if out[i] != want[i] {
+			t.Fatalf("output[%d] = %v, want %v", i, out[i], want[i])
+		}
+	}
+	if backend == "" {
+		t.Fatal("composed gpu session must report which backend actually ran the kernel")
+	}
+
+	// Fail-closed: revoking the capability denies a fresh ctl open, so no new
+	// data-plane session can be minted for the device after revocation.
+	if err := sys.Kernel.Revoke(capH); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := sys.Namespace.Open(dev+"/ctl", capH); err == nil {
+		t.Fatal("opening gpu ctl with a revoked cap was allowed — revocation did not propagate")
 	}
 }
 

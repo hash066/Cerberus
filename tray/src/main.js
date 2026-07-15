@@ -70,6 +70,20 @@ function fmtNum(n) {
   return Number(n).toLocaleString();
 }
 
+function fmtBytes(n) {
+  if (n == null || Number.isNaN(n)) return "—";
+  const b = Number(n);
+  if (b >= 1 << 30) return `${(b / (1 << 30)).toFixed(1)} GiB`;
+  if (b >= 1 << 20) return `${(b / (1 << 20)).toFixed(1)} MiB`;
+  if (b >= 1 << 10) return `${(b / (1 << 10)).toFixed(1)} KiB`;
+  return `${b} B`;
+}
+
+function shortPeer(hex) {
+  if (!hex || hex.length < 8) return hex || "—";
+  return `${hex.slice(0, 8)}…`;
+}
+
 function toast(msg, kind = "info") {
   const wrap = $("toasts");
   if (!wrap) return;
@@ -255,6 +269,25 @@ function renderStatus(s) {
   const peerCount = (s.peers || []).length;
   setText("ov-peers", String(peerCount));
   setText("ov-balance", fmtNum(s.operator_balance));
+  const pool = s.gpu_pool || {};
+  setText("ov-vram", pool.total_vram_free != null ? fmtBytes(pool.total_vram_free) : "—");
+
+  // GPU / VRAM pool card
+  setText("gp-vram-total", pool.total_vram_total != null ? fmtBytes(pool.total_vram_total) : "—");
+  setText("gp-vram-free", pool.total_vram_free != null ? fmtBytes(pool.total_vram_free) : "—");
+  const gpuNodes = pool.nodes || [];
+  setText("gp-node-count", String(gpuNodes.length));
+  const gpc = $("gp-node-container");
+  if (!gpuNodes.length) {
+    gpc.textContent = "No pooled GPU telemetry yet — peers publish VRAM at 1–4 Hz.";
+  } else {
+    gpc.innerHTML = gpuNodes
+      .map((n) => {
+        const tag = n.self ? " (this node)" : "";
+        return `<div class="kv"><span>${esc(shortPeer(n.peer_id))}${tag}</span><b>${fmtBytes(n.vram_free)} free / ${fmtBytes(n.vram_total)}</b></div>`;
+      })
+      .join("");
+  }
 
   // Daemon card
   setText("d-version", s.version || "—");
@@ -382,9 +415,13 @@ function isAudioDevice(d) {
 function deviceRowHTML(d, kindIcon) {
   const path = d.path || d;
   const kind = d.kind || "device";
+  const name = d.name || path.split("/").pop() || path;
+  const peerTag = d.pooled && d.peer
+    ? `<span class="chip warn" title="Remote peer ${esc(d.peer)}">pooled</span> `
+    : "";
   return (
-    nameCell(kindIcon, path.split("/").pop() || path, path) +
-    `<td><span class="chip info">${esc(kind)}</span></td>` +
+    nameCell(kindIcon, name, path) +
+    `<td>${peerTag}<span class="chip info">${esc(kind)}</span></td>` +
     `<td>${esc((d.rights || []).join(", ") || "read")}</td>` +
     `<td class="actions-col"></td>`
   );
@@ -416,7 +453,17 @@ async function refreshDevices() {
     }
     lastDevices = Array.isArray(list) ? list : [];
     renderDeviceTable(devContainer, lastDevices.filter((d) => !isAudioDevice(d)), "▤", "No devices in the namespace yet.");
-    renderDeviceTable(audioContainer, lastDevices.filter(isAudioDevice), "♪", "No microphones or speakers found on this host.");
+    const audioDevs = lastDevices.filter(isAudioDevice);
+    const pooled = audioDevs.filter((d) => d.pooled);
+    const local = audioDevs.filter((d) => !d.pooled);
+    renderDeviceTable(audioContainer, audioDevs, "♪", "No microphones or speakers found (local or pooled from peers).");
+    if (pooled.length) {
+      setText("audio-pool-hint", `${pooled.length} pooled from ${new Set(pooled.map((d) => d.peer)).size} peer(s); ${local.length} local. Use cerberus audio play/monitor --on <peer> to stream.`);
+    } else if (local.length) {
+      setText("audio-pool-hint", `${local.length} local device(s). Pooled peer devices appear when mesh peers are connected.`);
+    } else {
+      setText("audio-pool-hint", "");
+    }
   } else if (isPending(r.err)) {
     renderPending(devContainer, r.err, "Device namespace (9P)");
     renderPending(audioContainer, r.err, "Audio device enumeration");
