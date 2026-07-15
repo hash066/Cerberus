@@ -22,11 +22,15 @@ package audiolink
 // package implements them, exactly as daemon/system implements mesh.ShardServer.
 //
 // LIVE vs SYNTHETIC backends: the Source (mic) and Sink (speaker) are injected as
-// factories so the real WASAPI backends (audio.NewOSCaptureSource /
-// NewOSPlaybackSink — real on Windows, documented stubs elsewhere) are used in
-// production while tests inject a synthetic SineSource / BufferSink and never
-// require audio hardware. NewLiveMeshAudioServer / NewLiveMeshAudioClient wire the
-// OS backends; NewMeshAudioServer / NewMeshAudioClient take explicit factories.
+// factories so the real OS backends (audio.NewOSCaptureSource /
+// NewOSPlaybackSink) are used in production while tests inject a synthetic
+// SineSource / BufferSink and never require audio hardware. Those backends are
+// real and hardware-verified on Windows (WASAPI) and Linux (PulseAudio, which
+// also covers PipeWire); macOS and everything else are documented stubs that
+// fail loudly with audio.ErrOSAudioUnavailable — see daemon/audio's os_*.go for
+// each platform's exact status. NewLiveMeshAudioServer / NewLiveMeshAudioClient
+// wire the OS backends; NewMeshAudioServer / NewMeshAudioClient take explicit
+// factories.
 
 import (
 	"context"
@@ -161,9 +165,9 @@ func (m *meshAudioClient) PlayRemote(r io.Reader) error {
 }
 
 // LiveMicFactory returns a SourceFactory that opens the real OS microphone at
-// format (audio.NewOSCaptureSource). On a build without a real backend it returns
-// audio.ErrOSAudioUnavailable when invoked, so a caller fails loudly rather than
-// streaming fake audio.
+// format (audio.NewOSCaptureSource) — real on Windows and Linux. On a platform
+// without a real backend it returns audio.ErrOSAudioUnavailable when invoked, so
+// a caller fails loudly rather than streaming fake audio.
 func LiveMicFactory(format audio.Format) SourceFactory {
 	if format == (audio.Format{}) {
 		format = DefaultFormat
