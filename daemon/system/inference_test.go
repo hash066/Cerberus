@@ -31,7 +31,7 @@ func TestInferenceServiceSplitMLP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := NewInferenceService(runner, BuiltinInferenceModels())
+	svc := NewInferenceService(runner, PipelineFixtureModels())
 
 	res, err := svc.Run(ctx, "alice", SplitMLPDemoModel.ID, nil)
 	if err != nil {
@@ -62,7 +62,7 @@ func TestInferenceServiceStreamEmitsStageTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := NewInferenceService(runner, BuiltinInferenceModels())
+	svc := NewInferenceService(runner, PipelineFixtureModels())
 
 	var tokens []string
 	_, err = svc.RunStream(ctx, "bob", SplitMLPDemoModel.ID, nil, func(tok string) error {
@@ -115,28 +115,50 @@ func TestShardsForLayerCountTwoNodes(t *testing.T) {
 	}
 }
 
-func TestShardsForSpecTinyLlama(t *testing.T) {
-	shards, err := shardsForSpec(TinyLlamaModel)
+// TestShardsForSpecCoversEveryLayer exercises the Phase-2 layer-split substrate
+// with a synthetic 22-layer spec. It is NOT tied to any real model: llama.cpp owns
+// the layer split on the real path (daemon/llama), so this function is not on it.
+func TestShardsForSpecCoversEveryLayer(t *testing.T) {
+	spec := InferenceModelSpec{ID: "synthetic-22L", Backend: InferenceBackendCPUSoftware, LayerCount: 22}
+	shards, err := shardsForSpec(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(shards) != 2 {
-		t.Fatalf("got %d shards", len(shards))
+	if len(shards) != DefaultPipelineNodeCount {
+		t.Fatalf("got %d shards want %d", len(shards), DefaultPipelineNodeCount)
 	}
 	total := int(shards[len(shards)-1].LayerHi + 1)
-	if total != int(TinyLlamaModel.LayerCount) {
-		t.Fatalf("layer coverage = %d want %d", total, TinyLlamaModel.LayerCount)
+	if total != int(spec.LayerCount) {
+		t.Fatalf("layer coverage = %d want %d", total, spec.LayerCount)
 	}
 }
 
-func TestBuiltinInferenceModelsIncludeLLMEntries(t *testing.T) {
-	ids := map[string]bool{}
-	for _, m := range BuiltinInferenceModels() {
-		ids[m.ID] = true
+// TestBuiltinInferenceModelsExposesNoFixtureOrMock is a REGRESSION GUARD for the
+// L0 cleanup, and it is the inverse of the test that used to live here.
+//
+// The old test asserted that /v1/models advertised "llamacpp-mock", "tinyllama-1b"
+// and "llama-3.2-1b". None of those ran a real model: the first was a mock
+// transform, the second additionally prompted llama-cli with the auth subject, the
+// third needed a sidecar that rejected models above 4 layers. The test passing was
+// what made the lie look maintained.
+//
+// /v1/models must advertise only models that genuinely run. Real entries come from
+// daemon/llama. The split-MLP fixture must never appear here.
+func TestBuiltinInferenceModelsExposesNoFixtureOrMock(t *testing.T) {
+	if got := BuiltinInferenceModels(); len(got) != 0 {
+		t.Fatalf("BuiltinInferenceModels() = %+v, want empty — only genuinely-running models may reach /v1/models", got)
 	}
-	for _, id := range []string{"split-mlp-demo", "llamacpp-mock", "tinyllama-1b", "llama-3.2-1b"} {
-		if !ids[id] {
-			t.Fatalf("missing model %q", id)
-		}
+}
+
+// TestPipelineFixtureModelsStillCarriesTheFixture pins the other half: the fixture
+// remains reachable for `cerberus pipeline-run` and the e2e harnesses, which is
+// honest, because nothing there claims it is a language model.
+func TestPipelineFixtureModelsStillCarriesTheFixture(t *testing.T) {
+	got := PipelineFixtureModels()
+	if len(got) != 1 || got[0].ID != SplitMLPDemoModel.ID {
+		t.Fatalf("PipelineFixtureModels() = %+v, want just %q", got, SplitMLPDemoModel.ID)
+	}
+	if got[0].Fixture != InferenceFixtureSplitMLP {
+		t.Fatalf("fixture = %q, want %q", got[0].Fixture, InferenceFixtureSplitMLP)
 	}
 }

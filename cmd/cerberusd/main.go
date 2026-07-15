@@ -233,10 +233,11 @@ func main() {
 				} else {
 					pr.Backend = be
 				}
-				inferenceSvc = system.NewInferenceService(pr, system.BuiltinInferenceModels())
-				// ReportedBackend is honest: "mlx" only when the sidecar genuinely
-				// computes on this node, "mlx-mock"/"llamacpp-mock" otherwise.
-				log.Printf("cerberusd: pipeline runner ready (split-MLP layer-split demo, backend=%s)",
+				// The fixture registry, NOT the gateway registry: this keeps
+				// `cerberus pipeline-run` working while leaving /v1/models free of
+				// a 4-float fixture masquerading as a chat model.
+				inferenceSvc = system.NewInferenceService(pr, system.PipelineFixtureModels())
+				log.Printf("cerberusd: pipeline runner ready (split-MLP layer-split FIXTURE, backend=%s; not an LLM)",
 					inference.ReportedBackend(pr.Backend))
 			} else {
 				log.Printf("cerberusd: pipeline runner disabled: %v", perr)
@@ -398,7 +399,12 @@ func main() {
 	// silently unreachable.
 	gw := gateway.NewGateway(workloadExec, issuer)
 	if inferenceSvc != nil {
-		gw.SetInference(&gateway.SystemInference{Svc: inferenceSvc})
+		// Chat models come from daemon/llama (real llama.cpp), not from the
+		// split-MLP fixture. The fixture is reachable via `cerberus pipeline-run`.
+		// BuiltinInferenceModels() is empty by design: every entry it used to hold
+		// was a mock. Real chat models are registered by daemon/llama when a
+		// llama-server pack is present. The split-MLP fixture is deliberately NOT
+		// registered here — it is reachable via `cerberus pipeline-run`.
 		for _, m := range system.BuiltinInferenceModels() {
 			gw.RegisterModel(gateway.Model{
 				ID:      m.ID,

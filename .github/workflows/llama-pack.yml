@@ -1,0 +1,356 @@
+name: llama-pack
+
+# Builds the Cerberus llama pack: llama-server + ggml-rpc-server from a PINNED
+# upstream tag, zipped per platform/backend with a sha256.
+#
+# WHY WE BUILD FROM SOURCE AT ALL:
+#   ggml-rpc-server is gated behind -DGGML_RPC=ON at COMPILE time. Cerberus cannot
+#   rely on whatever an upstream prebuilt archive happens to contain for a given
+#   release, so it builds both binaries itself from one pinned tag. That also
+#   guarantees the two binaries in a pack are the SAME build, which daemon/llama's
+#   version gate depends on: ggml-rpc-server has no --version flag, so its build
+#   number is read from the llama-server built beside it (see locate.go).
+#
+# WHY VULKAN AND NOT CUDA:
+#   ~33MB vs ~640MB, and one artifact covers NVIDIA + AMD + Intel. The pack is NOT
+#   bundled in the base installer; it is fetched on first use with progress and
+#   verified against a sha256 compiled into the daemon (daemon/llama/pack.go).
+#
+# THE PINNED TAG IS ALSO A SECURITY FLOOR:
+#   daemon/llama refuses to execute any llama.cpp build older than b8492, which is
+#   the fix for CVE-2026-34159 — an unauthenticated pre-auth RCE in the ggml-rpc
+#   deserializer (CVSS 9.8). Keep LLAMA_TAG >= b8492, and keep it in lockstep with
+#   PinnedTag/PinnedCommit in daemon/llama/version.go.
+#
+# The Vulkan SDK / glslc steps below are taken from llama.cpp's own release.yml
+# rather than invented.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/llama-pack.yml"
+      - "daemon/llama/version.go"
+
+permissions:
+  contents: read
+
+env:
+  # MUST match daemon/llama/version.go PinnedTag (b10021 ->
+  # 33a75f41c30052fd3d1c38e8ed2f86ee3c3f8fba). A mismatch means the daemon's
+  # compiled-in expectations and the artifact disagree.
+  LLAMA_TAG: b10021
+  LLAMA_REPO: https://github.com/ggml-org/llama.cpp.git
+  # From llama.cpp's release.yml.
+  VULKAN_VERSION: 1.4.313.2
+  # LLAMA_BUILD_TOOLS=ON is what builds tools/rpc; GGML_RPC=ON is what makes
+  # ggml-rpc-server exist at all. Both are required — dropping either silently
+  # produces a pack with no worker binary.
+  COMMON_CMAKE_ARGS: >-
+    -DCMAKE_BUILD_TYPE=Release
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_BUILD_TOOLS=ON
+    -DLLAMA_BUILD_SERVER=ON
+    -DGGML_RPC=ON
+    -DGGML_NATIVE=OFF
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.backend }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            backend: vulkan
+            goos: windows
+            goarch: amd64
+            defines: "-DGGML_VULKAN=ON"
+          - os: windows-latest
+            backend: cpu
+            goos: windows
+            goarch: amd64
+            defines: ""
+          - os: ubuntu-22.04
+            backend: vulkan
+            goos: linux
+            goarch: amd64
+            defines: "-DGGML_VULKAN=ON"
+          - os: ubuntu-22.04
+            backend: cpu
+            goos: linux
+            goarch: amd64
+            defines: ""
+          - os: macos-14
+            backend: metal
+            goos: darwin
+            goarch: arm64
+            defines: "-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON"
+          - os: macos-14
+            backend: cpu
+            goos: darwin
+            goarch: arm64
+            defines: "-DGGML_METAL=OFF"
+
+    steps:
+      - name: Checkout Cerberus
+        uses: actions/checkout@v4
+
+      - name: Checkout llama.cpp at the pinned tag
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_TAG }}
+          path: llama.cpp
+          fetch-depth: 1
+
+      - name: Verify the pinned tag matches daemon/llama/version.go
+        shell: bash
+        run: |
+          set -euo pipefail
+          want_tag=$(grep -oE 'PinnedTag = "[^"]+"' daemon/llama/version.go | cut -d'"' -f2)
+          if [ "$want_tag" != "${LLAMA_TAG}" ]; then
+            echo "::error::LLAMA_TAG=${LLAMA_TAG} but daemon/llama/version.go pins ${want_tag}."
+            echo "The daemon's compiled-in expectations and this artifact would disagree."
+            exit 1
+          fi
+          want_commit=$(grep -oE 'PinnedCommit = "[^"]+"' daemon/llama/version.go | cut -d'"' -f2)
+          got_commit=$(git -C llama.cpp rev-parse HEAD)
+          if [ "$want_commit" != "$got_commit" ]; then
+            echo "::error::${LLAMA_TAG} resolves to $got_commit but version.go pins $want_commit."
+            exit 1
+          fi
+          echo "pinned tag ${LLAMA_TAG} -> $got_commit (matches version.go)"
+
+      # --- Vulkan SDK (lifted from llama.cpp's release.yml) ---
+      - name: Install Vulkan SDK (Windows)
+        if: ${{ matrix.backend == 'vulkan' && runner.os == 'Windows' }}
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Vulkan SDK (Linux)
+        if: ${{ matrix.backend == 'vulkan' && runner.os == 'Linux' }}
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build ${COMMON_CMAKE_ARGS} ${{ matrix.defines }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build llama.cpp/build --config Release -j 4
+
+      # The pack is defined by containing BOTH binaries. If tools/rpc silently did
+      # not build, fail here rather than publish a pack whose worker is missing and
+      # let daemon/llama's ErrPackMissing surface it on a user's machine.
+      - name: Assert both binaries exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pack
+          found_server="" ; found_rpc=""
+          for d in llama.cpp/build/bin/Release llama.cpp/build/bin llama.cpp/build/Release llama.cpp/build; do
+            [ -d "$d" ] || continue
+            for ext in "" ".exe"; do
+              [ -f "$d/llama-server$ext" ]    && found_server="$d/llama-server$ext"
+              [ -f "$d/ggml-rpc-server$ext" ] && found_rpc="$d/ggml-rpc-server$ext"
+            done
+          done
+          if [ -z "$found_server" ]; then
+            echo "::error::llama-server was not built (LLAMA_BUILD_SERVER=ON?)"; exit 1
+          fi
+          if [ -z "$found_rpc" ]; then
+            echo "::error::ggml-rpc-server was not built. GGML_RPC=ON and LLAMA_BUILD_TOOLS=ON are BOTH required."
+            echo "Note the target name is ggml-rpc-server (tools/rpc/CMakeLists.txt: set(TARGET ggml-rpc-server)), not rpc-server."
+            exit 1
+          fi
+          echo "server=$found_server rpc=$found_rpc"
+          srcdir=$(dirname "$found_rpc")
+          cp "$found_server" "$found_rpc" pack/
+          # Shared ggml/backend libraries live beside the binaries.
+          for f in "$srcdir"/*.dll "$srcdir"/*.so "$srcdir"/*.so.* "$srcdir"/*.dylib; do
+            [ -e "$f" ] && cp "$f" pack/ || true
+          done
+          ls -la pack/
+
+      # Proves the gate can read a build number from this pack. locate.go parses
+      # `version: <N> (<commit>)` off STDERR (common/arg.cpp fprintf's it there);
+      # if a future upstream changes that format, the gate would refuse every pack,
+      # so catch it here at build time rather than on a user's machine.
+      - name: Verify llama-server reports a parseable version >= the CVE floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=pack/llama-server; [ -f "$bin.exe" ] && bin="$bin.exe"
+          out=$("$bin" --version 2>&1 || true)
+          echo "$out"
+          n=$(echo "$out" | grep -oE 'version: [0-9]+' | head -1 | grep -oE '[0-9]+')
+          if [ -z "$n" ]; then
+            echo "::error::could not parse a build number from --version; daemon/llama/locate.go's gate would refuse this pack"; exit 1
+          fi
+          if [ "$n" -lt 8492 ]; then
+            echo "::error::build b$n is older than b8492 (CVE-2026-34159, unauthenticated RCE in ggml-rpc). Refusing to publish."; exit 1
+          fi
+          echo "llama-server reports b$n (>= 8492 floor)"
+
+      - name: Zip + sha256
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="cerberus-llama-${{ matrix.goos }}-${{ matrix.goarch }}-${{ matrix.backend }}-${LLAMA_TAG}.zip"
+          (cd pack && zip -r "../$name" .)
+          if command -v sha256sum >/dev/null; then sha256sum "$name" > "$name.sha256";
+          else shasum -a 256 "$name" > "$name.sha256"; fi
+          cat "$name.sha256"
+          echo "PACK_NAME=$name" >> "$GITHUB_ENV"
+          echo
+          echo "::notice::Record this digest in packSHA256 in daemon/llama/pack.go — FetchPack REFUSES to download a pack with no compiled-in digest, because an unverified pack is an arbitrary-code-execution vector."
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACK_NAME }}
+          path: |
+            ${{ env.PACK_NAME }}
+            ${{ env.PACK_NAME }}.sha256
+          if-no-files-found: error
+
+  # The leg that proves the whole thing actually runs. Two REAL processes on one
+  # CI box: ggml-rpc-server on loopback, llama-server driving it over --rpc with a
+  # REAL 1MB gguf. Asserts real generated tokens.
+  #
+  # This exists because the previous inference code's only test skipped itself
+  # unless CERBERUS_LLAMA_MODEL was set and CI never set it — which is precisely
+  # why a C++ helper that had never once been compiled sat in the tree for months.
+  distributed-smoke:
+    name: real 2-process distributed inference (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-14]
+        include:
+          - os: ubuntu-22.04
+            pack: cerberus-llama-linux-amd64-cpu-b10021.zip
+          - os: windows-latest
+            pack: cerberus-llama-windows-amd64-cpu-b10021.zip
+          - os: macos-14
+            pack: cerberus-llama-darwin-arm64-cpu-b10021.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.pack }}
+          path: packzip
+
+      - name: Unpack
+        shell: bash
+        run: |
+          mkdir -p pack && cd pack && unzip -o ../packzip/${{ matrix.pack }}
+          chmod +x llama-server ggml-rpc-server 2>/dev/null || true
+          ls -la
+
+      # stories260K.gguf: llama.cpp's own CI model. ~1.13MB, a REAL gguf with real
+      # weights and a real tokenizer — small enough to run anywhere, real enough
+      # that "it generated tokens" means something.
+      # Digest verified from Hugging Face's LFS metadata for
+      # ggml-org/models @ tinyllamas/stories260K.gguf (size 1185376).
+      - name: Fetch stories260K.gguf (sha256-pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          url=https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+          want=61b50d457809a5194818fd22e6724b456cd7bb9a6264c52c8110684c53f3704a
+          curl -sSL -o stories260K.gguf "$url"
+          if command -v sha256sum >/dev/null; then got=$(sha256sum stories260K.gguf | cut -d' ' -f1);
+          else got=$(shasum -a 256 stories260K.gguf | cut -d' ' -f1); fi
+          if [ "$got" != "$want" ]; then
+            echo "::error::stories260K.gguf sha256 mismatch: want $want got $got"; exit 1
+          fi
+          echo "stories260K.gguf verified ($got)"
+
+      - name: Real distributed generation over loopback
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=""; [ "${{ runner.os }}" = "Windows" ] && EXE=".exe"
+
+          ./pack/ggml-rpc-server$EXE -H 127.0.0.1 -p 50052 -t 2 &
+          RPC_PID=$!
+          trap 'kill $RPC_PID 2>/dev/null || true' EXIT
+
+          for i in $(seq 1 60); do
+            (exec 3<>/dev/tcp/127.0.0.1/50052) 2>/dev/null && break
+            sleep 0.5
+          done
+
+          ./pack/llama-server$EXE -m stories260K.gguf --host 127.0.0.1 --port 8099 \
+            -ngl 99 --rpc 127.0.0.1:50052 &
+          SRV_PID=$!
+          trap 'kill $RPC_PID $SRV_PID 2>/dev/null || true' EXIT
+
+          for i in $(seq 1 120); do
+            curl -sf http://127.0.0.1:8099/health >/dev/null && break
+            sleep 0.5
+          done
+
+          resp=$(curl -sf http://127.0.0.1:8099/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"messages":[{"role":"user","content":"Once upon a time"}],"max_tokens":24,"temperature":0,"seed":42}')
+          echo "$resp"
+
+          content=$(echo "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["choices"][0]["message"]["content"])')
+          ctoks=$(echo "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["usage"]["completion_tokens"])')
+          echo "generated: $content"
+          echo "completion_tokens: $ctoks"
+          if [ -z "$content" ] || [ "$ctoks" -lt 1 ]; then
+            echo "::error::no real tokens were generated across the two processes"; exit 1
+          fi
+          echo "REAL distributed generation over ggml-rpc: $ctoks tokens"
+
+      # Greedy determinism, CPU vs CPU ONLY. Vulkan is deliberately NOT asserted
+      # bit-exact here: different drivers/hardware legitimately differ, and
+      # asserting it would produce a flaky test that gets disabled, which is worse
+      # than not asserting it.
+      - name: Determinism — single-node CPU vs distributed CPU must match byte-for-byte
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=""; [ "${{ runner.os }}" = "Windows" ] && EXE=".exe"
+          req='{"messages":[{"role":"user","content":"Once upon a time"}],"max_tokens":24,"temperature":0,"seed":42}'
+
+          ./pack/llama-server$EXE -m stories260K.gguf --host 127.0.0.1 --port 8098 -ngl 0 &
+          A=$!; trap 'kill $A 2>/dev/null || true' EXIT
+          for i in $(seq 1 120); do curl -sf http://127.0.0.1:8098/health >/dev/null && break; sleep 0.5; done
+          single=$(curl -sf http://127.0.0.1:8098/v1/chat/completions -H 'Content-Type: application/json' -d "$req" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["choices"][0]["message"]["content"])')
+          kill $A 2>/dev/null || true
+
+          ./pack/ggml-rpc-server$EXE -H 127.0.0.1 -p 50053 -t 2 &
+          R=$!; trap 'kill $A $R 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/50053) 2>/dev/null && break; sleep 0.5; done
+          ./pack/llama-server$EXE -m stories260K.gguf --host 127.0.0.1 --port 8097 -ngl 99 --rpc 127.0.0.1:50053 &
+          B=$!; trap 'kill $A $R $B 2>/dev/null || true' EXIT
+          for i in $(seq 1 120); do curl -sf http://127.0.0.1:8097/health >/dev/null && break; sleep 0.5; done
+          dist=$(curl -sf http://127.0.0.1:8097/v1/chat/completions -H 'Content-Type: application/json' -d "$req" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["choices"][0]["message"]["content"])')
+
+          echo "single-node : $single"
+          echo "distributed : $dist"
+          if [ "$single" != "$dist" ]; then
+            echo "::error::greedy CPU output differs between single-node and distributed-over-loopback — the RPC path is changing results"
+            exit 1
+          fi
+          echo "deterministic: distributing the model did not change the output"

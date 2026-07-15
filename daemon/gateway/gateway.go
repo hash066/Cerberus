@@ -86,7 +86,7 @@ type OnDispatchFunc func(DispatchEvent)
 type Gateway struct {
 	executor  contract.Executor
 	authz     auth.Authorizer
-	inference InferenceRunner
+	inference ChatBackend
 
 	mu         sync.RWMutex
 	models     map[string]Model // keyed by Model.ID
