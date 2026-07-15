@@ -36,6 +36,42 @@ func TestWalkRequiresCapability(t *testing.T) {
 	}
 }
 
+// TestWalkDeniesPhantomPathsUnderADevice pins a bug found by actually mounting
+// the namespace and walking it from a shell: `cat <mnt>/dev/vram/AA/0/secret`
+// reported "Is a directory" instead of "No such file or directory".
+//
+// The cause was that Walk resolved its path with deviceFor, which PREFIX-matches
+// (it has to: Open/ReadInfo are handed ".../ctl" and ".../info" and must find
+// the owning device). So any invented suffix under a registered device — at any
+// depth — matched that device, passed its read check, and resolved. wire.go's
+// node.Walk then classified the non-leaf name as a directory, conjuring an
+// endless tree of phantom directories under every device. The namespace's only
+// real paths are structural ancestors, registered device dirs, their ctl/info
+// leaves, and /cer/fs — nothing else may resolve, which is exactly what
+// wire.go's default branch already claimed ("Unknown paths are denied here").
+//
+// This was never an authority leak (the phantom is empty, and ctl/info stay
+// gated), but a namespace that answers for paths it does not have is lying, and
+// the mount made that lie visible to any shell.
+func TestWalkDeniesPhantomPathsUnderADevice(t *testing.T) {
+	s, cap, _ := setup()
+	for _, phantom := range []string{
+		dev + "/secret",           // an invented name directly under a device
+		dev + "/secret/deeper",    // ...and at depth
+		dev + "/ctl/nested",       // below a real leaf
+		"/cer/dev/vram/AA/0extra", // a device-dir prefix that is NOT a path boundary
+	} {
+		if err := s.Walk(phantom, cap); err == nil {
+			t.Errorf("walk to %q must be denied: the namespace has no such path, and resolving it "+
+				"conjures a phantom directory through any mount of this namespace", phantom)
+		}
+	}
+	// The real paths must keep resolving exactly as before.
+	if err := s.Walk(dev, cap); err != nil {
+		t.Fatalf("walk to the registered device itself must still succeed: %v", err)
+	}
+}
+
 func TestOpenCtlReturnsEndpointNotBytes(t *testing.T) {
 	s, cap, _ := setup()
 	ep, err := s.Open(dev+"/ctl", cap)

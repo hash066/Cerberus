@@ -29,7 +29,6 @@ package ninep
 import (
 	"fmt"
 	"io"
-	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -83,7 +82,7 @@ func mount(cfg MountConfig) error {
 	adapter := newWinfsAdapter(cfg.NS, cfg.Cap, root)
 	host := fuse.NewFileSystemHost(adapter)
 
-	if err := registerMount(cfg.Mountpoint, &mountedHost{host: host, client: cl, closer: closer}); err != nil {
+	if err := registerMount(cfg.Mountpoint, &mountedHost{host: host, client: cl, closer: closer, mountpoint: cfg.Mountpoint}); err != nil {
 		_ = closer()
 		return err
 	}
@@ -142,50 +141,29 @@ func panicToMountError(r interface{}) error {
 	return contract.Errf(contract.ErrPartitioned, fmt.Sprintf("mount: cgofuse panicked: %v", r))
 }
 
-// mountedHost tracks a live mount so Unmount can find and tear it down.
+// mountedHost tracks a live mount so Unmount can find and tear it down. It is
+// the Windows implementation of mount.go's mountHandle; the registry itself
+// (registerMount/unregisterMount/unmountRegistered) is shared with the other
+// platforms in mount.go.
 type mountedHost struct {
-	host   *fuse.FileSystemHost
-	client *p9.Client
-	closer func() error
+	host       *fuse.FileSystemHost
+	client     *p9.Client
+	closer     func() error
+	mountpoint string
 }
 
-var (
-	mountsMu sync.Mutex
-	mounts   = map[string]*mountedHost{}
-)
-
-func registerMount(mountpoint string, h *mountedHost) error {
-	mountsMu.Lock()
-	defer mountsMu.Unlock()
-	if _, exists := mounts[mountpoint]; exists {
-		return contract.Errf(contract.ErrDenied, "mount: "+mountpoint+" is already mounted by this process")
+// unmount detaches the cgofuse host and releases the 9P client behind it.
+func (h *mountedHost) unmount() error {
+	if !h.host.Unmount() {
+		return contract.Errf(contract.ErrPartitioned, "unmount: cgofuse Unmount() reported failure for "+h.mountpoint)
 	}
-	mounts[mountpoint] = h
+	_ = h.closer()
 	return nil
-}
-
-func unregisterMount(mountpoint string) {
-	mountsMu.Lock()
-	defer mountsMu.Unlock()
-	delete(mounts, mountpoint)
 }
 
 // unmount is the Windows entry point for Unmount (see mount.go).
 func unmount(cfg MountConfig) error {
-	mountsMu.Lock()
-	h, ok := mounts[cfg.Mountpoint]
-	if ok {
-		delete(mounts, cfg.Mountpoint)
-	}
-	mountsMu.Unlock()
-	if !ok {
-		return contract.Errf(contract.ErrDenied, "unmount: "+cfg.Mountpoint+" is not mounted by this process")
-	}
-	if !h.host.Unmount() {
-		return contract.Errf(contract.ErrPartitioned, "unmount: cgofuse Unmount() reported failure for "+cfg.Mountpoint)
-	}
-	_ = h.closer()
-	return nil
+	return unmountRegistered(cfg.Mountpoint)
 }
 
 // --- FileSystemInterface adapter -------------------------------------------
@@ -227,27 +205,6 @@ type openHandle struct {
 }
 
 const invalidFh = ^uint64(0)
-
-// components splits a FUSE path ("/", "/dev", "/dev/vram/AA/0/ctl") into the
-// name components p9.File.Walk expects, relative to the attached /cer root.
-func components(fusePath string) []string {
-	clean := path.Clean("/" + fusePath)
-	if clean == "/" {
-		return nil
-	}
-	return strings.Split(strings.TrimPrefix(clean, "/"), "/")
-}
-
-// nsPath rebuilds the full namespace path (e.g. "/cer/dev/vram/AA/0/ctl") a
-// FUSE path corresponds to, for calling ListChildren (which, like the rest of
-// the Server API, takes namespace-rooted paths, not FUSE-relative ones).
-func nsPath(fusePath string) string {
-	names := components(fusePath)
-	if len(names) == 0 {
-		return rootPath
-	}
-	return rootPath + "/" + strings.Join(names, "/")
-}
 
 // walk resolves a FUSE path against the namespace root over the live 9P
 // client connection — the same capability-checked Walk wire.go's node.Walk
@@ -469,23 +426,6 @@ func (a *winfsAdapter) Read(fusePath string, buff []byte, ofst int64, fh uint64)
 		return 0
 	}
 	return copy(buff, h.data[ofst:])
-}
-
-func readAllFrom(f p9.File) ([]byte, error) {
-	var out []byte
-	buf := make([]byte, 4096)
-	var off int64
-	for {
-		n, err := f.ReadAt(buf, off)
-		out = append(out, buf[:n]...)
-		off += int64(n)
-		if err == io.EOF || n == 0 {
-			return out, nil
-		}
-		if err != nil {
-			return out, err
-		}
-	}
 }
 
 // Write writes to an opened /cer/fs file. This forwards to the 9P client's

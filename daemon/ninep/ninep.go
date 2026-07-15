@@ -210,11 +210,31 @@ func (s *Server) check(cap contract.CapHandle, op string, ref contract.ResourceR
 	return s.kernel.Verify(cap, contract.Request{Op: op, Resource: ref}, s.now)
 }
 
-// Walk resolves a path, gated by a read capability on the owning device.
+// Walk resolves a path to a REGISTERED DEVICE DIRECTORY, gated by a read
+// capability on that device. path must name the device directory itself (e.g.
+// "/cer/dev/vram/AA/0"), not a path beneath it.
+//
+// The exact match is load-bearing. Walk deliberately does NOT use deviceFor,
+// which prefix-matches because Open/ReadInfo are handed ".../ctl" / ".../info"
+// and must find the owning device. Resolving Walk that way meant any invented
+// name under a registered device ("/cer/dev/vram/AA/0/secret") matched that
+// device, passed its read check, and resolved — and wire.go's node.Walk then
+// classified the non-leaf name as a directory, so every device sprouted an
+// infinite tree of phantom subdirectories. That was visible from any shell once
+// the namespace was mounted (`cat <mnt>/dev/vram/AA/0/secret` answered "Is a
+// directory" instead of ENOENT). The namespace's only real paths are structural
+// ancestors (IsAncestorDir), registered device dirs (here), their ctl/info
+// leaves (Open/ReadInfo), and /cer/fs (WalkFS) — anything else must not resolve,
+// which is what wire.go's default branch already documented. See
+// TestWalkDeniesPhantomPathsUnderADevice.
+//
+// Callers that need the leaf paths go through Open/ReadInfo; wire.go's node.Walk
+// checks a leaf by calling this with the leaf's PARENT (the device dir), so the
+// exact match is what both call sites already want.
 func (s *Server) Walk(path string, cap contract.CapHandle) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ref, ok := s.deviceFor(path)
+	ref, ok := s.devices[strings.TrimRight(path, "/")]
 	if !ok {
 		return contract.Errf(contract.ErrDenied, "no such path: "+path)
 	}
