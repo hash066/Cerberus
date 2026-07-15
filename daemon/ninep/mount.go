@@ -33,18 +33,24 @@ type MountConfig struct {
 // is live, or a specific *contract.CapError describing exactly why it is not.
 // Call Unmount to tear it down.
 //
-// Windows (mount_windows.go): REAL, via github.com/winfsp/cgofuse against the
-// WinFsp driver. Linux (mount_linux.go): REAL, via github.com/hanwen/go-fuse,
-// which talks the FUSE protocol to /dev/fuse directly in PURE GO — no cgo, no
-// libfuse, preserving this repo's CGO_ENABLED=0 default build. Both dial the
-// namespace with DialCap, so every callback re-enters the SAME
-// capability-checked Walk/Open path wire.go enforces for network peers.
+// Which builds get a real mount (the tag matrix lives in mount_unsupported.go):
 //
-// Other platforms (mount_unsupported.go) remain a documented stub that names
-// precisely what is missing (CLAUDE.md "Maturity honesty"). If the platform's
-// kernel driver is simply not installed on this host, Mount fails fast with an
-// actionable error rather than a generic failure, a raw panic, or a
-// silently-faked success.
+//   - Windows WITHOUT cgo (mount_windows.go): REAL, via github.com/winfsp/cgofuse's
+//     nocgo binding against the WinFsp driver. This is the repo's default build.
+//   - Windows WITH cgo: the documented stub — not because the mount is missing,
+//     but because cgofuse's cgo variant would need the WinFsp SDK's headers at
+//     compile time. Build without cgo to get the real thing.
+//   - Linux (mount_linux.go), cgo or not: REAL, via github.com/hanwen/go-fuse,
+//     which talks the FUSE protocol to /dev/fuse directly in PURE GO — no cgo, no
+//     libfuse. Nothing to install: fuse is in the mainline kernel.
+//   - macOS/BSD: the documented stub (see mountUnsupportedMsg).
+//
+// Every real mount dials the namespace with DialCap, so each callback re-enters
+// the SAME capability-checked Walk/Open path wire.go enforces for network peers.
+//
+// When a platform's kernel driver is simply not installed on this host, Mount
+// fails fast with an actionable error naming it (CLAUDE.md "Maturity honesty")
+// rather than a generic failure, a raw panic, or a silently-faked success.
 func Mount(cfg MountConfig) error {
 	return mount(cfg)
 }
