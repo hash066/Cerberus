@@ -4,6 +4,7 @@ go 1.25.7
 
 require (
 	github.com/go-ole/go-ole v1.2.6
+	github.com/hanwen/go-fuse/v2 v2.10.1
 	github.com/hugelgupf/p9 v0.4.1
 	github.com/ipfs/go-cid v0.6.1
 	github.com/ipld/go-ipld-prime v0.24.0
