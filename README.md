@@ -1,464 +1,255 @@
 # Cerberus
 
-**A zero-trust, masterless distributed hypervisor for your own machines.**
+**A zero-trust distributed hypervisor for the machines you already own.**
 
-Launch one small daemon on each Mac, PC, or Linux box you own. They discover each
-other on your LAN with zero configuration and become a single private mesh that
-runs sandboxed workloads — where software can only touch a resource if it holds an
-unforgeable **capability** for it. No master node, no cloud account, no ambient
-authority.
+Install one daemon on each of your Windows/Mac/Linux boxes. They discover each
+other on your LAN and become a single mesh where **everything is a
+capability-gated device**: run sandboxed WASM on a peer's CPU, dispatch a compute
+kernel to a peer's GPU, store files erasure-coded across everyone's disks, stream
+your microphone to another machine's speaker — every one of those actions
+presents an unforgeable, signed, revocable capability. No master node, no cloud
+account, no passwords, no ambient authority.
 
 <p>
-  <img alt="status: v0.1" src="https://img.shields.io/badge/status-v0.1-blue">
+  <img alt="status: v0.1 beta" src="https://img.shields.io/badge/status-v0.1%20beta-blue">
   <img alt="Go 1.22+" src="https://img.shields.io/badge/Go-1.22%2B-00ADD8">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-orange">
-  <img alt="platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey">
+  <img alt="platforms" src="https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="license" src="https://img.shields.io/badge/license-TBD-lightgrey">
 </p>
 
-## Why Cerberus
-
-- **Masterless & zero-config** — nodes auto-discover over mDNS on the LAN and
-  coordinate directly over libp2p/QUIC. Any node can drop without killing the mesh.
-- **Zero-trust by construction** — no passwords or roles. Every action presents an
-  Ed25519 capability you can narrow, delegate, and revoke; revocations gossip
-  mesh-wide and survive restart.
-- **Heterogeneous by default** — workloads compile to **WebAssembly** components,
-  so an ARM Mac and an x86 PC run the same shard. No cross-compiling native binaries.
-- **OpenAI-compatible gateway** — point any OpenAI SDK at `http://localhost:8080/v1`
-  with your token and dispatch compute to the mesh.
-- **Two profiles, one binary** — `open_mesh` (compute economy on) and `sealed`
-  (economy off, attestation on), a boot-time switch.
-
-> **Maturity, honestly.** v0.1 has a real capability kernel, real WASM execution, a
-> real libp2p/QUIC mesh, durable state, and a working gateway path. Hardware/OS
-> edges (GPU dispatch, FUSE/WinFsp mounts, OS audio capture, the Tauri GUI) and
-> Frontier bets (zk-WASM, host-TEE, RDMA) are **documented stubs, never faked**.
-> See [VISION-AND-ROADMAP.md](VISION-AND-ROADMAP.md).
+If you know [exo](https://github.com/exo-explore/exo): exo pools your devices to
+serve an LLM, and it is good at that. Cerberus is a different category — it pools
+the **machines themselves** (compute, GPU, storage, audio) behind an
+object-capability security model, so you can safely hand pieces of your hardware
+to other people and to AI agents. [Comparison below.](#cerberus-vs-exo)
 
 ---
 
-## 5-minute Quickstart
+## What works today (v0.1 beta — honest)
 
-**Prerequisites:** Go 1.22+ (required). Rust/cargo recommended. The default build
-is pure-Go — no C toolchain needed.
+Everything in the **Real** column runs today and is exercised by tests or an
+e2e harness in this repo. Nothing below is aspirational; the linked code is the
+claim.
+
+| Capability | Status | Where |
+|---|---|---|
+| Masterless mesh: mDNS auto-discovery on LAN + explicit `--peer` bootstrap (Tailscale/WireGuard across networks) | **Real** | `daemon/mesh`, `cmd/cerberusd` |
+| Capability kernel: Ed25519 signed tokens — mint, attenuate, revoke; revocations gossip mesh-wide and survive restart | **Real** | `daemon/auth`, `core/ocap` |
+| Remote WASM execution: `cerberus run x.wasm --on <peer>` in a deny-by-default sandbox (wazero), content-addressed (CID) | **Real** | `cmd/cerberusd/rpc.go`, `daemon/compute`, `daemon/wasm` |
+| 9P device namespace: `/cer/dev/{gpu,cpu,vram,audio}`, `/cer/fs` — walk/open is capability-checked; opening a device `ctl` mints a QUIC data-plane grant | **Real** | `daemon/ninep`, `daemon/system/system.go` |
+| QUIC data plane with mutual TLS + PeerID pinning; bulk bytes never ride the control plane | **Real** | `daemon/dataplane` |
+| GPU kernel dispatch, local **and** cross-node (`cerberus gpu … --on <peer>`), gated by a signed exec capability | **Real** | `daemon/gpu`, `daemon/mesh/gpu.go` |
+| Physical-GPU backend (wgpu → Vulkan/DX12/Metal) | **Partial** — from-source build (`task build:gpu`); default binaries compute on CPU and honestly report `backend: cpu-software` | `core/runtime`, [docs/gpu.md](docs/gpu.md) |
+| Pipeline-parallel inference across nodes: scheduler places layer shards on peers, activations hand off over the QUIC data plane | **Real** (split-MLP fixture model) | `daemon/system/pipeline.go`, `test/pipeline_e2e` |
+| LLM engines (llama.cpp, MLX) | **Partial** — engine seams + sidecars exist and report `llamacpp-mock`/`mlx-mock` unless you wire real weights; this is **not** an LLM-serving product yet | `daemon/inference` |
+| Cross-node audio: your mic → a peer's speaker (`cerberus audio play --on <peer>`), capability-gated, WASAPI | **Real** (Windows; other OS backends not yet) | `daemon/audio`, `daemon/audiolink` |
+| Distributed filesystem `/cer/fs`: Reed-Solomon erasure coding, shards scattered to peers, write on node A / read on node B | **Real** (CLI/9P access; no OS drive-letter mount yet) | `daemon/dfs`, `daemon/system` |
+| Telemetry-driven placement + lid-drop reroute (sleep imminent → checkpoint → promote standby) | **Real** (baseline) | `daemon/scheduler`, `daemon/lifecycle` |
+| OpenAI-compatible gateway (`/v1/chat/completions` incl. SSE streaming, `/v1/models`) — Bearer capability token required | **Real** surface; models are WASM shards + pipeline fixtures, not hosted LLMs | `daemon/gateway` |
+| MCP server: Claude Code / Cursor drive the mesh (12 tools: run workloads, list nodes, mint/revoke caps, …) | **Real** | `cmd/cerberus-mcp`, [docs/mcp.md](docs/mcp.md) |
+| Desktop tray app (Tauri v2): bundles + auto-starts the daemon, dashboard for nodes/devices/workloads/wallet/conflicts | **Real** (installers unsigned — beta) | `tray/` |
+| CRDT agent memory with belief-conflict surfacing (contradictions go to a human, never silent last-writer-wins) | **Real** | `daemon/state`, `core/crdt` |
+| Compute economy: durable ledger, per-run transaction log, fraud-proof `challenge` that slashes | **Partial** — usage accounting only, **no real value moves** | `daemon/ledger`, `daemon/economy` |
+| zk-WASM proof-of-inference | **Stub** — documented design, not implemented | [ARCHITECTURE.md §8](ARCHITECTURE.md) |
+| RDMA-over-Thunderbolt data plane | **Stub** — documented design, not implemented | [ARCHITECTURE.md §8](ARCHITECTURE.md) |
+| TEE memory shielding (TDX/SEV/Enclave) | **Stub** — documented design, not implemented | [ARCHITECTURE.md §8](ARCHITECTURE.md) |
+
+The rule this repo is built under ([CLAUDE.md](CLAUDE.md)): a feature either
+works or tells you it isn't wired — nothing is faked. The GPU command prints the
+backend that *actually* ran your kernel; the inference backends report
+`-mock` suffixes when they mock; unsigned installers say so.
+
+---
+
+## 60-second quickstart (one machine)
+
+**From a release** (Windows): grab either asset from the
+[latest release](https://github.com/hash066/Cerberus/releases/latest) —
+the `.msi` installer (tray app, daemon auto-starts) or the CLI zip
+`cerberus_<version>_windows_amd64.zip` (unzip, then run `cerberusd.exe`
+yourself). Installers are unsigned for now: SmartScreen → **More info → Run
+anyway**.
+
+**From source** (any OS, Go 1.22+ — the default build is pure Go, no C
+toolchain):
 
 ```bash
-# 1. Clone and build
 git clone https://github.com/hash066/Cerberus.git
 cd Cerberus
-go build ./...            # or: task build
 
-# 2. Prove it works end-to-end: two daemons discover each other and run a
-#    WASM shard remotely (prints "... returned 1337.")
-go run ./test/e2e        # or: task demo
+# Prove the whole thing end-to-end first: two daemons form a mesh and one
+# executes a WASM shard for the other (prints "... returned 1337").
+go run ./test/e2e
 
-# 3. Start the daemon (leave it running)
+# Now run a real daemon (leave it running; it writes an operator
+# capability token to your OS config dir — the CLI picks it up automatically)
 go run ./cmd/cerberusd
-#   → serves gateway :8080, status API 127.0.0.1:7777,
-#     metrics 127.0.0.1:7779, RPC 127.0.0.1:9092
-#   → writes an operator token to your OS config dir
 ```
 
-In a **second terminal**, load the operator token and talk to the daemon:
+In a second terminal:
 
 ```bash
-# Load the token the daemon wrote (Linux/macOS shown; see docs for Windows)
-export CERBERUS_TOKEN="$(cat ~/.config/cerberus/operator.token)"
-
-# Check status (talks RPC on :9092)
-go run ./cmd/cerberus status
-#   Cerberus Daemon Status
-#   Version: 0.1.0
-#   State:   Running (Power: AC, Battery: 100.0%)
-#   Auth:    authenticated as "operator"
-
-# Call the OpenAI-compatible gateway (Bearer token required)
-curl -sS http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer $CERBERUS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"cerberus-shard","messages":[{"role":"user","content":"hello"}]}'
-
-# View health + metrics
-curl -sS http://127.0.0.1:7779/healthz                        # → ok
-curl -sS http://127.0.0.1:7779/metrics -H "Authorization: Bearer $CERBERUS_TOKEN"
+go run ./cmd/cerberus status      # daemon health, identity, mesh, balance
+go run ./cmd/cerberus devices     # the capability-gated 9P device namespace
+go run ./cmd/cerberus gpu vector-add 1,2,3 4,5,6
+#   vector-add(a,b) = [5 7 9]
+#   backend: cpu-software         <- honest: no GPU build, real CPU compute
+go run ./cmd/cerberus fs put README.md && go run ./cmd/cerberus fs ls
+go run ./cmd/cerberus pipeline-run   # layer-split inference; prints where each stage ran
 ```
 
-**Add a second node:** run `go run ./cmd/cerberusd` on another machine on the same
-LAN. Within seconds they discover each other — confirm via the `peers` array:
-
-```bash
-curl -sS http://127.0.0.1:7777/api/v1/status -H "Authorization: Bearer $CERBERUS_TOKEN"
-#   → "mesh_up": true, "peers": ["<peer addr>", ...]
-```
-
-> The gateway in v0.1 dispatches through the **real WASM executor**, but the wired
-> component is the demo shard — the request/response *shape* is genuine OpenAI, the
-> *model* behind it is not yet an LLM. See [docs/gateway.md](docs/gateway.md).
-
-Full walkthrough (operator token per-OS, profiles, troubleshooting):
-**[docs/getting-started.md](docs/getting-started.md)**.
+**Two machines is the point** — remote WASM exec, dispatching kernels to a
+peer's GPU, files written on A read on B, your mic on B's speaker:
+**[QUICKSTART.md](QUICKSTART.md)** has the exact copy-paste steps (LAN and
+Tailscale).
 
 ---
+
+## How it fits together
+
+```
+        you                          your AI agents
+  ┌───────────┐ ┌──────────┐   ┌──────────────┐ ┌─────────────────────┐
+  │ cerberus  │ │ tray app │   │ cerberus-mcp │ │ any OpenAI SDK      │
+  │   (CLI)   │ │ (Tauri)  │   │(Claude/Cursor)│ │ base_url=:8080/v1  │
+  └─────┬─────┘ └────┬─────┘   └───────┬──────┘ └──────────┬──────────┘
+        └────────────┴─── every call presents a capability token ──┘
+                             │
+  ┌──────────────────────────▼───────────────────────────────────────┐
+  │                      cerberusd  (Go daemon)                       │
+  │                                                                   │
+  │  OCap kernel (Rust): Ed25519 caps — mint / attenuate / revoke,    │
+  │      revocation gossip mesh-wide, issuer key in the OS keychain   │
+  │  wazero WASM sandbox · telemetry-driven scheduler · CRDT memory   │
+  │  9P namespace:  /cer/dev/{gpu,cpu,vram,audio}   /cer/fs           │
+  │      (walk/open is cap-checked; opening ctl mints a data grant)   │
+  └───────┬───────────────────────────────────────────┬───────────────┘
+          │ CONTROL: libp2p/QUIC                      │ DATA: QUIC
+          │ mDNS discovery, signed caps,              │ mTLS, PeerID-pinned
+          │ small messages only                       │ tensors/files/audio
+  ┌───────▼─────────┐        ┌─────────────────┐     ▼
+  │ cerberusd       │  ...   │ cerberusd       │  (bulk bytes never
+  │ (your other PC) │        │ (friend's box)  │   touch the control plane)
+  └─────────────────┘        └─────────────────┘
+```
+
+Three design decisions carry the system
+([ARCHITECTURE.md](ARCHITECTURE.md) is the full spec):
+
+1. **Capabilities, not identities.** There are no user accounts and no ACLs.
+   To touch a resource you present a signed token that names exactly that
+   resource and rights; you can hand a narrower copy to someone else
+   (`cerberus caps attenuate`) and kill the whole chain later
+   (`cerberus caps revoke`, gossiped to every node).
+2. **Control plane ≠ data plane.** Discovery, grants, and scheduling ride
+   libp2p/QUIC as small signed messages. File shards, activations, and audio
+   frames ride a separate mTLS QUIC data plane that a control-plane grant
+   unlocks. Opening `/cer/dev/gpu/<peer>/0/ctl` returns a data-plane endpoint,
+   never bytes.
+3. **WASM as the unit of compute.** Workloads are WebAssembly, so an ARM Mac
+   and an x86 PC run the same bytes, and the sandbox is the deny-by-default
+   import set — a guest literally cannot name a resource it wasn't granted.
+
+---
+
+## Cerberus vs exo
+
+[exo](https://github.com/exo-explore/exo) is the obvious comparison and it's a
+good project — if your goal is "run a big LLM across my Macs tonight," use exo;
+its model-parallel LLM serving is real and that is its entire focus. Cerberus
+is a bet one layer down: that the interesting primitive is not a shared model
+but a shared, *securable* machine.
+
+| | exo | Cerberus |
+|---|---|---|
+| Pools | Your devices' memory/compute to serve **one model** | The machines themselves: WASM compute, GPU kernels, files, mic/speaker |
+| LLM inference today | **Real, its core strength** (Llama et al., model-parallel) | Honest beta: cross-node pipeline orchestration is real, but over a fixture model; llama.cpp/MLX are engine seams with labelled mocks |
+| Trust between nodes | Trusted-LAN assumption | Zero-trust: every cross-node call carries a signed, attenuable, revocable Ed25519 capability |
+| Workload isolation | Python processes | WASM sandbox; imports are the security boundary |
+| Peripheral sharing | — | 9P namespace: a peer's GPU/CPU/audio/fs as mountable, quota'd devices |
+| Delegation / revocation | — | First-class: `caps mint/attenuate/revoke`, revocation gossip |
+| Agent surface | ChatGPT-compatible API | OpenAI-compatible gateway **+ MCP server** (agents hold scoped caps, not admin) |
+| Platform center of gravity | macOS / Apple Silicon, Linux | Windows-first beta (tray, WASAPI audio); macOS/Linux build from the same tree |
+| Stack | Python | Go control plane + Rust capability kernel, static binaries |
+
+Different question, different tool: exo asks *"how do I fit a 70B model on my
+devices?"* Cerberus asks *"how do I safely let anything — friends' machines, my
+own agents — use my hardware at all?"*
+
+---
+
+## Interfaces
+
+Four ways to drive the same capability-gated daemon:
+
+- **CLI** — `cerberus status | run | pipeline-run | nodes | devices | fs | gpu |
+  audio | caps | wallet | conflicts | economy | metrics | doctor`
+  ([docs/cli.md](docs/cli.md))
+- **Tray app** — install-and-forget dashboard; bundles and auto-starts the
+  daemon ([tray/](tray/))
+- **MCP** — point Claude Code or Cursor at `cerberus-mcp` and your agent can
+  discover nodes, run workloads, and mint/revoke capabilities — with a token
+  you can scope down ([docs/mcp.md](docs/mcp.md))
+- **OpenAI-compatible HTTP** — `base_url=http://localhost:8080/v1` with a
+  Bearer capability token ([docs/gateway.md](docs/gateway.md))
 
 ## Documentation
 
 | Doc | What it covers |
 |---|---|
-| **[Getting Started](docs/getting-started.md)** | install/build, first run, the operator token, profiles, a 2nd node, first workload, troubleshooting |
-| **[CLI Reference](docs/cli.md)** | every `cerberus` command with examples and output |
-| **[Gateway API](docs/gateway.md)** | the OpenAI-compatible API — curl + Python `openai` client, endpoints, errors |
-| **[User Guide](docs/user-guide.md)** | capabilities & security model, the two profiles, peripheral pooling, the desktop app, the economy |
-| **[Architecture](ARCHITECTURE.md)** | the canonical system specification (Volume II) |
-| **[Vision & Roadmap](VISION-AND-ROADMAP.md)** | where it's going, what's real vs stub, ownership |
-| **[Handoff](HANDOFF.md)** | the deep technical "where things actually stand" |
-| **[Contributing conventions](CLAUDE.md)** | build rules, lanes, the frozen contract |
+| **[QUICKSTART.md](QUICKSTART.md)** | two Windows machines, LAN + Tailscale, every cross-node feature |
+| **[TESTERS.md](TESTERS.md)** | beta-tester guide: install, solo tour, honest status table |
+| **[Getting Started](docs/getting-started.md)** | build from source, operator token, profiles, troubleshooting |
+| **[CLI Reference](docs/cli.md)** | every `cerberus` command with examples |
+| **[Gateway API](docs/gateway.md)** | the OpenAI-compatible surface |
+| **[MCP server](docs/mcp.md)** | wiring Claude Code / Cursor to the mesh |
+| **[GPU](docs/gpu.md)** | the honest backend model + the real-GPU (wgpu) build |
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | canonical spec: schemas, invariants, maturity matrix (§8) |
+| **[Vision & Roadmap](VISION-AND-ROADMAP.md)** | where this goes; what's real vs stub, by name |
+| **[docs/verticals/](docs/verticals/)** | 11 low-level designs (ocap kernel, mesh, CRDT, 9P, economy, …) |
+| **[CLAUDE.md](CLAUDE.md)** | build conventions incl. the maturity-honesty rule |
+
+Historical: the original narrative spec ("Volume I") is preserved at
+[docs/research/volume-1-original-spec.md](docs/research/volume-1-original-spec.md).
 
 ## Repository layout
 
 ```
-cmd/        cerberusd (daemon), cerberus (CLI)
-daemon/     Go control plane: auth gateway api mesh scheduler ninep dataplane
-            audio telemetry metrics lifecycle economy ledger state store system
-core/       Rust core: ocap crdt runtime identity economy cabi (C-ABI for cgo)
-contract/   frozen integration types (Go + Rust)  — do not edit casually
-proto/ components/wit/ schemas/   frozen contract sources
+cmd/        cerberusd (daemon) · cerberus (CLI) · cerberus-mcp (MCP server)
+daemon/     Go control plane: mesh scheduler ninep dataplane gateway auth
+            dfs audio inference system state ledger economy telemetry metrics
+core/       Rust: ocap kernel · wasmtime runtime · crdt · identity · economy · cabi (FFI)
+contract/   frozen integration types (Go + Rust)      [do not edit casually]
+proto/ components/wit/ schemas/                        [frozen contract sources]
 tray/       Tauri v2 desktop app
-test/e2e    2-process acceptance demo (prints 1337)
-docs/       getting-started, cli, gateway, user-guide, verticals/, ARCHITECTURE refs
+test/       e2e harnesses: 2-node WASM exec · pipeline · LLM pipeline · peripherals · chaos · load
+build/      release packaging, FFI/GPU build scripts, CI helpers
 ```
 
-## Commands
+## Build & test
 
 ```bash
-task build   # build Go + Rust   (raw: go build ./... && cargo build)
-task test    # unit tests        (raw: go test ./... && cargo test)
-task demo    # 2-node WASM-exec acceptance demo (raw: go run ./test/e2e)
+task build   # Go + Rust        (raw: go build ./... && cargo build)
+task test    # unit tests       (raw: go test ./... && cargo test)
+task demo    # 2-node mesh + remote WASM exec acceptance (raw: go run ./test/e2e)
 task lint    # golangci-lint + clippy
+task build:gpu   # Windows: daemon with the real wgpu GPU backend (docs/gpu.md)
 ```
 
-If `task` isn't installed: `go install github.com/go-task/task/v3/cmd/task@latest`,
-or run the raw commands shown above / in [Taskfile.yml](Taskfile.yml).
-
----
-
-<details>
-<summary><strong>Volume I — the original P2P hyper-computer spec</strong> (historical; the canonical spec is now <a href="ARCHITECTURE.md">ARCHITECTURE.md</a>)</summary>
-
-> **Note:** The section below is the original narrative specification, retained for
-> provenance. The hardened, zero-trust production spec is
-> [ARCHITECTURE.md](ARCHITECTURE.md) (canonical); the narrative debate and
-> Go-To-Market live in [docs/research/ideadumpp2.md](docs/research/ideadumpp2.md),
-> with per-vertical deep dives under [docs/verticals/](docs/verticals/).
-
-# Project Cerberus (Voltron): Production-Grade Architecture & Technical Specification
-
-This document provides the absolute, exhaustive architectural layout, technical stack selection, protocol specifications, implementation map, and edge-case mitigations for **Project Cerberus**—a decentralized, peer-to-peer (P2P), zero-configuration distributed framework designed to aggregate heterogeneous hardware resources into a unified, virtual hyper-computer.
-
----
-
-## 1. Executive Summary & Vision
-
-Project Cerberus treats any local computing resource—whether an Apple Silicon M-series MacBook, a high-end Windows gaming rig, a headless Linux server, or an iOS/Android mobile device—not as isolated environments, but as fluid pools of execution threads, VRAM/RAM pages, block storage, and peripheral IO channels.
-
-### The Problem With Modern Solutions
-
-Traditional distributed engines (Kubernetes, Ray, Spark) rely on homogeneous assumptions, static network configurations, or central master nodes. If the master drops, the cluster dies. If hardware platforms differ (ARM vs. x86), binaries break. Emerging AI-specific mesh frameworks solve model sharding well but neglect general-purpose computing pipelines, unified distributed file systems, and real-time peripheral hardware virtualization.
-
-### The Cerberus Thesis
-
-By leveraging a P2P overlay network, WebAssembly sandboxing for target-agnostic general computing, and low-level kernel abstractions (FUSE, PipeWire, CoreAudio), Cerberus achieves a true plug-and-play distributed hyper-computer.
-
----
-
-## 2. Architectural Deep-Dive: The 5 Engineering Verticals
-
-```
-=============================================================================================
-                                    CERBERUS CORE DAEMON
-=============================================================================================
-         │                        │                       │                        │
-         ▼                        ▼                       ▼                        ▼
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│    VERTICAL 1    │    │    VERTICAL 2    │    │    VERTICAL 3    │    │    VERTICAL 4    │
-│  P2P Network &   │    │Resource Profiling│    │ Execution Engine │    │    Peripheral    │
-│  Auto-Discovery  │    │& Topology Matrix │    │& Compute Sharding│    │  Virtualization  │
-└────────┬─────────┘    └────────┬─────────┘    └────────┬─────────┘    └────────┬─────────┘
-         │                       │                       │                       │
-         ├───────────────────────┴───────────────────────┴───────────────────────┤
-         ▼                                                                        ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│                       VERTICAL 5: USER DASHBOARD & EXTENSIBLE API LAYERS                 │
-└──────────────────────────────────────────────────────────────────────────────────────────┘
-
-```
-
-### 🌐 Vertical 1: P2P Networking & Auto-Discovery
-
-The discovery plane must function with zero explicit configuration. When a new device boots Cerberus on a local subnet, it integrates into the mesh completely autonomously.
-
-```
-[New Node] ──(mDNS Multicast)──> [Discovers Local Mesh] ──(QUIC Handshake)──> [Establishes Mutual TLS]
-    │                                                                                   │
-    └─────────────────── <─── Updates Global Mesh Topology (Gossipsub) ─────────────────┘
-
-```
-
-#### Discovery Mechanics
-
-* **mDNS / UDP Broadcast:** The core daemon listens on standard multicast addresses (`224.0.0.251` or `ff02::fb` over port `5353`) via a specialized service identifier (`_cerberus._tcp`).
-* **Bootstrap Handshake:** Once an IP and port pair are discovered, nodes switch to an encrypted **QUIC transport layer**. Mutual TLS (mTLS) certificates are generated on-the-fly via localized, self-signed ephemeral keys tied to the node's unique cryptographically derived PeerID.
-* **P2P Topology:** Utilizing a Kademlia-inspired DHT (Distributed Hash Table) customized for low-latency local area subnets, nodes maintain an updated map of all peers.
-* **Consensus & Fault Tolerance:** There is no master server. Coordination uses a decentralized state validation loop. If an active coordinator node drops, a raft-based or high-throughput bully election algorithm identifies a replacement in less than 200ms without canceling existing compute tasks.
-
----
-
-### 📊 Vertical 2: Resource Profiling & Topology Mapping
-
-Before routing a task, the framework maps out the operational limits of every hardware component and interconnect link in the cluster.
-
-```
-+---------------------------------------------------------------------------------+
-|                               CERBERUS NODE MAP                                 |
-+-----------------------+---------------------------------+-----------------------+
-|  Node A (MacBook Pro) | <=== 40Gbps Thunderbolt Mesh ===>| Node B (Windows PC)   |
-|  - 64GB Unified RAM   |                                 | - 32GB DDR5 / 16GB VRAM|
-|  - M3 Max 16-Core CPU | <======== 1Gbps Wi-Fi 6 =======>| - Core i9 / RTX 4090  |
-+-----------------------+---------------------------------+-----------------------+
-
-```
-
-#### Metrics Telemetry
-
-Every node executes a background profiling module measuring:
-
-* **Compute Matrix:** Total hardware core count (Performance vs. Efficiency cores), thermal dissipation headroom, active instructions per cycle (IPC), explicit NPU execution targets, and raw floating-point operations per second (FLOPS).
-* **Memory Matrix:** Total capacity, available swap pages, allocation velocity, and explicit GPU VRAM availability.
-* **Interconnect Matrix:** Passive and active bandwidth monitoring. The framework maps precise network paths between Node A and Node B. It detects if nodes share an ultra-low latency physical medium (such as a 40Gbps Thunderbolt cable) or are crossing a fluctuating wireless path (Wi-Fi 5 vs. Wi-Fi 6/7), dynamically structuring the maximum transmission unit (MTU) to prevent packet fragmentation.
-
----
-
-### ⚡ Vertical 3: Execution Engine & Compute Sharding
-
-Cerberus features a dual-execution layer optimized for both structural machine learning models and general-purpose computational logic.
-
-#### AI Workloads & Model Parallelism
-
-* **Tensor Splitting:** When dealing with model sizes that eclipse single-device limitations (e.g., a 70 Billion parameter model requiring 140GB of unquantized float16 memory across four 32GB laptops), Cerberus applies **Pipeline Parallelism**.
-* **Layer Partitioning:** The engine groups neural layers based on localized VRAM limits. Node A caches layers 1–20, Node B caches 21–40, and Node C caches 41–60.
-* **Context Activation Handoff:** Activations are passed over the QUIC streams sequentially. To reduce transport latency, tensors are packed using high-performance zero-copy serialization and compressed dynamically via customized Zstandard (zstd) dictionaries based on network link performance.
-
-#### General Compute & WebAssembly Sandboxing
-
-To safely run arbitrary user loops (such as image filtering arrays or mathematical simulations) across different OS platforms without cross-compilation errors, Cerberus wraps execution tasks into deterministic **WebAssembly (WASM)** modules. The runtime safely targets any host architecture via a unified compilation engine, translating abstract computations directly into native machine instructions at execution time.
-
----
-
-### 🎙️ Vertical 4: Peripheral Virtualization
-
-This vertical abstracts local physical I/O devices into distributed network endpoints, turning separate hardware pieces into elements of a unified system.
-
-#### Distributed Virtual Filesystem (Storage Pooling)
-
-Cerberus creates a user-space file system (via FUSE or project-specific drivers) mapped to a specified directory (e.g., `/mnt/cerberus`).
-
-```
-[User writes 100MB File to /mnt/cerberus]
-                   │
-                   ▼
-       [Cerberus Block Splitter]
-                   │
-       ┌───────────┼───────────┐
-       ▼           ▼           ▼
-   [Block 1]   [Block 2]   [Block 3] (2-Pass Reed-Solomon Parity)
-       │           │           │
-       ▼           ▼           ▼
-   (Node A)    (Node B)    (Node C)
- (Mac SSD)   (Win NVMe)  (Android SD)
-
-```
-
-Files written here are split into variable block sizes, passed through an inline erasure-coding filter (such as Reed-Solomon algorithms), and distributed redundantly across the unused NVMe, SSD, or micro-SD storage profiles available on all connected devices.
-
-#### Synchronized Audio Virtualization
-
-* **Input Capture (Mics):** Captures multi-device microphone signals through low-level hooks (CoreAudio/PipeWire), feeding them into an operational pool for spatial audio configurations or collaborative noise isolation.
-* **Output Capture (Speakers):** Sound output is split into low-latency network packets. Utilizing precise Network Time Protocol (NTP) adjustments synchronized down to sub-millisecond tolerances, audio is played across multiple physical laptop and mobile speaker modules simultaneously without phase distortion or audio drift.
-
----
-
-### 🖥️ Vertical 5: User-Facing Dashboard & API Layer
-
-The user interface serves as both an interactive control board and a bridge for external applications.
-
-#### OpenAI-Compatible Gateway
-
-Cerberus embeds an HTTP endpoint running a complete API mapping. If a developer uses a tool like LangChain, AutoGPT, or a custom application, they change their endpoint string:
-
-```python
-# Before Cerberus
-openai.api_base = "https://api.openai.com/v1"
-
-# After Cerberus (Workloads are auto-split across your local hardware cluster)
-openai.api_base = "http://localhost:9999/v1"
-
-```
-
-The gateway parses incoming JSON requests, extracts payload sequences, streams calculations through the Vertical 3 pipeline, and streams response tokens back to the application transparently.
-
-#### Real-Time System Monitor Dashboard
-
-A fast desktop interface visualizing the real-time operational state of the hyper-computer mesh:
-
-* Topographical connection graphs with interactive bandwidth vectors.
-* Memory rings tracking allocation across RAM and VRAM.
-* Real-time thermal indicators signaling performance throttling risks on specific nodes.
-
----
-
-## 3. Detailed Technical Stack Selection
-
-To achieve maximum efficiency on everything from high-performance Linux setups to low-resource mobile platforms, the framework relies on this explicit combination of developer tools:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            CERBERUS TECH STACK                              │
-├───────────────────────┬─────────────────────────────────────────────────────┤
-│ Core Infrastructure   │ Go (Golang) v1.22+ or Rust                          │
-├───────────────────────┼─────────────────────────────────────────────────────┤
-│ P2P Mesh Layer        │ libp2p Framework (Go implementation)                │
-├───────────────────────┼─────────────────────────────────────────────────────┤
-│ Sandboxed Compute     │ Wasmtime Engine (WebAssembly Core Runtime)          │
-├───────────────────────┼─────────────────────────────────────────────────────┤
-│ Core ML Execution     │ Apple MLX Backend (macOS) + tinygrad Vulkan (PC/Lin)│
-├───────────────────────┼─────────────────────────────────────────────────────┤
-│ Audio Virtualization  │ PipeWire (Linux) + CoreAudio Network Bridge (Apple) │
-├───────────────────────┼─────────────────────────────────────────────────────┤
-│ Storage Abstraction   │ JuiceFS Core / Libfuse Bindings                     │
-├───────────────────────┼─────────────────────────────────────────────────────┤
-│ Visual Client Interface│ Tauri App Engine v2 (Rust Backend + Next.js UI)    │
-└───────────────────────┴─────────────────────────────────────────────────────┘
-
-```
-
-### Core Architecture & Networking
-
-* **Language Selection:** **Go (Golang)** for the central system control plane, daemon runtime, and discovery controllers. Go provides excellent concurrency patterns, native memory safety, and stable cross-compilation for mobile architectures.
-* **P2P Implementation:** **libp2p**. It abstractly manages peer discovery via mDNS, multiplexes streams via Yamux, handles NAT traversal securely via STUN/TURN, and uses **Gossipsub** for message propagation across the mesh network.
-
-### Computational Runtimes
-
-* **General Processing Runtime:** **Wasmtime**. By compiling compute logic to WebAssembly bytecode, tasks run at near-native execution performance while maintaining complete hardware and memory safety abstraction.
-* **Neural Framework Integration:** **MLX** for Apple platforms to leverage unified memory architectures and Apple Neural Engines. **tinygrad** for Windows/Linux targets to compile calculations directly into GPU shaders via Vulkan or SYCL wrappers, entirely bypassing bulky CUDA installation dependencies.
-
-### Interface & UI Development
-
-* **Visual Application Layer:** **Tauri Framework (v2)**. Tauri couples a Rust system layer directly to native platform WebViews, avoiding the heavy memory consumption of Electron platforms. The front-end view leverages **Next.js** and **TailwindCSS** to keep tracking dashboards lightweight.
-
----
-
-## 4. Protocols, Payloads & Data Schemes
-
-To keep network communication light and prevent processing lags, Cerberus avoids verbose JSON payloads inside internal pipelines, using high-performance binary formats instead.
-
-### 4.1 Node Telemetry Packet Schema (Protocol Buffers / Proto3)
-
-
-
-### 4.2 Distributed Compute Task Allocation Payload
-
-
-## 5. Comprehensive Execution Roadmap: MVP to Production
-
-```
- PHASE 1: MESH & TELEMETRY       PHASE 2: AI LAYER SPLIT         PHASE 3: GENERAL WASM CHUNKS    PHASE 4: VIRTUAL PERIPHERALS
- ┌───────────────────────┐       ┌───────────────────────┐       ┌───────────────────────────┐   ┌──────────────────────────┐
- │ • libp2p Discovery    │ ────> │ • Ring Sharder        │ ────> │ • Wasmtime Worker Nodes   │ ─>│ • Virtual FUSE Mounts    │
- │ • Real-time Telemetry │       │ • Compressed Tensors  │       │ • Array Array Fragmenting │   │ • Network Audio Sync     │
- └───────────────────────┘       └───────────────────────┘       └───────────────────────────┘   └──────────────────────────┘
-
-```
-
-### Phase 1: Mesh Fabric & Telemetry Initialization (Week 1–2)
-
-* **Goal:** Establish a resilient, zero-configuration network fabric across three varying operating systems, and visually track resource changes.
-* **Milestone 1:** Build the Go daemon using `libp2p`. Verify that opening the application on separate devices automatically triggers cluster inclusion events.
-* **Milestone 2:** Implement system checks inside the daemon using platform libraries. Confirm that live resource adjustments are accurately captured and displayed on the interface layout.
-
-### Phase 2: AI Model Parallelism & Layer Splitting (Week 3–4)
-
-* **Goal:** Successfully load and execute a Large Language Model that requires more memory than any single node in the cluster possesses.
-* **Milestone 1:** Build the dynamic layer sharding mapper. For an unquantized model pipeline, divide the parameters systematically across available system nodes based on current telemetry data.
-* **Milestone 2:** Implement the sequential forward-pass tensor routing over the QUIC transport channels. Measure and optimize performance to maximize generation speeds.
-
-### Phase 3: General Workload Sharding via WebAssembly (Week 5–6)
-
-* **Goal:** Distribute a general-purpose compute application across multiple devices without code modifications.
-* **Milestone 1:** Integrate the `Wasmtime` execution client into the base node daemon.
-* **Milestone 2:** Create an array fragmentation mechanism. Build a compiler pipeline that takes an application loop, packages it into a standard `.wasm` target, distributes processing slices across available network nodes, and aggregates calculations on the parent machine.
-
-### Phase 4: Full Peripheral Abstraction (Week 7+)
-
-* **Goal:** Mount distributed storage pools and integrate spatial audio sharing across all connected cluster elements.
-* **Milestone 1:** Deploy user-space file storage nodes via custom FUSE interfaces. Verify that files saved to the target mount are automatically split and distributed redundantly across the connected machines.
-* **Milestone 2:** Build out the low-latency audio capture and distribution system, ensuring synchronous multi-device output without audible latency drift.
-
----
-
-## 6. Engineering Edge Cases & Mitigation Strategies
-
-### 6.1 The Network Bottleneck (Wi-Fi Jitter)
-
-* **The Risk:** High network latency can slow down distributed AI layers, making local token generation sluggish compared to standard execution targets.
-* **Mitigation:** Cerberus applies predictive chunk execution. The framework pipelines task requests ahead of time. While Node B completes processing on Layer Block 2, Node A pre-fetches the input requirements for Layer Block 3, smoothing out communication delays over wireless networks.
-
-### 6.2 Unexpected Node Failures (The Laptop Lid Drop)
-
-* **The Risk:** A user suddenly closes their laptop midway through an application execution run, dropping structural memory states and halting the processing pipeline.
-* **Mitigation:** The system uses active health checks alongside automated task duplication. High-priority compute blocks are processed concurrently across adjacent backup nodes. If a peer fails to acknowledge a processing sequence within a specific timeout window, the coordinator re-routes the task immediately to prevent a full system freeze.
-
-```
-                  [Task Dispatched]
-                   /             \
-                  /               \
-         [Primary Node]     [Backup Node] (Hot Standby)
-               │                  │
-      (Lid Drops/Fails)           │
-               X                  ▼
-               └───────────> [Takes Over Context Instantly]
-
-```
-
-### 6.3 Asymmetric Thermal Throttling
-
-* **The Risk:** A compact laptop gets hot during intensive execution loops, causing its processing speed to drop sharply and slowing down the rest of the synchronous pipeline.
-* **Mitigation:** The monitoring daemon tracks temperature changes over time. If a node flags thermal safety limits, the scheduler dynamically scales back its workload assignment, transferring layers or execution blocks to cooler systems on the network.
-
----
-
-2. How to Actually Do It Today
-If you want to start pooling your devices right now to achieve , here are the exact tools and approaches you should look into.
-
-A. For Running Giant AI Models (The 64GB Model on Four 16GB Laptops)
-If your main goal is to run massive AI models by splitting the load across whatever laptops or devices you have lying around, you don't even have to write complex code.
-
-Exo (exo-explore): This is an incredible open-source project that does exactly what Pranav is describing. It allows you to connect multiple devices (Macs, iPhones, Linux/Windows laptops) into a single cluster over Wi-Fi. It automatically discovers other devices and splits the execution of LLMs across them based on available memory and compute.
-
-Petals: Think of this as BitTorrent for text generation. It allows you to load bits and pieces of massive models (like LLaMA-3 70B) across multiple distributed computers. You run a small client, and other people (or your own other laptops) host different layers of the model.
-
-B. For General Compute Pooling (CPU/GPU)
-If you aren't just running AI, but want to distribute heavy coding compilation, math simulations, or rendering:
-
-Ray.io: A powerful open-source unified framework for scaling AI and Python applications. You can install Ray on three different laptops, connect them to a head node, and write Python code that seamlessly scales across all available CPU threads and GPUs across those machines.
-
-Distcc: If you are compiling massive software projects, distcc distributes the compilation of C/C++ code across several machines on a local network without requiring them to share a filesystem or have the same headers.
-
-C. For Peripherals (Audio & Storage)
-To get that "all resources combined" feel for hardware like mics, speakers, and storage, you have to use network abstraction layers:
-
-Audio Pooling (Mics/Speakers): Tools like Audio Relay or Jack Audio Connection Kit (JACK) allow you to route audio seamlessly over a local network, turning one laptop's mic into the input for another laptop, or playing audio out of 4 different devices simultaneously.
-
-Storage Pooling: Ceph or GlusterFS allow you to take the hard drives of multiple different machines and pool them into one giant, distributed virtual hard drive.
-
-</details>
-
+No `task`? `go install github.com/go-task/task/v3/cmd/task@latest`, or run the
+raw commands from [Taskfile.yml](Taskfile.yml). CI runs the test matrix on
+Linux/macOS/Windows with `-race`, fuzz harnesses, and an SBOM gate.
+
+## Maturity, honestly
+
+This is a **v0.1 beta**. The capability kernel, mesh, sandbox, data plane,
+device namespace, distributed FS, cross-node audio/GPU/pipeline paths, CLI,
+MCP server, and tray app are real and running. The frontier pieces — zk-WASM
+proof-of-inference, RDMA-over-Thunderbolt, TEE shielding — are **documented
+stubs** ([ARCHITECTURE.md §8](ARCHITECTURE.md)), kept as designs rather than
+faked as features. Known gaps we'd fix next: OS drive-letter mounts for
+`/cer/fs` (WinFsp/FUSE), live VRAM quota accounting on the GPU device, real
+LLM weights through the llama.cpp/MLX seams, macOS/Linux audio backends, and
+signed installers. If you find a claim in this README the code doesn't back,
+that's a bug — file it.
