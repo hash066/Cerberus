@@ -12,10 +12,15 @@
 // Everything is built around injectable seams so the package builds and
 // unit-tests standalone (per CLAUDE.md golden rule 3):
 //
-//   - Source / Sink   — the OS capture/playback boundary. Real backends
-//     (CoreAudio / WASAPI / PipeWire) are NOT verifiable in this environment
-//     and ship as a labeled stub (see NewOSCaptureSource / NewOSPlaybackSink).
-//     A synthetic SineSource and an in-memory BufferSink drive the tests.
+//   - Source / Sink   — the OS capture/playback boundary. Real, hardware-verified
+//     backends exist for Windows (WASAPI, os_windows.go) and Linux (PulseAudio
+//     native protocol, os_linux.go); macOS (CoreAudio, os_darwin.go) and every
+//     other platform (os_other.go) are documented per their own files. Both real
+//     backends are pure Go — no cgo — so the CGO_ENABLED=0 release path builds
+//     them unchanged. A platform with no backend fails loudly with
+//     ErrOSAudioUnavailable rather than faking silence. A synthetic SineSource
+//     and an in-memory BufferSink drive the transport tests, which therefore
+//     need no audio hardware at all.
 //   - Transport       — the byte pipe between Sender and Receiver. In v0.1 it
 //     is an in-memory pipe; later it sits on the QUIC zero-copy data plane
 //     (vertical 04 §3). This package never imports the mesh — it only depends
@@ -230,25 +235,46 @@ func (b *BufferSink) WriteFrame(f Frame) error {
 // OS capture/playback — the OS-integration point in this package.
 //
 // Real microphone capture and speaker playback are behind the same Source/Sink
-// interfaces the synthetic generators implement:
-//   - Windows: WASAPI (IAudioClient capture/render) — REAL, see os_windows.go.
-//   - macOS:   CoreAudio (AudioUnit / AVAudioEngine tap) — not wired.
-//   - Linux:   PipeWire (pw_stream capture/playback node) — not wired.
+// interfaces the synthetic generators implement. The three entry points
+// (EnumerateEndpoints / NewOSCaptureSource / NewOSPlaybackSink) are dispatched
+// by build tag, one implementation per platform:
 //
-// The Windows backend is real (go-wca, a pure-Go WASAPI/COM binding — no cgo,
-// see os_windows.go's doc comment for the rationale). macOS/Linux are not
-// verifiable in this environment and remain documented stubs (MATURITY HONESTY
-// per CLAUDE.md "Maturity honesty": this is a documented stub, not a faked
-// working backend, until someone implements + verifies it on that platform).
-// The entry points below (NewOSCaptureSource / NewOSPlaybackSink) are
-// implemented per-platform in os_windows.go / os_other.go; on an unsupported
-// build they return ErrOSAudioUnavailable so a caller that asks for a real
-// device fails loudly instead of silently producing fake audio.
+//   - Windows: WASAPI (IAudioClient capture/render) — REAL, os_windows.go.
+//     Pure Go via go-wca (COM over syscall), no cgo. Hardware-verified.
+//   - Linux:   PulseAudio native protocol — REAL, os_linux.go. Pure Go via
+//     github.com/jfreymuth/pulse speaking the wire protocol over the server's
+//     unix socket, no cgo. Also covers PipeWire, which ships a
+//     PulseAudio-protocol-compatible server (pipewire-pulse). Hardware-verified.
+//   - macOS:   CoreAudio — os_darwin.go. See that file's doc comment for its
+//     verification status; it is honest about what has and has not been run.
+//   - Anything else (BSD, Solaris, js/wasm, ...): os_other.go, a documented
+//     stub that fails loudly rather than faking a device.
+//
+// MATURITY HONESTY (CLAUDE.md): a platform with no real backend returns
+// ErrOSAudioUnavailable from the stream constructors, so a caller that asks for
+// a real device fails loudly instead of silently receiving fabricated silence.
+// Nothing in this package ever invents a device or a sample it did not get from
+// the OS.
 // ---------------------------------------------------------------------------
 
 // ErrOSAudioUnavailable signals that no real OS audio backend is wired into this
 // build. Use SineSource / BufferSink for tests and the in-memory path.
 var ErrOSAudioUnavailable = errors.New("audio: OS capture/playback backend not implemented in this build (stub)")
+
+// ErrNoAudioDevice is returned when the platform's audio backend is present and
+// working but reports no usable endpoint at all (e.g. a headless/sandboxed
+// machine with no audio driver, or a Linux box with no running sound server).
+// Per CLAUDE.md "maturity honesty" (mirroring core/runtime/src/gpu.rs's
+// GpuError::NoAdapter for the analogous case in the GPU subsystem), this
+// package fails loudly instead of silently generating or discarding audio when
+// there is no real device to back the Source/Sink contract.
+//
+// It is distinct from ErrOSAudioUnavailable: that one means "this build has no
+// backend for this OS at all", whereas this one means "the backend works, the
+// machine simply has no device". Callers that only want to know whether audio
+// is usable can treat them alike; callers reporting to a human should not,
+// because the remedies differ (ship a backend vs. plug in a microphone).
+var ErrNoAudioDevice = errors.New("audio: no audio endpoint available on this system")
 
 // silentFrame returns a zero-filled (silence) frame sized for the format. Used
 // by the Receiver to gap-fill a lost packet when no last frame is available.

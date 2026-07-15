@@ -7,6 +7,26 @@ import (
 
 func testFormat() Format { return Format{SampleRate: 48000, Channels: 1} }
 
+// fanOutSink writes every frame to multiple Sinks in order, so a test can drive
+// a real device and an inspectable BufferSink from one Receiver. Shared by the
+// per-platform live-hardware tests (os_windows_test.go, os_linux_test.go),
+// which each run a real OS Sink and a BufferSink off the same Receiver.
+type fanOutSink struct {
+	format Format
+	sinks  []Sink
+}
+
+func (f *fanOutSink) Format() Format { return f.format }
+
+func (f *fanOutSink) WriteFrame(fr Frame) error {
+	for _, s := range f.sinks {
+		if err := s.WriteFrame(fr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // makePackets builds n sequential packets from a sine source so tests have a
 // known, ordered reference stream to compare reconstruction against.
 func makePackets(t *testing.T, n int) (Format, []packet) {

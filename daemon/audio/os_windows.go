@@ -81,13 +81,11 @@ const wasapiBitsPerSample = 16
 // while staying well inside typical device buffer limits.
 const wasapiBufferDuration = wca.REFERENCE_TIME(200 * 10 * 1000) // 200ms
 
-// ErrNoAudioDevice is returned when WASAPI has no capture or render endpoint
-// at all (e.g. a headless/sandboxed machine with no audio driver). Per
-// CLAUDE.md "maturity honesty" (mirroring core/runtime/src/gpu.rs's
-// GpuError::NoAdapter for the analogous case in the GPU subsystem), this
-// package fails loudly instead of silently generating or discarding audio
-// when there is no real device to back the Source/Sink contract.
-var ErrNoAudioDevice = errors.New("audio: no WASAPI endpoint available on this system")
+// ErrNoAudioDevice (the sentinel returned when WASAPI reports no capture or
+// render endpoint at all) is declared in audio.go rather than here: it started
+// life as a WASAPI-specific error, but the Linux backend needs exactly the same
+// "the backend works, this machine just has no device" signal, so it is now a
+// shared, platform-neutral sentinel. Its meaning on Windows is unchanged.
 
 // ErrSampleRateMismatch is returned when the requested Format's sample rate
 // does not match the WASAPI endpoint's native mix rate. This package

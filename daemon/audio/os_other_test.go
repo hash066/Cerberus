@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !darwin && !linux
 
 package audio
 
@@ -7,10 +7,9 @@ import (
 	"testing"
 )
 
-// On every non-Windows build the OS capture/playback backends are honest
-// stubs, not fakes: no real backend is wired in for this platform yet (see
-// os_other.go), so both constructors must report ErrOSAudioUnavailable
-// unconditionally.
+// On a platform with no backend wired in (i.e. not Windows/Linux/macOS — see
+// os_other.go) the OS capture/playback backends are honest stubs, not fakes, so
+// both constructors must report ErrOSAudioUnavailable unconditionally.
 func TestOSBackendsAreStubs(t *testing.T) {
 	f := testFormat()
 	if _, err := NewOSCaptureSource(f); !errors.Is(err, ErrOSAudioUnavailable) {
