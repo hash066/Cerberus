@@ -368,15 +368,9 @@ func (s *server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("bad issuer pubkey: %w", err))
 		return
 	}
-	if err := s.addPeer(Peer{
-		ID:              req.ID,
-		Addr:            req.Addr,
-		MeshPeerID:      req.MeshPeerID,
-		MeshAddrs:       req.MeshAddrs,
-		IssuerPub:       req.IssuerPub,
-		ExecCap:         req.ExecCap,         // handle the caller granted us
-		ExecCapEnvelope: req.ExecCapEnvelope, // signed cap the caller granted us
-	}); err != nil {
+	// The request carries the exec cap handle + signed envelope the caller
+	// granted us; Peer mirrors DiscoverRequest field-for-field.
+	if err := s.addPeer(Peer(req)); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}

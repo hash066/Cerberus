@@ -82,7 +82,7 @@ func (f *Fabric) handleAudioDevicesStream(
 	isRevoked auth.RevocationPredicate,
 ) {
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	raw, err := ss.Recv()
 	if err != nil {
@@ -166,7 +166,7 @@ func (f *Fabric) RequestListAudioDevices(
 	if err != nil {
 		return nil, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	ss := newStreamSession(s)
 
 	body, err := json.Marshal(audioDevicesRequest{Cap: capEnvelope, Issuer: issuer})

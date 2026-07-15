@@ -2,7 +2,6 @@ package compute
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
 	"sync"
@@ -297,15 +296,3 @@ func DispatchRemote(
 }
 
 var _ contract.Executor = (*PreferRemoteExecutor)(nil)
-
-// meshCapSignerFromIdentity is exported for tests that already hold a key.
-func meshCapSignerFromIdentity(identity ed25519.PrivateKey) (*auth.SignedCap, error) {
-	if len(identity) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("compute: not an Ed25519 private key")
-	}
-	ks, err := auth.NewMemoryKeyStore(identity.Seed())
-	if err != nil {
-		return nil, err
-	}
-	return auth.NewSignedCap(ks), nil
-}

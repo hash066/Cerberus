@@ -189,7 +189,7 @@ func (f *Fabric) handleShardStream(
 	isRevoked auth.RevocationPredicate,
 ) {
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	raw, err := ss.Recv()
 	if err != nil {
@@ -338,7 +338,7 @@ func (f *Fabric) requestShard(ctx context.Context, peer contract.PeerID, req sha
 		return shardResponse{}, fmt.Errorf("mesh: dial shard peer: %w", err)
 	}
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	body, err := json.Marshal(req)
 	if err != nil {

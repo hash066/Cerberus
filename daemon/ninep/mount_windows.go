@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows && !cgo
 
 // Real WinFsp mount of the 9P capability namespace, using
 // github.com/winfsp/cgofuse — the same library docs/verticals/04 §6 names as
@@ -346,7 +346,7 @@ func (a *winfsAdapter) Getattr(fusePath string, stat *fuse.Stat_t, fh uint64) in
 	if err != nil {
 		return -toFuseErrno(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, _, attr, err := f.GetAttr(p9.AttrMaskAll)
 	if err != nil {
 		return -toFuseErrno(err)
@@ -381,7 +381,7 @@ func (a *winfsAdapter) Opendir(fusePath string) (int, uint64) {
 		return -toFuseErrno(err), invalidFh
 	}
 	if !isDir {
-		f.Close()
+		_ = f.Close()
 		return -fuse.ENOTDIR, invalidFh
 	}
 	entries := a.ns.ListChildren(nsPath(fusePath), a.cap)
@@ -427,7 +427,7 @@ func (a *winfsAdapter) Open(fusePath string, flags int) (int, uint64) {
 		return -toFuseErrno(err), invalidFh
 	}
 	if isDir {
-		f.Close()
+		_ = f.Close()
 		return -fuse.EISDIR, invalidFh
 	}
 	mode := p9.ReadOnly
@@ -438,7 +438,7 @@ func (a *winfsAdapter) Open(fusePath string, flags int) (int, uint64) {
 		mode = p9.ReadWrite
 	}
 	if _, _, err := f.Open(mode); err != nil {
-		f.Close()
+		_ = f.Close()
 		return -toFuseErrno(err), invalidFh
 	}
 	fh := a.allocFh()
@@ -536,7 +536,7 @@ func (a *winfsAdapter) Statfs(fusePath string, stat *fuse.Statfs_t) int {
 	if err != nil {
 		return -toFuseErrno(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	fsstat, err := f.StatFS()
 	if err != nil {
 		return -toFuseErrno(err)

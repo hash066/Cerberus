@@ -59,7 +59,7 @@ func FromReadOnlySpan(s sdktrace.ReadOnlySpan) Span {
 	}
 	attrs := map[string]string{}
 	for _, kv := range s.Attributes() {
-		attrs[string(kv.Key)] = kv.Value.Emit()
+		attrs[string(kv.Key)] = kv.Value.String()
 	}
 	return Span{
 		TraceID:  sc.TraceID().String(),

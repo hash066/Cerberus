@@ -103,12 +103,7 @@ func registerStatus(mcpServer *mcp.Server, s *toolServer) {
 			r, _ := errResult("cerberus_status: %v", err)
 			return r, statusOutput{}, nil
 		}
-		return nil, statusOutput{
-			Version: resp.Version, State: resp.State, Subject: resp.Subject,
-			Profile: resp.Profile, Kernel: resp.Kernel, UptimeSec: resp.UptimeSec,
-			MeshUp: resp.MeshUp, PeerCount: resp.PeerCount, SelfPeer: resp.SelfPeer,
-			Balance: resp.Balance,
-		}, nil
+		return nil, statusOutput(resp), nil
 	})
 }
 
@@ -160,10 +155,7 @@ func registerRunWorkload(mcpServer *mcp.Server, s *toolServer) {
 			r, _ := errResult("cerberus_run_workload: %v", err)
 			return r, runWorkloadOutput{}, nil
 		}
-		out := runWorkloadOutput{
-			OK: resp.OK, Output: resp.Output, Error: resp.Error,
-			TaskID: resp.TaskID, Where: resp.Where, CID: resp.CID, Remote: resp.Remote,
-		}
+		out := runWorkloadOutput(resp)
 		if !resp.OK {
 			// A failed workload execution is a normal (non-protocol) tool
 			// error: surface it as IsError so the calling model sees it
@@ -212,7 +204,7 @@ func registerListNodes(mcpServer *mcp.Server, s *toolServer) {
 		}
 		out := listNodesOutput{SelfPeer: resp.SelfPeer, MeshUp: resp.MeshUp}
 		for _, n := range resp.Nodes {
-			out.Nodes = append(out.Nodes, nodeEntryOutput{PeerID: n.PeerID, Addr: n.Addr, Self: n.Self})
+			out.Nodes = append(out.Nodes, nodeEntryOutput(n))
 		}
 		return nil, out, nil
 	})
@@ -251,7 +243,7 @@ func registerListDevices(mcpServer *mcp.Server, s *toolServer) {
 		}
 		out := listDevicesOutput{}
 		for _, d := range resp.Devices {
-			out.Devices = append(out.Devices, deviceEntryOutput{Path: d.Path, Kind: d.Kind, QuotaBytes: d.QuotaBytes})
+			out.Devices = append(out.Devices, deviceEntryOutput(d))
 		}
 		return nil, out, nil
 	})
@@ -286,9 +278,7 @@ func registerWalletBalance(mcpServer *mcp.Server, s *toolServer) {
 			r, _ := errResult("cerberus_wallet_balance: %v", err)
 			return r, walletBalanceOutput{}, nil
 		}
-		return nil, walletBalanceOutput{
-			Owner: resp.Owner, Balance: resp.Balance, Enabled: resp.Enabled, TotalSupply: resp.TotalSupply,
-		}, nil
+		return nil, walletBalanceOutput(resp), nil
 	})
 }
 
@@ -330,7 +320,7 @@ func registerCapsMint(mcpServer *mcp.Server, s *toolServer) {
 			r, _ := errResult("cerberus_caps_mint: %v", err)
 			return r, capsMintOutput{}, nil
 		}
-		return nil, capsMintOutput{Token: resp.Token, ID: resp.ID, Subject: resp.Subject}, nil
+		return nil, capsMintOutput(resp), nil
 	})
 }
 
@@ -370,7 +360,7 @@ func registerCapsAttenuate(mcpServer *mcp.Server, s *toolServer) {
 			r, _ := errResult("cerberus_caps_attenuate: %v", err)
 			return r, capsMintOutput{}, nil
 		}
-		return nil, capsMintOutput{Token: resp.Token, ID: resp.ID, Subject: resp.Subject}, nil
+		return nil, capsMintOutput(resp), nil
 	})
 }
 
@@ -405,7 +395,7 @@ func registerCapsRevoke(mcpServer *mcp.Server, s *toolServer) {
 			r, _ := errResult("cerberus_caps_revoke: %v", err)
 			return r, capsRevokeOutput{}, nil
 		}
-		return nil, capsRevokeOutput{ID: resp.ID, Revoked: resp.Revoked}, nil
+		return nil, capsRevokeOutput(resp), nil
 	})
 }
 
@@ -446,10 +436,7 @@ func registerCapsList(mcpServer *mcp.Server, s *toolServer) {
 		}
 		out := capsListOutput{}
 		for _, c := range resp.Caps {
-			out.Caps = append(out.Caps, capEntryOutput{
-				ID: c.ID, Subject: c.Subject, Rights: c.Rights, Resource: c.Resource,
-				Expiry: c.Expiry, Parent: c.Parent, Revoked: c.Revoked,
-			})
+			out.Caps = append(out.Caps, capEntryOutput(c))
 		}
 		return nil, out, nil
 	})
@@ -496,7 +483,7 @@ func registerConflictsList(mcpServer *mcp.Server, s *toolServer) {
 		for _, c := range resp.Conflicts {
 			entry := conflictEntryOutput{Subject: c.Subject}
 			for _, cand := range c.Candidates {
-				entry.Candidates = append(entry.Candidates, conflictCandidateOutput{Actor: cand.Actor, Value: cand.Value})
+				entry.Candidates = append(entry.Candidates, conflictCandidateOutput(cand))
 			}
 			out.Conflicts = append(out.Conflicts, entry)
 		}
@@ -539,7 +526,7 @@ func registerConflictsResolve(mcpServer *mcp.Server, s *toolServer) {
 			r, _ := errResult("cerberus_conflicts_resolve: %v", err)
 			return r, conflictsResolveOutput{}, nil
 		}
-		return nil, conflictsResolveOutput{Resolved: resp.Resolved, Subject: resp.Subject}, nil
+		return nil, conflictsResolveOutput(resp), nil
 	})
 }
 

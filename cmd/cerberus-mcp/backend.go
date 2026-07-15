@@ -80,7 +80,7 @@ func call[Req any, Resp any](ctx context.Context, b *rpcBackend, method string, 
 	if err != nil {
 		return resp, err
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	type result struct {
 		err error
@@ -155,7 +155,7 @@ func (b *rpcBackend) Metrics(ctx context.Context, token string) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("cannot reach metrics endpoint at %s: %w", b.metricsAddr, err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return "", err

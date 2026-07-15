@@ -152,7 +152,7 @@ func (s *System) FSGet(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fs get: %w", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	return io.ReadAll(rc)
 }
 
@@ -295,7 +295,7 @@ func (s *dfsFSStore) BeginRead(path string, _ contract.CapHandle, recv ninep.Rec
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	// The daemon dials the caller's receiver and streams dfs.Get's bytes to it,
 	// authorized by the caller's own inbound grant (recv carries the transfer id,

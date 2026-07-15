@@ -130,7 +130,7 @@ func (f *Fabric) handleSignedGpuStream(
 	isRevoked auth.RevocationPredicate,
 ) {
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	raw, err := ss.Recv()
 	if err != nil {
@@ -182,7 +182,7 @@ func (f *Fabric) RequestGpuSigned(ctx context.Context, worker contract.PeerID, r
 		return GpuResult{}, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	body, err := json.Marshal(gpuRequestWire{
 		Req:    req,

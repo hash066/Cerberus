@@ -257,7 +257,7 @@ func appendProtoUint32(dst []byte, field int, v uint32) []byte {
 }
 
 func appendProtoVarint(dst []byte, field int, v uint64) []byte {
-	key := uint64(field<<3 | 0)
+	key := uint64(field << 3) // wire type 0 (varint)
 	dst = appendVarint(dst, key)
 	return appendVarint(dst, v)
 }

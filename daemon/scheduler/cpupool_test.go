@@ -12,8 +12,10 @@ func TestCPUPoolAcquireRelease(t *testing.T) {
 	id[0] = 1
 	s.UpdateNode(contract.NodeTelemetry{PeerID: id, Compute: contract.Compute{PCores: 2}})
 
-	if !s.AcquireCPU(id, 1) || !s.AcquireCPU(id, 1) {
-		t.Fatal("expected two acquires on 2-core node")
+	for i := 1; i <= 2; i++ {
+		if !s.AcquireCPU(id, 1) {
+			t.Fatalf("acquire %d of 2 should succeed on 2-core node", i)
+		}
 	}
 	if s.AcquireCPU(id, 1) {
 		t.Fatal("third acquire should fail when saturated")

@@ -481,10 +481,7 @@ func (d *DaemonRPC) Devices(req *DevicesRequest, resp *DevicesResponse) error {
 		}
 	} else {
 		for _, dev := range d.devices {
-			resp.Devices = append(resp.Devices, DeviceEntry{
-				Path: dev.Path, Kind: dev.Kind, QuotaBytes: dev.QuotaBytes,
-				Name: dev.Name, Peer: dev.Peer, Pooled: dev.Pooled,
-			})
+			resp.Devices = append(resp.Devices, DeviceEntry(dev))
 		}
 	}
 	sort.Slice(resp.Devices, func(i, j int) bool { return resp.Devices[i].Path < resp.Devices[j].Path })

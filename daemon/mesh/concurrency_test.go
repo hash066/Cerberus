@@ -392,10 +392,6 @@ func TestConcurrentDialAcceptSessionsStayBound(t *testing.T) {
 // documents and locks in that guarantee — a future change that adds package-
 // level or receiver state to this check must keep it goroutine-safe).
 func TestConcurrentVerifyAuthenticatedPeer(t *testing.T) {
-	type kp struct {
-		priv []byte
-		id   contract.PeerID
-	}
 	newKP := func() contract.PeerID {
 		_, id := newPeer(t)
 		return id

@@ -62,7 +62,7 @@ func RunLoopback(ctx context.Context, freqHz float64, frames int) (LoopbackStats
 	if err := srv.Listen("127.0.0.1:0"); err != nil {
 		return LoopbackStats{}, fmt.Errorf("audio session: data-plane listen: %w", err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()

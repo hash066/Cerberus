@@ -99,7 +99,7 @@ func RunI32(ctx context.Context, module []byte, entry string) (int32, error) {
 	defer cancel()
 
 	r := wazero.NewRuntimeWithConfig(ctx, governedRuntimeConfig())
-	defer r.Close(ctx)
+	defer func() { _ = r.Close(ctx) }()
 
 	mod, err := r.Instantiate(ctx, module)
 	if err != nil {
@@ -132,7 +132,7 @@ func RunI32Any(ctx context.Context, module []byte, entries []string) (int32, err
 	defer cancel()
 
 	r := wazero.NewRuntimeWithConfig(ctx, governedRuntimeConfig())
-	defer r.Close(ctx)
+	defer func() { _ = r.Close(ctx) }()
 
 	mod, err := r.Instantiate(ctx, module)
 	if err != nil {

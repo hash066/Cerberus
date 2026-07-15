@@ -130,7 +130,7 @@ func (f *Fabric) handleComponentFetchStream(
 	isRevoked auth.RevocationPredicate,
 ) {
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	raw, err := ss.Recv()
 	if err != nil {
@@ -225,7 +225,7 @@ func (f *Fabric) RequestComponent(ctx context.Context, peer contract.PeerID, c c
 		return nil, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	body, err := json.Marshal(componentFetchRequest{CID: c.Bytes(), Cap: capEnvelope, Issuer: issuer})
 	if err != nil {

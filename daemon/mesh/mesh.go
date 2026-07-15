@@ -77,6 +77,36 @@ type Fabric struct {
 type subscription struct {
 	expr string
 	ch   chan contract.Sample
+
+	// mu serializes trySend against closeCh: dispatch snapshots subscriptions
+	// outside the fabric lock, so without this a subscriber cancelling mid-fanout
+	// races close(ch) against a send (a panic, not just a detector finding).
+	mu     sync.Mutex
+	closed bool
+}
+
+// trySend delivers non-blockingly; a full buffer drops (bus back-pressure) and
+// a closed subscription is a no-op.
+func (s *subscription) trySend(sample contract.Sample) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.ch <- sample:
+	default:
+	}
+}
+
+// closeCh closes the delivery channel exactly once, after which trySend drops.
+func (s *subscription) closeCh() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.closed = true
+		close(s.ch)
+	}
 }
 
 // envelope is the on-bus framing: a Zenoh key plus its payload, sent over the
@@ -209,11 +239,7 @@ func (f *Fabric) dispatch(env envelope) {
 	}
 	f.mu.Unlock()
 	for _, s := range targets {
-		select {
-		case s.ch <- contract.Sample{Key: env.Key, Payload: env.Payload}:
-		default:
-			// Back-pressure: drop for slow consumers rather than block the bus.
-		}
+		s.trySend(contract.Sample{Key: env.Key, Payload: env.Payload})
 	}
 }
 
@@ -251,7 +277,7 @@ func (f *Fabric) Subscribe(ctx context.Context, keyExpr string, capH contract.Ca
 			}
 		}
 		f.mu.Unlock()
-		close(s.ch)
+		s.closeCh()
 	}()
 	return s.ch, nil
 }

@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -259,13 +258,6 @@ func attachLogs(message string, cause error, procs ...*daemonProc) error {
 		fmt.Fprintf(&b, "\n--- %s logs ---\n%s", proc.id, proc.logs.String())
 	}
 	return errors.New(b.String())
-}
-
-func executableName(name string) string {
-	if runtime.GOOS == "windows" {
-		return name + ".exe"
-	}
-	return name
 }
 
 type safeBuffer struct {

@@ -71,13 +71,6 @@ var (
 	metricsAddr = resolveAddr("CERBERUS_METRICS_ADDR", defaultMetricsAddr, func(m discovery.Manifest) string { return m.MetricsAddr })
 )
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
 // resolveAddr implements the env > manifest > default priority described
 // above for one address field. pick extracts the relevant field from a
 // manifest (empty string if that subsystem never bound).
@@ -187,7 +180,7 @@ func run(args []string) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `cerberus — operator CLI for the Cerberus daemon
+	_, _ = fmt.Fprint(w, `cerberus — operator CLI for the Cerberus daemon
 
 Usage:
   cerberus [--json] <command> [args]
@@ -256,7 +249,7 @@ func cmdStatus(_ []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	var resp StatusResponse
 	if err := client.Call("DaemonRPC.Status", &StatusRequest{Token: token}, &resp); err != nil {
@@ -302,7 +295,7 @@ func cmdRun(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	var resp RunResponse
 	req := &RunRequest{Token: token, Component: component, On: on}
@@ -346,7 +339,7 @@ func cmdPipelineRun(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	var resp PipelineRunResponse
 	req := &PipelineRunRequest{Token: token, Model: model, Backend: backend}
@@ -390,7 +383,7 @@ func cmdNodes(_ []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	var resp NodesResponse
 	if err := client.Call("DaemonRPC.Nodes", &NodesRequest{Token: token}, &resp); err != nil {
@@ -423,7 +416,7 @@ func cmdDevices(_ []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	var resp DevicesResponse
 	if err := client.Call("DaemonRPC.Devices", &DevicesRequest{Token: token}, &resp); err != nil {
@@ -464,7 +457,7 @@ func cmdWallet(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	var resp WalletResponse
 	if err := client.Call("DaemonRPC.Wallet", &WalletRequest{Token: token, Owner: owner}, &resp); err != nil {
@@ -510,7 +503,7 @@ func cmdCaps(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	switch sub {
 	case "mint":
@@ -659,7 +652,7 @@ func cmdComponents(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	switch sub {
 	case "add":
@@ -759,7 +752,7 @@ func cmdAudioSession(args []string, jsonOut bool, monitor bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	req := &AudioSessionRequest{Token: token, On: on, Monitor: monitor}
 	method := "DaemonRPC.AudioPlay"
@@ -814,7 +807,7 @@ func cmdAudioLoopback(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	req.Token = token
 	var resp AudioLoopbackResponse
@@ -924,7 +917,7 @@ func cmdGPU(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	req := &GpuDispatchRequest{Token: token, Kernel: int(kernel), Param: param, A: a, B: b, On: onPeer}
 	var resp GpuDispatchResponse
@@ -978,7 +971,7 @@ func cmdFS(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	switch sub {
 	case "put":
@@ -1026,7 +1019,7 @@ func cmdFS(args []string, jsonOut bool) int {
 			fmt.Printf("Wrote %d bytes to %s\n", len(resp.Data), out)
 			return exitOK
 		}
-		os.Stdout.Write(resp.Data) // no local file given: stream to stdout
+		_, _ = os.Stdout.Write(resp.Data) // no local file given: stream to stdout
 		return exitOK
 
 	case "cat":
@@ -1042,7 +1035,7 @@ func cmdFS(args []string, jsonOut bool) int {
 		if jsonOut {
 			return printJSON(map[string]any{"path": resp.Path, "bytes": len(resp.Data)})
 		}
-		os.Stdout.Write(resp.Data)
+		_, _ = os.Stdout.Write(resp.Data)
 		return exitOK
 
 	case "ls":
@@ -1085,7 +1078,7 @@ func cmdConflicts(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	switch sub {
 	case "assert":
@@ -1178,7 +1171,7 @@ func cmdEconomy(args []string, jsonOut bool) int {
 	if code != exitOK {
 		return code
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	switch sub {
 	case "challenge":
@@ -1246,7 +1239,7 @@ func cmdMetrics(_ []string, jsonOut bool) int {
 		fmt.Fprintf(os.Stderr, "metrics: cannot reach daemon at %s: %v\n", metricsAddr, err)
 		return exitErr
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	body, _ := io.ReadAll(res.Body)
 	if res.StatusCode != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "metrics: daemon returned %s: %s\n", res.Status, strings.TrimSpace(string(body)))
@@ -1255,7 +1248,7 @@ func cmdMetrics(_ []string, jsonOut bool) int {
 	if jsonOut {
 		return printJSON(map[string]string{"metrics": string(body)})
 	}
-	os.Stdout.Write(body)
+	_, _ = os.Stdout.Write(body)
 	return exitOK
 }
 
@@ -1314,7 +1307,7 @@ func cmdDoctor(_ []string, jsonOut bool) int {
 	if res, err := probeClient.Get("http://" + rep.MetricsAddr + "/healthz"); err != nil {
 		rep.HealthzErr = err.Error()
 	} else {
-		res.Body.Close()
+		_ = res.Body.Close()
 		rep.Healthz = res.StatusCode == http.StatusOK
 		if !rep.Healthz {
 			rep.HealthzErr = res.Status
@@ -1323,7 +1316,7 @@ func cmdDoctor(_ []string, jsonOut bool) int {
 	if res, err := probeClient.Get("http://" + rep.MetricsAddr + "/readyz"); err != nil {
 		rep.ReadyzErr = err.Error()
 	} else {
-		res.Body.Close()
+		_ = res.Body.Close()
 		rep.Readyz = res.StatusCode == http.StatusOK
 		if !rep.Readyz {
 			rep.ReadyzErr = res.Status
@@ -1336,7 +1329,7 @@ func cmdDoctor(_ []string, jsonOut bool) int {
 	} else if client, err := rpc.Dial("tcp", rep.RPCAddr); err != nil {
 		rep.RPCErr = err.Error()
 	} else {
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 		var resp StatusResponse
 		if err := client.Call("DaemonRPC.Status", &StatusRequest{Token: token}, &resp); err != nil {
 			rep.RPCErr = err.Error()
@@ -1440,7 +1433,7 @@ func printJSON(v any) int {
 		fmt.Fprintf(os.Stderr, "json: %v\n", err)
 		return exitErr
 	}
-	os.Stdout.Write(b)
+	_, _ = os.Stdout.Write(b)
 	fmt.Println()
 	return exitOK
 }

@@ -1,0 +1,26 @@
+version: "2"
+
+# Show every finding: the default max-same-issues cap (3) hides repeats of the
+# same message, which let identical unchecked-Close sites trickle out one CI
+# run at a time.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+# Keep the default linter set (errcheck, govet, staticcheck, unused,
+# ineffassign, ...) as a hard gate on product code. The one carve-out:
+# unchecked Close()/cleanup errors in _test.go files are idiomatic teardown
+# noise, not product bugs — the assertions are the gate there. Everything else
+# (staticcheck, unused, govet, ...) still applies to tests.
+linters:
+  exclusions:
+    rules:
+      - path: '_test\.go'
+        linters:
+          - errcheck
+      # test/ holds runnable e2e/demo harness mains (not _test files); their
+      # gate is the harness's own PASSED/FAILED verdict, so teardown-path
+      # Close/RemoveAll noise gets the same carve-out as _test.go files.
+      - path: '^test/'
+        linters:
+          - errcheck

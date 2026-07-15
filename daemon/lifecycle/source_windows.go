@@ -107,7 +107,7 @@ func (winEventSource) Events(ctx context.Context) <-chan PowerEvent {
 			}
 		})
 		if srErr == nil {
-			defer suspendResume.unregister()
+			defer func() { _ = suspendResume.unregister() }()
 		}
 
 		// Lid open/closed via the hidden message-window watcher (the only
@@ -122,7 +122,7 @@ func (winEventSource) Events(ctx context.Context) <-chan PowerEvent {
 			send(PowerEvent{Kind: EvLidClosed})
 		})
 		if lidErr == nil {
-			defer lw.close()
+			defer func() { _ = lw.close() }()
 		}
 
 		// Emit an initial sample immediately so callers see current state

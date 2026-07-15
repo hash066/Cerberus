@@ -161,7 +161,7 @@ func main() {
 	if derr != nil {
 		log.Fatalf("open store: %v", derr)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Durable CRDT engine (agent memory + checkpoints) and eUTXO ledger.
 	crdtEngine, cerr := state.Open(db)
@@ -707,7 +707,9 @@ func main() {
 		kernel:    ffi.Backend(),
 		started:   started,
 	}
-	rpc.Register(rpcService)
+	if err := rpc.Register(rpcService); err != nil {
+		log.Fatalf("RPC register error: %v", err)
+	}
 	l, err := net.Listen("tcp", *rpcAddr) // TCP instead of UDS for Windows simplicity in skeleton
 	if err != nil {
 		log.Fatalf("RPC listen error: %v", err)

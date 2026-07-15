@@ -481,7 +481,7 @@ func NewOSCaptureSource(f Format) (Source, error) {
 			initDone <- initResult{err: fmt.Errorf("audio: WASAPI IAudioClient.Start: %w", err)}
 			return
 		}
-		defer ac.Stop()
+		defer func() { _ = ac.Stop() }()
 
 		initDone <- initResult{}
 
@@ -692,7 +692,7 @@ func NewOSPlaybackSink(f Format) (Sink, error) {
 			initDone <- initResult{err: fmt.Errorf("audio: WASAPI IAudioClient.Start: %w", err)}
 			return
 		}
-		defer ac.Stop()
+		defer func() { _ = ac.Stop() }()
 
 		initDone <- initResult{}
 

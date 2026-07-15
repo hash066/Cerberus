@@ -1,4 +1,10 @@
-//go:build !windows
+//go:build !windows || cgo
+
+// The cgo exclusion on Windows: cgofuse's cgo variant needs the WinFsp SDK's
+// FUSE headers at compile time, which a cgo-enabled build (e.g. -tags ffi with
+// a C toolchain) does not otherwise require. The shipped Windows mount uses
+// cgofuse's nocgo DLL binding (mount_windows.go, `windows && !cgo`); a
+// cgo-enabled Windows build gets this honest stub instead of a build error.
 
 package ninep
 

@@ -338,7 +338,7 @@ func rpcMeshPeers(rpcAddr, token string) int {
 	if err != nil {
 		return 0
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	var resp rpNodesResp
 	if err := c.Call("DaemonRPC.Nodes", &rpNodesReq{Token: token}, &resp); err != nil {
 		return 0
@@ -366,7 +366,7 @@ func fetchClusterResources(ctx context.Context, apiAddr, token string) (api.Clus
 	if err != nil {
 		return out, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return out, fmt.Errorf("HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
@@ -388,7 +388,7 @@ func fetchStatus(ctx context.Context, apiAddr, token string) (api.Snapshot, erro
 	if err != nil {
 		return out, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return out, err
 	}
@@ -405,7 +405,7 @@ func fetchDevices(ctx context.Context, apiAddr, token string) ([]api.NamespaceDe
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var out []api.NamespaceDevice
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
@@ -439,7 +439,7 @@ func freePort() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 

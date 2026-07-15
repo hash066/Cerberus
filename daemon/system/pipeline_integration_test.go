@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"encoding/binary"
-	"fmt"
 	"testing"
 	"time"
 
@@ -154,37 +152,6 @@ func TestPipelineRemoteShard23(t *testing.T) {
 	if !bytes.Equal(res.Output, wantEnc) {
 		t.Fatalf("direct remote mismatch: got %x want %x", res.Output, wantEnc)
 	}
-}
-
-func testActivationDeliver(t *testing.T, ctx context.Context, sender, receiver pipelineTestNode) error {
-	t.Helper()
-	client, err := dataplane.NewClientWithIdentity(sender.fabric.Identity())
-	if err != nil {
-		return err
-	}
-	ep, err := sender.fabric.RequestActivationGrant(ctx, receiver.fabric.PeerID(), 16)
-	if err != nil {
-		return fmt.Errorf("grant: %w", err)
-	}
-	payload := EncodeActivation(SplitMLPDefaultInput)
-	if err := client.SendBytes(ctx, ep, payload); err != nil {
-		return fmt.Errorf("send: %w", err)
-	}
-	var tid [8]byte
-	binary.LittleEndian.PutUint64(tid[:], ep.TransferID)
-	task := contract.ComputeTask{
-		TaskID: []byte("act-test"),
-		Shard:  contract.Shard{Kind: contract.ShardPipeline, LayerLo: 0, LayerHi: 1},
-		Deps:   []contract.Promise{{PromiseID: tid[:]}},
-	}
-	res, err := receiver.worker.HandleCompute(ctx, task, auth.Grant{})
-	if err != nil {
-		return err
-	}
-	if !res.OK {
-		return fmt.Errorf("compute: %s", res.Error)
-	}
-	return nil
 }
 
 func setupPipelineNodePair(t *testing.T, ctx context.Context) (a, b pipelineTestNode, trusted map[contract.PeerID][]byte) {

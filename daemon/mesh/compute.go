@@ -220,7 +220,7 @@ func (f *Fabric) ServeCompute(h ComputeHandler) {
 
 func (f *Fabric) handleComputeStream(s network.Stream, h ComputeHandler) {
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	raw, err := ss.Recv()
 	if err != nil {
@@ -282,7 +282,7 @@ func (f *Fabric) handleSignedComputeStream(
 	requiredRight contract.Right,
 ) {
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	raw, err := ss.Recv()
 	if err != nil {
@@ -394,7 +394,7 @@ func (f *Fabric) RequestCompute(ctx context.Context, worker contract.PeerID, tas
 		return contract.ComputeResult{}, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	body, err := json.Marshal(computeRequest{Task: taskToWire(task), Cap: capH})
 	if err != nil {
@@ -439,7 +439,7 @@ func (f *Fabric) RequestComputeSigned(ctx context.Context, worker contract.PeerI
 		return contract.ComputeResult{}, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	body, err := json.Marshal(computeRequest{Task: taskToWire(task), Cap: capH, Issuer: issuer})
 	if err != nil {

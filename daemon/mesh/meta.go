@@ -87,7 +87,7 @@ func (f *Fabric) handleMetaStream(
 	isRevoked auth.RevocationPredicate,
 ) {
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	raw, err := ss.Recv()
 	if err != nil {
@@ -240,7 +240,7 @@ func (f *Fabric) requestMeta(ctx context.Context, peer contract.PeerID, req meta
 		return metaResponse{}, fmt.Errorf("mesh: dial meta peer: %w", err)
 	}
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	body, err := json.Marshal(req)
 	if err != nil {

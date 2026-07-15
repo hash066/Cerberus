@@ -18,13 +18,11 @@ import (
 // up the grant's byte quota, and only THEN streams the payload — enforcing the
 // quota while it streams. No payload byte is consumed before authorization.
 
-// quotaFor resolves the byte ceiling for a given (transfer, capability). The
-// control plane authorized a specific transfer with a specific Quota when it
-// minted the Endpoint; the server consults its own record of that grant rather
-// than trusting the sender's header. This is the seam where a real deployment
-// would look the grant up from the capability's caveats; in v0.1 the daemon
-// registers the authorized transfers it handed out (see RegisterGrant).
-type quotaFor func(transferID uint64, cap contract.CapHandle) (contract.Quota, bool)
+// Quota resolution: the control plane authorized a specific transfer with a
+// specific Quota when it minted the Endpoint; the server consults its own
+// record of that grant (see RegisterGrant) rather than trusting the sender's
+// header. This is the seam where a real deployment would look the grant up
+// from the capability's caveats.
 
 // Sink consumes a fully-received blob. The server hands it the transfer id and an
 // io.Reader limited to the authorized byte ceiling; the sink streams from it. The

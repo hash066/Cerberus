@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-const mockLayerCount = 4
-
 func mockForced() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("CERBERUS_LLAMACPP_MOCK")))
 	return v == "1" || v == "true" || v == "yes"
@@ -24,14 +22,6 @@ func mockForwardRange(input [ActivationDim]float32, layerLo, layerHi uint32) ([A
 		out = applyMockLayer(out, int(layer), int(layerHi))
 	}
 	return out, nil
-}
-
-func mockExpectedOutput() [ActivationDim]float32 {
-	out, err := mockForwardRange(DefaultActivation, 0, mockLayerCount-1)
-	if err != nil {
-		panic(err)
-	}
-	return out
 }
 
 func applyMockLayer(in [ActivationDim]float32, layer, layerHi int) [ActivationDim]float32 {

@@ -245,11 +245,10 @@ type msg struct {
 type lidWatcher struct {
 	onLidChange func(open bool)
 
-	mu       sync.Mutex
-	hwnd     uintptr
-	notify   uintptr // HPOWERNOTIFY from RegisterPowerSettingNotification
-	quitOnce sync.Once
-	stopped  chan struct{}
+	mu      sync.Mutex
+	hwnd    uintptr
+	notify  uintptr // HPOWERNOTIFY from RegisterPowerSettingNotification
+	stopped chan struct{}
 }
 
 var (
@@ -281,7 +280,7 @@ func lidWndProc(hwnd uintptr, message uint32, wparam uintptr, lparam unsafe.Poin
 		return 0
 	}
 	if message == wmDestroy {
-		procPostQuitMessage.Call(0)
+		_, _, _ = procPostQuitMessage.Call(0)
 		return 0
 	}
 	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(message), wparam, uintptr(lparam))
@@ -318,7 +317,7 @@ func newLidWatcher(onLid func(open bool)) (*lidWatcher, error) {
 		// RegisterClassExW may legitimately fail with ERROR_CLASS_ALREADY_EXISTS
 		// if a prior watcher in this process registered it; that's fine, we can
 		// still create a window against the existing class.
-		procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+		_, _, _ = procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 
 		hwnd, _, err := procCreateWindowExW.Call(
 			0,
@@ -346,7 +345,7 @@ func newLidWatcher(onLid func(open bool)) (*lidWatcher, error) {
 		)
 		if notify == 0 {
 			lidWatcherRegistry.Delete(hwnd)
-			procDestroyWindow.Call(hwnd)
+			_, _, _ = procDestroyWindow.Call(hwnd)
 			ready <- nerr
 			return
 		}
@@ -363,8 +362,8 @@ func newLidWatcher(onLid func(open bool)) (*lidWatcher, error) {
 			if int32(r) <= 0 {
 				break
 			}
-			procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
-			procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
+			_, _, _ = procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+			_, _, _ = procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
 		}
 
 		lidWatcherRegistry.Delete(hwnd)
@@ -392,8 +391,8 @@ func (w *lidWatcher) close() error {
 		}
 	}
 	if hwnd != 0 {
-		procPostMessageW.Call(hwnd, uintptr(wmClose), 0, 0)
-		procDestroyWindow.Call(hwnd) // triggers WM_DESTROY -> PostQuitMessage in lidWndProc
+		_, _, _ = procPostMessageW.Call(hwnd, uintptr(wmClose), 0, 0)
+		_, _, _ = procDestroyWindow.Call(hwnd) // triggers WM_DESTROY -> PostQuitMessage in lidWndProc
 	}
 	<-w.stopped
 	return firstErr

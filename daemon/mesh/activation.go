@@ -33,7 +33,7 @@ type activationGrantResponse struct {
 func (f *Fabric) ServeActivationGrant(h ActivationGrantHandler) {
 	f.host.SetStreamHandler(activationProto, func(s network.Stream) {
 		ss := newStreamSession(s)
-		defer ss.Close()
+		defer func() { _ = ss.Close() }()
 
 		raw, err := ss.Recv()
 		if err != nil {
@@ -69,7 +69,7 @@ func (f *Fabric) RequestActivationGrant(ctx context.Context, worker contract.Pee
 		return dataplane.Endpoint{}, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
 	ss := newStreamSession(s)
-	defer ss.Close()
+	defer func() { _ = ss.Close() }()
 
 	body, err := json.Marshal(activationGrantRequest{Bytes: n})
 	if err != nil {

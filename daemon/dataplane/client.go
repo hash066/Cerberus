@@ -131,7 +131,7 @@ func (c *Client) send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) (
 	if err != nil {
 		return nil, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
-	defer conn.CloseWithError(0, "done")
+	defer func() { _ = conn.CloseWithError(0, "done") }()
 
 	st, err := conn.OpenStreamSync(ctx)
 	if err != nil {

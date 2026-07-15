@@ -100,11 +100,6 @@ func (c vclock) happensBefore(other vclock) bool {
 	return c.dominatedBy(other) && !c.equal(other)
 }
 
-// concurrentWith: causally incomparable (neither happened-before the other).
-func (c vclock) concurrentWith(other vclock) bool {
-	return !c.dominatedBy(other) && !other.dominatedBy(c)
-}
-
 // dot is one causally-stamped write: a value plus the clock at authoring time.
 type dot struct {
 	Actor string `json:"actor"`

@@ -166,7 +166,7 @@ func DecodePipelineActivation(payload []byte, frame contract.ActivationFrame) (A
 
 // ActivationFromContractFrame converts a contract frame to an inference Activation.
 func ActivationFromContractFrame(frame contract.ActivationFrame) (Activation, error) {
-	dtype := TensorDTypeF32
+	var dtype TensorDType
 	switch frame.DType {
 	case contract.TensorDTypeF32, contract.TensorDTypeUnspecified:
 		dtype = TensorDTypeF32
@@ -181,7 +181,7 @@ func ToContractFrame(act Activation) (contract.ActivationFrame, error) {
 	if err := act.normalize(); err != nil {
 		return contract.ActivationFrame{}, err
 	}
-	dtype := contract.TensorDTypeF32
+	var dtype contract.TensorDType
 	switch act.DType {
 	case TensorDTypeF32, "":
 		dtype = contract.TensorDTypeF32

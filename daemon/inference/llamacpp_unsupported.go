@@ -27,3 +27,14 @@ func CLIPathForTest() (string, error) {
 func ModelPathForTest() (string, error) {
 	return "", fmt.Errorf("llamacpp: unsupported platform")
 }
+
+// llamacppRealForwardActivation is unreachable here (llamacppSupported() is
+// false, so the engine always takes the mock path) but must compile.
+func llamacppRealForwardActivation(Activation, uint32, uint32) (Activation, string, error) {
+	return Activation{}, "", fmt.Errorf("llamacpp: unsupported platform (build for windows or linux)")
+}
+
+func llamaModelConfigured() bool { return false }
+
+// LlamacppCLIReady is always false on unsupported platforms.
+func LlamacppCLIReady() bool { return false }

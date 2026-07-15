@@ -272,26 +272,6 @@ func failPipelineResult(taskID []byte, msg string) contract.ComputeResult {
 	return contract.ComputeResult{TaskID: taskID, OK: false, Error: msg}
 }
 
-func grantPipelineExecCap(fab *mesh.Fabric, site string) (contract.CapHandle, []byte, contract.PeerID, error) {
-	signer, err := NewShardCapSigner(fab.Identity())
-	if err != nil {
-		return 0, nil, contract.PeerID{}, err
-	}
-	issuerID, err := signer.IssuerPeerID()
-	if err != nil {
-		return 0, nil, contract.PeerID{}, err
-	}
-	g, err := auth.NewGrant(PipelineResource(site), []contract.Right{contract.RightExec}, nil, time.Hour)
-	if err != nil {
-		return 0, nil, contract.PeerID{}, err
-	}
-	env, err := signer.Issue(g)
-	if err != nil {
-		return 0, nil, contract.PeerID{}, err
-	}
-	return contract.CapHandle(1), env, issuerID, nil
-}
-
 // PipelineIssuerResolver returns an IssuerPubResolver backed by trusted keys plus
 // this node's own mesh identity.
 func PipelineIssuerResolver(fab *mesh.Fabric, trusted map[contract.PeerID]ed25519.PublicKey) mesh.IssuerPubResolver {
