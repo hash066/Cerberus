@@ -230,6 +230,7 @@ the scheduler via `system.schedulerLoop` (subscribed to
 | `daemon/gpu/` | the daemon's dispatch surface (software default; `-tags ffi` routes to Rust) |
 | `daemon/gpu/session.go` | GPU-over-data-plane session codec (`Serve` / `RequestSession`) for the 9P `/cer/dev/gpu` device path |
 | `daemon/dataplane/server.go` | `RegisterResponder` — the request/response session a GPU ctl grant uses |
+| `daemon/gpu/vramprobe*.go` | real per-device VRAM telemetry — see [docs/vram.md](vram.md) |
 | `daemon/ffi/gpu_ffi.go` | cgo binding to `cerberus_gpu_submit` (`-tags ffi`) |
 | `daemon/ffi/gpu_ffi_ld.go` | extra Win32 link flags for the GPU build (`-tags "ffi ffigpu"`) |
 | `daemon/mesh/gpu.go` | cross-node GPU dispatch primitive (capability-gated) |
