@@ -1,20 +1,20 @@
-// inference.go is the shared entry point for pipeline-backed inference demos.
-// Gateway chat completions and `cerberus pipeline-run` both call InferenceService
-// so they exercise the same PipelineRunner path. v0.1 uses the honest split-MLP
-// cpu-software fixture; MLX / llama.cpp backends plug in via InferenceModelSpec.
+// inference.go is the entry point for the PIPELINE FIXTURE path: it drives the
+// deterministic split-MLP activation across mesh nodes through PipelineRunner.
 //
-// Model support matrix (v0.1.1, honest):
+// WHAT THIS IS: a test/demo harness for Cerberus's own distribution machinery
+// (mesh streams, dataplane, scheduler, signed capability gates). The split-MLP
+// fixture is 4 layers x 4 dimensions with weights from a formula. It is not a
+// language model and has no tokenizer, weights, KV-cache or sampler.
 //
-//	| Model ID        | Backend    | Platform        | Weights / deps              | Pipeline shards |
-//	|-----------------|------------|-----------------|-----------------------------|-----------------|
-//	| split-mlp-demo  | cpu-soft   | all             | built-in fixture            | 2 (4 layers)    |
-//	| llamacpp-mock   | llama.cpp  | all             | mock shard forward (CI)     | 2 (4 layers)    |
-//	| tinyllama-1b    | llama.cpp  | Win/Linux       | CERBERUS_LLAMA_MODEL + CLI  | 2 (22 layers)   |
-//	| llama-3.2-1b    | mlx        | macOS AS + MLX  | CERBERUS_MLX_MODEL + mlx-lm | 2 (16 layers)   |
+// WHAT THIS IS NOT: real LLM inference. That lives in daemon/llama, which
+// supervises upstream llama.cpp and tunnels its RPC over a capability-gated mesh
+// session. Chat completions are served from there, not from here.
 //
-// Without weights the LLM entries still run: shard forward uses deterministic
-// mock transforms; Complete()/MLXGenerate() produce real tokens only when deps
-// are present. CI always uses llamacpp-mock or split-mlp-demo.
+// DELIBERATELY NOT ON /v1/models: BuiltinInferenceModels() is empty. The fixture is
+// reachable from `cerberus pipeline-run` and the e2e harnesses, which is honest —
+// listing it as a chat model on /v1/models would not be. v0.1 shipped
+// `llamacpp-mock`, `tinyllama-1b` and `llama-3.2-1b` here; none of them ran a real
+// model and all three were removed in Lane L / L0.
 package system
 
 import (
@@ -26,13 +26,13 @@ import (
 	"github.com/hash066/cerberus/daemon/inference"
 )
 
-// InferenceBackend names the compute backend for an inference model.
+// InferenceBackend names the compute backend for an inference model. Only the
+// split-MLP fixture backend exists; the llama.cpp / MLX entries were mocks and are
+// gone (see daemon/inference/backend.go).
 type InferenceBackend string
 
 const (
 	InferenceBackendCPUSoftware InferenceBackend = "cpu-software"
-	InferenceBackendMLX         InferenceBackend = "mlx"
-	InferenceBackendLlamaCpp    InferenceBackend = "llama.cpp"
 )
 
 // InferenceFixture names a built-in demo model (no weights file on disk).
@@ -54,8 +54,12 @@ type InferenceModelSpec struct {
 	Fixture    InferenceFixture // non-empty for built-in demos
 }
 
-// SplitMLPDemoModel is the canonical split-MLP pipeline fixture advertised on
-// /v1/models and exercised by gateway streaming + `cerberus pipeline-run`.
+// SplitMLPDemoModel is the split-MLP pipeline FIXTURE, exercised by
+// `cerberus pipeline-run` and the two-node e2e harnesses.
+//
+// It is deliberately absent from BuiltinInferenceModels(): a fixture in a test is
+// honest, a fixture on /v1/models pretending to be a chat model is not. Callers
+// that want it must name it explicitly.
 var SplitMLPDemoModel = InferenceModelSpec{
 	ID:         "split-mlp-demo",
 	Backend:    InferenceBackendCPUSoftware,
@@ -63,41 +67,24 @@ var SplitMLPDemoModel = InferenceModelSpec{
 	Fixture:    InferenceFixtureSplitMLP,
 }
 
-// LlamaCppMockModel exercises the llamacpp pipeline backend with mock shard
-// forward (no GGUF weights). Set CERBERUS_LLAMA_MODEL + llama-cli for real tokens
-// via inference.Complete in formatInferenceOutput.
-var LlamaCppMockModel = InferenceModelSpec{
-	ID:         "llamacpp-mock",
-	Backend:    InferenceBackendLlamaCpp,
-	LayerCount: 4,
-	Fixture:    InferenceFixtureSplitMLP,
-}
-
-// TinyLlamaModel is TinyLlama-1.1B (22 transformer layers). Requires Windows or
-// Linux with llama.cpp CLI + GGUF at CERBERUS_LLAMA_MODEL for real tokens; shard
-// forward stays mock until llama.cpp layer-range FFI lands.
-var TinyLlamaModel = InferenceModelSpec{
-	ID:         "tinyllama-1b",
-	Backend:    InferenceBackendLlamaCpp,
-	LayerCount: 22,
-}
-
-// Llama32Model is Llama 3.2 1B Instruct (16 layers). Requires macOS Apple
-// Silicon with mlx-lm and CERBERUS_MLX_MODEL for real shard forward / tokens.
-var Llama32Model = InferenceModelSpec{
-	ID:         "llama-3.2-1b",
-	Backend:    InferenceBackendMLX,
-	LayerCount: 16,
-}
-
-// BuiltinInferenceModels returns the v0.1.1 demo registry.
+// BuiltinInferenceModels returns the models advertised on the gateway's /v1/models.
+//
+// It is EMPTY, and that is correct. Every entry it used to hold was a mock:
+// `llamacpp-mock` ran a fake transform, `tinyllama-1b` ran a fake transform and
+// prompted llama-cli with the auth subject, `llama-3.2-1b` required an MLX sidecar
+// that rejected any model above 4 layers. Real chat models are registered by
+// daemon/llama once a llama-server pack is present — see llama.NewService.
+//
+// Do not re-add the split-MLP fixture here to make the list look populated.
 func BuiltinInferenceModels() []InferenceModelSpec {
-	return []InferenceModelSpec{
-		SplitMLPDemoModel,
-		LlamaCppMockModel,
-		TinyLlamaModel,
-		Llama32Model,
-	}
+	return nil
+}
+
+// PipelineFixtureModels returns the fixture registry for the pipeline harnesses
+// (`cerberus pipeline-run`, test/pipeline_e2e). These are NOT chat models and are
+// not advertised on /v1/models.
+func PipelineFixtureModels() []InferenceModelSpec {
+	return []InferenceModelSpec{SplitMLPDemoModel}
 }
 
 // InferenceResult is the outcome of one inference run.
@@ -214,7 +201,7 @@ func (s *InferenceService) run(ctx context.Context, subject string, spec Inferen
 		}
 		return res, fmt.Errorf("%s", res.Error)
 	}
-	content, ferr := formatInferenceOutput(ctx, subject, spec, pipe.Output)
+	content, ferr := formatFixtureOutput(spec, pipe.Output)
 	if ferr != nil {
 		return res, ferr
 	}
@@ -231,19 +218,18 @@ func setRunnerBackend(runner *PipelineRunner, spec InferenceModelSpec, override 
 		runner.Backend = be
 		return nil
 	}
-	switch spec.Backend {
-	case InferenceBackendLlamaCpp:
-		runner.Backend = inference.BackendLlamacpp
-	case InferenceBackendMLX:
-		runner.Backend = inference.BackendMLX
-	default:
-		runner.Backend = inference.BackendCPUSoftware
-	}
+	// Only the split-MLP fixture backend exists on this path.
+	runner.Backend = inference.BackendCPUSoftware
 	return nil
 }
 
 // ShardsForLayerCount splits layerCount transformer layers evenly across shardCount
-// pipeline shards (inclusive LayerLo/LayerHi ranges). Used by real LLM models.
+// pipeline shards (inclusive LayerLo/LayerHi ranges).
+//
+// NOTE: this is Phase-2 substrate, not the real-LLM path. Real llama.cpp inference
+// (daemon/llama) does NOT use it: llama.cpp owns its own layer split, distributing
+// weights across local+remote devices in proportion to measured memory (overridable
+// with --tensor-split). Do not wire this into that path.
 func ShardsForLayerCount(layerCount uint32, shardCount int) ([]contract.Shard, error) {
 	if layerCount == 0 {
 		return nil, fmt.Errorf("inference: layer count must be > 0")
@@ -288,49 +274,21 @@ func shardsForSpec(spec InferenceModelSpec) ([]contract.Shard, error) {
 	}
 }
 
-func formatInferenceOutput(ctx context.Context, prompt string, spec InferenceModelSpec, output []byte) (string, error) {
-	switch spec.Backend {
-	case InferenceBackendLlamaCpp:
-		if inference.LlamacppCLIReady() {
-			if _, err := inference.ModelPathForTest(); err == nil {
-				text, backend, err := inference.Complete(ctx, prompt, 16)
-				if err != nil {
-					return "", err
-				}
-				return fmt.Sprintf("[%s] %s", backend, text), nil
-			}
-		}
-		vec, err := DecodeActivation(output)
-		if err != nil {
-			return "", err
-		}
-		tag := spec.ID
-		if tag == "" {
-			tag = "llamacpp-mock"
-		}
-		return fmt.Sprintf("[%s] activation: [%.4f, %.4f, %.4f, %.4f]",
-			tag, vec[0], vec[1], vec[2], vec[3]), nil
-	case InferenceBackendMLX:
-		if inference.MLXSidecarReady() && inference.MLXAvailable() {
-			text, backend, err := inference.MLXGenerate(ctx, prompt, 16)
-			if err == nil {
-				return fmt.Sprintf("[%s] %s", backend, text), nil
-			}
-		}
-		vec, err := DecodeActivation(output)
-		if err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("[%s mlx-mock] activation: [%.4f, %.4f, %.4f, %.4f]",
-			spec.ID, vec[0], vec[1], vec[2], vec[3]), nil
-	default:
-		vec, err := DecodeActivation(output)
-		if err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("[split-mlp %s] activation: [%.4f, %.4f, %.4f, %.4f]",
-			spec.Backend, vec[0], vec[1], vec[2], vec[3]), nil
+// formatFixtureOutput renders the split-MLP fixture's output activation.
+//
+// It takes NO prompt and NO subject, by design. The function this replaced took a
+// `prompt string` parameter that its only caller filled with the authorization
+// SUBJECT, and then passed that subject to a text-completion call — i.e. the model
+// was literally prompted with the auth principal. A subject is an authz identity
+// and must never reach a model. There is no prompt on this path at all: the fixture
+// consumes an activation vector, not text.
+func formatFixtureOutput(spec InferenceModelSpec, output []byte) (string, error) {
+	vec, err := DecodeActivation(output)
+	if err != nil {
+		return "", err
 	}
+	return fmt.Sprintf("[split-mlp fixture %s] activation: [%.4f, %.4f, %.4f, %.4f]",
+		spec.Backend, vec[0], vec[1], vec[2], vec[3]), nil
 }
 
 func formatStageToken(stage PipelineStageResult) string {

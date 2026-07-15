@@ -60,7 +60,9 @@ func (s *server) wirePipeline(ctx context.Context) error {
 	runner.Signer = s.signer
 	runner.Site = meshSite
 	s.pipelineRunner = runner
-	s.inferenceSvc = system.NewInferenceService(runner, system.BuiltinInferenceModels())
+	// The e2e node serves the split-MLP FIXTURE registry, not the gateway's
+	// /v1/models registry (which is empty by design — see BuiltinInferenceModels).
+	s.inferenceSvc = system.NewInferenceService(runner, system.PipelineFixtureModels())
 	return nil
 }
 
