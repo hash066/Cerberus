@@ -34,6 +34,7 @@ cerberus status                 # daemon health, identity, balance
 cerberus gpu vector-add 1,2,3 4,5,6   # runs a compute kernel (backend: cpu-software)
 cerberus fs put myfile.txt      # store a file in the distributed FS
 cerberus fs ls
+cerberus pipeline-run           # layer-split inference demo; prints where each stage ran
 cerberus audio loopback         # a real audio session over the QUIC data plane
 cerberus conflicts assert sky blue --agent alice   # belief CRDT
 ```
@@ -56,9 +57,14 @@ Then, using the other machine's hex PeerID:
 
 ```
 cerberus run hello.wasm --on <their-peer-id>     # run a workload on their machine
+cerberus gpu vector-add 1,2,3 4,5,6 --on <their-peer-id>   # kernel on THEIR compute
 cerberus audio play --on <their-peer-id>         # your mic -> their speaker
 cerberus audio monitor --on <their-peer-id>      # their mic -> your speaker
+cerberus pipeline-run                            # inference stages placed across the mesh
 ```
+
+(Need a `hello.wasm`? [QUICKSTART.md §4](QUICKSTART.md) has a one-liner that
+writes the 45-byte demo module, plus the full two-machine walkthrough.)
 
 **Different networks (over the internet):** mDNS can't reach across the internet,
 so use an overlay:
@@ -78,12 +84,13 @@ so use an overlay:
 | Capability | Status |
 |---|---|
 | Run WASM workloads locally + **on a remote peer** | ✅ works |
-| Distributed filesystem (`fs put/get/ls`) | ✅ works (shards scatter to peers when present) |
+| Distributed filesystem (`fs put/get/cat/ls`) | ✅ works (shards scatter to peers when present; `put` on one node, `get` on another) |
 | Wallet balance + transaction log | ✅ works (beta: usage log, no real value transfer) |
 | Belief-conflict detect / list / resolve | ✅ works |
 | GPU compute (`gpu <kernel>`) | ✅ real compute; **`backend: cpu-software`** by default. Physical GPU (`gpu-wgpu`) needs a from-source build — see `docs/gpu.md` |
+| Target a peer's GPU (`gpu <kernel> … --on <peer>`) | ✅ works — capability-checked on the peer; reports the backend the peer actually used |
+| Pipeline inference (`pipeline-run`) | ✅ works — split-MLP fixture layers placed across nodes, activations over the data plane. LLM backends (`--backend llamacpp`/`mlx`) are engine seams that honestly report `-mock` without real weights |
 | Audio session (local loopback) | ✅ works |
 | Cross-node mic/speaker (`audio play/monitor --on`) | ✅ wired + capability-gated; needs two machines with real mic/speaker to *hear* |
-| Target a peer's GPU (`gpu --on`) | ⏳ mesh primitive tested, not yet wired into the app |
 
 Report anything that errors or surprises you — that's what the beta is for.
