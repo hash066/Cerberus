@@ -73,11 +73,10 @@ func buildCerberusd(repoRoot string) (string, error) {
 	}
 	defer release()
 
-	// Another process may have built while we waited for the lock.
-	if st, err := os.Stat(binPath); err == nil && st.Size() > 0 {
-		return binPath, nil
-	}
-
+	// Always rebuild under the lock: reusing a binary left by a PREVIOUS run
+	// silently tests stale code (go's own build cache makes a no-change rebuild
+	// cheap, so the lock — not a stat shortcut — is what dedupes concurrent
+	// builders). The in-process memo above still avoids rebuilding per test.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, "./cmd/cerberusd")
