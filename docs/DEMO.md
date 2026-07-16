@@ -4,6 +4,25 @@ The story to tell: **one click installs a zero-trust compute mesh; humans AND AI
 agents drive it; every action is capability-gated.** Show real machines, real
 output — never fake a backend (if the GPU build isn't `gpu-wgpu`, say so).
 
+> [!IMPORTANT]
+> **Do not shoot these — they are not real, and a launch video is the worst
+> possible place to find that out:**
+>
+> - **Any LLM / chat scene.** Cerberus runs no language models. `pipeline-run`
+>   distributes a 4×4 MLP **fixture**. Do not point an OpenAI client at
+>   `/v1/chat/completions` on camera: it returns `"1337"` for any model name with
+>   fabricated token counts (known bug — see [gateway.md](gateway.md)). It would
+>   look exactly like a working LLM. That shot would be a lie.
+> - **A Windows drive letter (`X:`) mount.** Unverified — needs WinFsp. The
+>   Linux FUSE mount is real and fair game.
+> - **Browsing `/cer/fs` in Explorer or a file manager.** Not supported: fs files
+>   aren't enumerated and read-open returns `ENOSYS`. Shoot `cerberus fs
+>   put`/`get` instead — that path is real.
+> - **macOS audio.** Never compiled. Windows and Linux audio are real.
+>
+> The rule, same as the repo's: if it isn't wired, the demo says so or the demo
+> doesn't show it.
+
 ## Before you record
 - **Two machines** on the same Wi‑Fi (Machine A = "yours", Machine B = "a friend").
   Both have the installer. (For a cross‑internet shot, both on the same Tailscale.)

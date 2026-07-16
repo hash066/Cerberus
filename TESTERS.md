@@ -81,6 +81,12 @@ so use an overlay:
 
 ## What works vs. what's in progress (honest)
 
+> This is the **tester's view** — what you'll hit in the first hour, in the order
+> you'll hit it. The canonical Real/Partial/Stub matrix, with a code path behind
+> every row, is the table at the top of
+> **[README.md](README.md#what-works-today-v01-beta--honest)**. If the two ever
+> disagree, README wins and this table is the bug.
+
 | Capability | Status |
 |---|---|
 | Run WASM workloads locally + **on a remote peer** | ✅ works |

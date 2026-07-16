@@ -34,9 +34,15 @@ is what you want, use exo. [Comparison below.](#cerberus-vs-exo)
 
 ## What works today (v0.1 beta — honest)
 
-Everything in the **Real** column runs today and is exercised by tests or an
-e2e harness in this repo. Nothing below is aspirational; the linked code is the
-claim.
+**This table is canonical.** It is the single source of truth for what is Real /
+Partial / Stub, and every other doc in the repo defers to it rather than keeping
+its own status list — the last round of drift happened precisely because five
+different tables each had their own opinion. If a doc disagrees with this table,
+this table wins and the doc is a bug.
+
+Every row cites the code that backs it. **Real** means it runs today and is
+exercised by a test or an e2e harness in this tree. Nothing here is aspirational,
+and the caveats are in the rows rather than in a footnote you won't read.
 
 | Capability | Status | Where |
 |---|---|---|
@@ -259,8 +265,8 @@ Four ways to drive the same capability-gated daemon:
 | **[Gateway API](docs/gateway.md)** | the OpenAI-compatible surface |
 | **[MCP server](docs/mcp.md)** | wiring Claude Code / Cursor to the mesh |
 | **[GPU](docs/gpu.md)** | the honest backend model + the real-GPU (wgpu) build |
-| **[ARCHITECTURE.md](ARCHITECTURE.md)** | canonical spec: schemas, invariants, maturity matrix (§8) |
-| **[Vision & Roadmap](VISION-AND-ROADMAP.md)** | where this goes; what's real vs stub, by name |
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | canonical spec: schemas, invariants, and §8's design-verdict-vs-what's-in-the-tree matrix |
+| **[Vision & Roadmap](VISION-AND-ROADMAP.md)** | where this goes next, and the phase-by-phase history |
 | **[docs/verticals/](docs/verticals/)** | 11 low-level designs (ocap kernel, mesh, CRDT, 9P, economy, …) |
 | **[CLAUDE.md](CLAUDE.md)** | build conventions incl. the maturity-honesty rule |
 

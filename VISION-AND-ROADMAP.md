@@ -4,6 +4,12 @@
 > Honest about maturity by design (per [ARCHITECTURE.md §8](ARCHITECTURE.md)). It pairs with:
 > [ARCHITECTURE.md](ARCHITECTURE.md) (the canonical spec), [HANDOFF.md](HANDOFF.md) (deep technical "where things stand"),
 > [CONTRACT.md](CONTRACT.md) (the frozen integration seam), and the per-feature designs in [docs/verticals/](docs/verticals/).
+>
+> **For "what works today", the canonical table is the one at the top of
+> [README.md](README.md#what-works-today-v01-beta--honest)** — every row cites a
+> code path. This document is the *roadmap*: it says where things are going and
+> tracks phase-by-phase history, which is a different job. Where the two
+> disagree, README wins.
 
 **Status legend** — used throughout:
 
