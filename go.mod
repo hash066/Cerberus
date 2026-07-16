@@ -8,6 +8,7 @@ require (
 	github.com/hugelgupf/p9 v0.4.1
 	github.com/ipfs/go-cid v0.6.1
 	github.com/ipld/go-ipld-prime v0.24.0
+	github.com/jfreymuth/pulse v0.1.2
 	github.com/klauspost/reedsolomon v1.14.1
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/libp2p/go-libp2p-pubsub v0.16.0
