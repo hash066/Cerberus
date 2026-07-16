@@ -174,6 +174,10 @@ func RegisterPipelineWorker(
 			func() int64 { return time.Now().Unix() },
 			nil,
 			contract.RightExec,
+			// Scope the gate to the pipeline's own resource — the one
+			// PipelineRunner.mintExecCap issues against (see pipeline.go). A
+			// mesh-compute or mesh-gpu cap must not drive pipeline shards.
+			PipelineResource(site),
 		)
 	}
 	return svc, nil

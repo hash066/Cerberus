@@ -10,7 +10,7 @@ package audiolink
 // plane mints the grant; media rides the data plane) — only the endpoint is
 // local — so it proves the session mechanism runs in real time and is the honest,
 // hardware-free way to exercise it. A true remote mic→speaker session additionally
-// needs a second node and real audio devices (daemon/audio's WASAPI backends).
+// needs a second node and real audio devices (daemon/audio's real OS backends: WASAPI on Windows, PulseAudio on Linux).
 
 import (
 	"context"

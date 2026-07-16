@@ -438,11 +438,13 @@ func capForResourceAs(t *testing.T, requester *Fabric, res contract.ResourceRef,
 // scoped to a DIFFERENT resource — MeshComputeResource, i.e. permission to run a
 // WASM workload, not to run llama.cpp tensor work.
 //
-// Every other gate in this package would ACCEPT it, because none of them compares
-// grant.Resource to what is being accessed (auth.Verify does not even take the
-// resource as an argument). Accepting it here would mean a peer trusted to run a
-// sandboxed WASM job could instead open a ggml-rpc session — a CVE-2026-34159
-// pre-auth RCE surface — using a capability that never mentioned llama.
+// Every other gate in this package USED to accept exactly this, because none of
+// them compared grant.Resource to what was being accessed (auth.Verify does not
+// even take the resource as an argument). They all scope now — see capscope.go and
+// the sibling *DeniedWithCapForDifferentResource tests — but the stakes are
+// highest here: accepting it would mean a peer trusted to run a sandboxed WASM job
+// could instead open a ggml-rpc session, a CVE-2026-34159 pre-auth RCE surface,
+// using a capability that never mentioned llama.
 //
 // If this test starts failing, the gate has regressed to a signed permission slip.
 func TestLlamaRPCDeniedWithCapForDifferentResource(t *testing.T) {
@@ -469,27 +471,29 @@ func TestLlamaRPCDeniedWithCapForDifferentResource(t *testing.T) {
 }
 
 // TestGrantCoversLlamaResource unit-tests the scoping predicate directly, so the
-// boundary is pinned without needing a live mesh.
+// boundary is pinned without needing a live mesh. The predicate is now the shared
+// grantCoversResource in capscope.go, which every gate in this package uses; this
+// test keeps pinning it from llama's point of view.
 func TestGrantCoversLlamaResource(t *testing.T) {
 	want := LlamaRPCResource("site-a")
 
-	if err := grantCoversLlamaResource(auth.Grant{Resource: want}, want); err != nil {
+	if err := grantCoversResource("llama rpc", auth.Grant{Resource: want}, want); err != nil {
 		t.Fatalf("exact resource match rejected: %v", err)
 	}
 	// Right kind, wrong path (another site's worker).
-	if err := grantCoversLlamaResource(auth.Grant{Resource: LlamaRPCResource("site-b")}, want); err == nil {
+	if err := grantCoversResource("llama rpc", auth.Grant{Resource: LlamaRPCResource("site-b")}, want); err == nil {
 		t.Fatal("a cap for another site's llama resource was accepted")
 	}
 	// Right path, wrong kind.
-	if err := grantCoversLlamaResource(auth.Grant{Resource: contract.ResourceRef{Kind: contract.KindFS, Path: want.Path}}, want); err == nil {
+	if err := grantCoversResource("llama rpc", auth.Grant{Resource: contract.ResourceRef{Kind: contract.KindFS, Path: want.Path}}, want); err == nil {
 		t.Fatal("a cap of the wrong Kind was accepted")
 	}
 	// The realistic attack: a valid mesh-compute cap.
-	if err := grantCoversLlamaResource(auth.Grant{Resource: MeshComputeResource("site-a")}, want); err == nil {
+	if err := grantCoversResource("llama rpc", auth.Grant{Resource: MeshComputeResource("site-a")}, want); err == nil {
 		t.Fatal("a MeshComputeResource cap was accepted for llama offload")
 	}
 	// Zero grant.
-	if err := grantCoversLlamaResource(auth.Grant{}, want); err == nil {
+	if err := grantCoversResource("llama rpc", auth.Grant{}, want); err == nil {
 		t.Fatal("a zero-resource grant was accepted")
 	}
 }

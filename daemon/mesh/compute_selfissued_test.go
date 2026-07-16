@@ -44,6 +44,7 @@ func TestSelfIssuedComputeRequiresMatchingIssuer(t *testing.T) {
 		func() int64 { return time.Now().Unix() },
 		nil,
 		contract.RightExec,
+		MeshComputeResource("self-issued"),
 	)
 
 	// Mint a self-issued cap under the requester's mesh identity.
@@ -130,6 +131,7 @@ func TestWorkerGrantedComputeSkipsSelfIssuedBinding(t *testing.T) {
 		func() int64 { return time.Now().Unix() },
 		nil,
 		contract.RightExec,
+		contract.ResourceRef{Kind: contract.KindGPU, Path: "/cer/e2e/wasm/worker"},
 	)
 
 	grant, err := auth.NewGrant(

@@ -210,8 +210,9 @@ func (f *Fabric) handleAudioStream(
 	}
 
 	// Fail closed: verify the signed capability BEFORE opening any live audio
-	// device — no mic capture and no speaker render happens on an invalid envelope.
-	if _, verr := verifyAudioCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked, requiredRight); verr != nil {
+	// device — no mic capture and no speaker render happens on an invalid envelope,
+	// or on one issued for some resource other than THIS node's audio.
+	if _, verr := verifyAudioCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked, requiredRight, AudioResource(f.site)); verr != nil {
 		_ = writeAudioAck(ss, verr.Error())
 		_ = ss.Close()
 		return
@@ -251,8 +252,14 @@ func (f *Fabric) handleAudioStream(
 }
 
 // verifyAudioCap extracts the signed envelope from the request, resolves the
-// issuer key it names, and Verifies it — the single fail-closed gate applied
-// before any local audio device access. It mirrors shard.go's verifyShardCap.
+// issuer key it names, Verifies it, and checks it is scoped to wantResource —
+// the single fail-closed gate applied before any local audio device access. It
+// mirrors shard.go's verifyShardCap.
+//
+// wantResource is this node's AudioResource(site). Without that comparison a peer
+// holding ANY validly-signed cap carrying RightWrite — one issued to place a dfs
+// shard, say — could push audio into this machine's speakers, and any cap
+// carrying RightRead could open its microphone. See capscope.go.
 func verifyAudioCap(
 	env []byte,
 	claimedIssuer contract.PeerID,
@@ -260,6 +267,7 @@ func verifyAudioCap(
 	now func() int64,
 	isRevoked auth.RevocationPredicate,
 	requiredRight contract.Right,
+	wantResource contract.ResourceRef,
 ) (auth.Grant, error) {
 	if resolveIssuer == nil {
 		return auth.Grant{}, fmt.Errorf("mesh: no issuer resolver configured for audio session")
@@ -281,6 +289,9 @@ func verifyAudioCap(
 	}
 	if requiredRight != "" && !grantHasRight(grant, requiredRight) {
 		return auth.Grant{}, fmt.Errorf("mesh: audio capability lacks required right %q", requiredRight)
+	}
+	if err := grantCoversResource("audio", grant, wantResource); err != nil {
+		return auth.Grant{}, err
 	}
 	return grant, nil
 }

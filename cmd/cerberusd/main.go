@@ -30,6 +30,7 @@ import (
 	"github.com/hash066/cerberus/daemon/inference"
 	"github.com/hash066/cerberus/daemon/ledger"
 	"github.com/hash066/cerberus/daemon/lifecycle"
+	"github.com/hash066/cerberus/daemon/llama"
 	"github.com/hash066/cerberus/daemon/mesh"
 	"github.com/hash066/cerberus/daemon/metrics"
 	"github.com/hash066/cerberus/daemon/ninep"
@@ -104,6 +105,42 @@ func main() {
 		"data-plane QUIC listen address (host:port) for bulk bytes; 0.0.0.0 makes this node's data plane reachable from other machines. Previously hardcoded to 127.0.0.1:0, which made cross-machine bulk transfer impossible.")
 	dpAdvertise := flag.String("dataplane-advertise", "",
 		"host advertised to peers in data-plane endpoints. Empty = ask the OS routing table which local address reaches the peer (correct on a multi-homed box). Set this only where the routing table cannot be asked, e.g. behind a NAT/port-forward.")
+	// Lend THIS node's GPU/CPU to peers for llama.cpp tensor work. OFF by default,
+	// and the honest description of what enabling it means is much worse than
+	// "peers holding a capability", so the flag text says the true thing:
+	//
+	//   1. The llama-rpc gate resolves issuers via mesh.SelfIssuerResolver, which
+	//      returns the claimed issuer's PeerID AS its public key (shard.go:100).
+	//      Its only real assertion is "the signer is the authenticated peer on this
+	//      stream" — so ANY peer can self-sign a capability naming the llama
+	//      resource and pass. There is no set of issuers an operator authorized.
+	//   2. mDNS auto-connects to peers found on the LAN (discovery.go), and there is
+	//      NO ConnectionGater / allowlist anywhere in the tree — nothing decides
+	//      WHICH peers may join the mesh.
+	//   3. ggml-rpc's deserializer trusts its client (CVE-2026-34159 was a pre-auth
+	//      RCE there); the pack pin keeps us past the fix, but the trust model is
+	//      unchanged and this is not a sandbox.
+	//
+	// Compose those and the truth is: enabling this lets any machine on your LAN
+	// running cerberusd execute code on this one. The resource scoping added in
+	// daemon/mesh/capscope.go stops a cap for one service being reused on another —
+	// real, and necessary — but it does not make this authorization, because the
+	// attacker mints their own cap. Do not soften this text until there is a real
+	// trust-anchor set to point at.
+	llamaWorker := flag.Bool("llama-worker", false,
+		"lend this node's GPU/CPU to peers for llama.cpp inference. OFF by default. "+
+			"WARNING: this grants CODE EXECUTION on this machine to ANY PEER THAT CAN JOIN "+
+			"YOUR MESH — which today means any machine on your LAN running cerberusd with the "+
+			"same site, because peers self-issue their own capabilities and there is no peer "+
+			"allowlist yet. llama.cpp's RPC backend trusts its client and is not sandboxed. "+
+			"Only enable on a network where you trust every machine.")
+	llamaModel := flag.String("llama-model", envOr("CERBERUS_LLAMA_MODEL", ""),
+		"path to a GGUF model to serve at /v1/chat/completions. Empty = no chat backend "+
+			"(the route reports that none is wired). Only THIS node needs the weights: "+
+			"llama.cpp pushes tensors to remote workers at load time.")
+	llamaRPC := flag.String("llama-rpc", "",
+		"comma-separated host:port of llama.cpp RPC workers to offload to (advanced; "+
+			"normally Cerberus supplies these itself via cap-gated mesh forwarders). Empty = single-node.")
 	pipelineBackend := flag.String("pipeline-backend", envOr("CERBERUS_PIPELINE_BACKEND", ""),
 		"pipeline inference backend: cpu-software (default) | llamacpp | mlx (macOS/Apple Silicon sidecar; falls back to mlx-mock and says so)")
 	// Present the 9P capability namespace as a real host filesystem, so Explorer
@@ -402,6 +439,31 @@ func main() {
 			})
 			log.Println("cerberusd: mesh compute active (CPU-pool placement across peers)")
 		}
+
+		// Llama offload worker: expose THIS node's GPU/CPU to peers for llama.cpp
+		// tensor work, gated by a signed capability scoped to the llama-offload
+		// resource. Strictly opt-in — see the -llama-worker flag doc for why.
+		if *llamaWorker {
+			err := llama.WireWorker(meshFabric, llama.WorkerConfig{
+				Site:    site,
+				Revoked: auth.RevocationPredicateFromIssuer(issuer),
+			})
+			switch {
+			case errors.Is(err, llama.ErrPackMissing):
+				// Not fatal, and not a silent no-op: the operator asked to lend
+				// this machine and we cannot, so say exactly why and how to fix it.
+				log.Printf("cerberusd: -llama-worker requested but no llama.cpp pack is installed: %v", err)
+			case err != nil:
+				log.Printf("cerberusd: llama worker wiring failed: %v", err)
+			default:
+				// Say the true thing at runtime too, not just in --help: an operator
+				// who leaves this on should be reminded what they exposed.
+				log.Println("cerberusd: llama offload worker ACTIVE — WARNING: any peer that " +
+					"can join this mesh (today: any machine on your LAN running cerberusd with " +
+					"site=" + site + ") can execute llama.cpp code on this node. Peers self-issue " +
+					"their own capabilities and there is no peer allowlist yet.")
+			}
+		}
 	}
 
 	// Start Gateway with the mesh-preferring executor (no mock), auth-gated.
@@ -437,6 +499,43 @@ func main() {
 		log.Printf("cerberusd: %d inference model(s) registered on gateway", len(system.BuiltinInferenceModels()))
 	}
 	gw.RegisterModel(gateway.Model{ID: "hello-shard", ComponentCID: "hello-shard"})
+
+	// The REAL chat backend: a supervised llama-server the gateway proxies
+	// /v1/chat/completions to. Without this the route has no backend and says so
+	// rather than answering with a fixture — every mock engine was deleted.
+	//
+	// Only this node needs the GGUF: llama.cpp pushes tensors to remote workers at
+	// load time, so a peer lending its GPU needs the binary but not the weights.
+	if *llamaModel != "" {
+		svc, lerr := llama.NewService(llama.ServiceConfig{
+			ModelPath:  *llamaModel,
+			ModelID:    filepath.Base(*llamaModel),
+			RPCServers: *llamaRPC,
+			Logf:       log.Printf,
+		})
+		if lerr != nil {
+			log.Printf("cerberusd: -llama-model given but the chat backend could not be built: %v", lerr)
+		} else if serr := svc.Start(ctx); serr != nil {
+			log.Printf("cerberusd: llama-server failed to start, chat backend NOT wired: %v", serr)
+		} else {
+			gw.SetInference(svc)
+			gw.RegisterModel(gateway.Model{
+				ID:      filepath.Base(*llamaModel),
+				Kind:    gateway.ModelKindInference,
+				OwnedBy: "cerberus",
+				Inference: gateway.InferenceModelMeta{
+					Backend:   "llamacpp",
+					ModelPath: *llamaModel,
+				},
+			})
+			where := "single-node"
+			if *llamaRPC != "" {
+				where = "offloading to " + *llamaRPC
+			}
+			log.Printf("cerberusd: chat backend ACTIVE — %s (%s), /v1/chat/completions is live",
+				filepath.Base(*llamaModel), where)
+		}
+	}
 
 	// Workload history: a small in-memory ring buffer recording every dispatch
 	// through either surface that can run a workload — the OpenAI-compatible

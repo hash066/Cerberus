@@ -77,6 +77,8 @@ func newTestNode(t *testing.T, ctx context.Context, id string) *server {
 		func() int64 { return time.Now().Unix() },
 		nil,
 		contract.RightExec,
+		// Same resource grantExecCap issues against — mirrors Run().
+		wasmExecResource(id),
 	)
 	// Mirror Run(): answer peer component-fetch requests from our own store,
 	// gated by mesh-fabric-membership capability, so tests built on this helper

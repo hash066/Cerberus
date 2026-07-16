@@ -104,7 +104,8 @@ type DeviceRef struct {
 }
 
 // registerAudioDevices enumerates every real OS audio endpoint (Windows via
-// WASAPI; an honest empty list on other platforms — see daemon/audio's
+// WASAPI, Linux via the PulseAudio native protocol — both pure-Go and both
+// hardware-verified; macOS/BSD return an honest empty list, see daemon/audio's
 // EnumerateEndpoints doc) and mounts each one into the 9P namespace at
 // /cer/dev/audio/<mic|speaker>/<index>, alongside the existing VRAM device.
 // It never fails Compose: an enumeration error (or zero endpoints) just means

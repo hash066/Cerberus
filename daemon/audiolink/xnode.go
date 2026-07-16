@@ -199,7 +199,7 @@ func NewLiveMeshAudioClient(format audio.Format, cfg audio.ReceiverConfig) mesh.
 	return NewMeshAudioClient(LiveMicFactory(format), LiveSpeakerFactory(format), cfg)
 }
 
-// closeIfCloser closes v if it implements io.Closer. The real WASAPI Source/Sink
+// closeIfCloser closes v if it implements io.Closer. The real OS Source/Sink
 // hold OS device handles that must be released at session end; the synthetic
 // SineSource / BufferSink do not implement io.Closer, so this is a no-op for them.
 func closeIfCloser(v any) {
