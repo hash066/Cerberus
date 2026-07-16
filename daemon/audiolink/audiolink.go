@@ -16,7 +16,7 @@
 // libp2p/QUIC mesh session (daemon/mesh's ServeAudio / OpenAudioSession) so two
 // people on the mesh can share audio using only a peer's PeerID. daemon/mesh
 // stays a leaf w.r.t. audio — it declares AudioServer/AudioClient interfaces and
-// this package implements them against daemon/audio's real WASAPI backends.
+// this package implements them against daemon/audio's real OS backends (WASAPI on Windows, PulseAudio on Linux).
 package audiolink
 
 import (
@@ -93,7 +93,7 @@ func SendStream(ctx context.Context, w io.Writer, src audio.Source) error {
 // reconstructed frames to dst until the stream ends (io.EOF is a clean end).
 //
 // It is the receive-side counterpart to SendStream: a cross-node session hands
-// it a mesh stream and a LIVE speaker Sink (daemon/audio's WASAPI render backend)
+// it a mesh stream and a LIVE speaker Sink (daemon/audio's real OS render backend)
 // so a peer's captured audio is played here in real time.
 func SinkStream(ctx context.Context, r io.Reader, dst audio.Sink, cfg audio.ReceiverConfig) error {
 	rx := audio.NewReceiver(audio.NewRecvTransport(r), dst, cfg)
