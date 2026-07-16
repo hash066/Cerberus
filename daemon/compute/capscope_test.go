@@ -102,17 +102,23 @@ func (r *capScopeRig) dispatch(t *testing.T, ctx context.Context, env []byte, is
 // the 9P device scoping fixed in 6475759 (a cap for the LOCAL cpu device must
 // not open a PEER's device).
 //
-// The mesh compute worker verifies a presented capability's issuer, signature,
-// validity window, revocation status, and that it carries RightExec. It did NOT
-// verify WHAT RESOURCE the grant names — mesh.verifySignedCap has no resource
-// check at all, and compute.WireWorker's handler received the verified grant and
-// discarded it (`_ = grant`).
+// The gate used to enforce a presented capability's issuer, signature, validity
+// window, revocation status, and RightExec — but never WHAT RESOURCE the grant
+// named. So any signed grant carrying RightExec authorized arbitrary WASM
+// execution here: a grant for a GPU device, an unrelated 9P path, or a DIFFERENT
+// SITE's mesh-compute resource. This lane found that by dispatching each of those
+// against a real two-fabric mesh and watching all four execute hello-shard.
 //
-// So ANY signed grant carrying RightExec authorized arbitrary WASM execution on
-// this node: a grant for a GPU device, for an unrelated 9P path, or for a
-// DIFFERENT SITE's mesh-compute resource. That is authority derived from holding
-// any exec-bearing cap rather than from holding a cap for THIS resource — the
-// same ambient-authority shape, one layer up from the 9P namespace.
+// Enforcement now lives one layer down, in mesh.verifySignedCap, via the
+// wantResource argument WireWorker passes to ServeComputeSigned (Lane M's
+// 81e3f48, which found the same class independently and fixed it for every mesh
+// protocol at once — the right layer: it fails closed before the handler runs).
+//
+// These tests stay because they cover something that check does not: that THIS
+// lane's wiring hands it the correct resource. mesh's own proofs verify the
+// mechanism; these verify WireWorker actually guards the compute endpoint with
+// MeshComputeResource(site) and not something else. Passing the wrong ref there
+// would leave mesh's check intact and still be exploitable.
 //
 // Each subtest presents a genuinely valid, correctly signed envelope from a
 // trusted issuer. The ONLY thing wrong is the resource it names.
