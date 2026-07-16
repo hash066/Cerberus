@@ -216,3 +216,95 @@ func TestMinVRAMConstraint(t *testing.T) {
 		t.Fatal("expected no standby (only one feasible node)")
 	}
 }
+
+// linkNode is `node` plus a per-peer link view, which is the input the RTT term
+// of DefaultCostModel.Score consumes.
+func linkNode(id byte, vramFree uint64, rttMs float64) contract.NodeTelemetry {
+	n := node(id, vramFree, false, true)
+	if rttMs >= 0 {
+		n.Links = []contract.Link{{
+			Peer:   contract.PeerID{99},
+			Medium: contract.MediumWiFi,
+			RTTms:  rttMs,
+		}}
+	}
+	return n
+}
+
+// TestRTTPenaltyChangesPlacement proves the scheduler's link-RTT term is live
+// code that changes a real decision — given that something actually populates
+// NodeTelemetry.Links.
+//
+// READ THIS BEFORE BELIEVING THE RTT PENALTY DOES ANYTHING IN PRODUCTION: as of
+// this commit NOTHING populates Links on the shipping path. daemon/system's
+// localTelemetry (system.go:539) is the only Sample() source and it never sets
+// the field, so n.Links is nil, `worst` is 0, and `score -= worst/100` subtracts
+// zero on every node forever. daemon/system/links.go builds the real per-peer
+// link view but localTelemetryWithLinks has no non-test caller — it is inert by
+// its own admission. This test therefore pins the term's BEHAVIOUR, not a
+// property the running daemon currently has.
+func TestRTTPenaltyChangesPlacement(t *testing.T) {
+	// Two nodes identical in every scored dimension except link RTT.
+	s := New(nil)
+	s.UpdateNode(linkNode(1, 8_000_000_000, 500)) // 500ms link
+	s.UpdateNode(linkNode(2, 8_000_000_000, 1))   // 1ms link -> should win
+
+	plan, err := s.Place(task(1))
+	if err != nil {
+		t.Fatalf("place: %v", err)
+	}
+	if len(plan.Placements) == 0 {
+		t.Fatal("no placements")
+	}
+	if got := plan.Placements[0].Node; got != (contract.PeerID{2}) {
+		t.Fatalf("placed on node %d, want node 2 (the 1ms link). The RTT term "+
+			"(score -= worstRTT/100) did not change the decision", got[0])
+	}
+
+	// And with the links removed, the tie must resolve the other way (insertion
+	// order / stable sort), proving it was the RTT that moved it and not chance.
+	s2 := New(nil)
+	s2.UpdateNode(linkNode(1, 8_000_000_000, -1)) // no links at all
+	s2.UpdateNode(linkNode(2, 8_000_000_000, -1))
+	plan2, err := s2.Place(task(1))
+	if err != nil {
+		t.Fatalf("place: %v", err)
+	}
+	if len(plan2.Placements) == 0 {
+		t.Fatal("no placements")
+	}
+	if plan2.Placements[0].Node == (contract.PeerID{2}) {
+		t.Log("NOTE: the no-link tie also resolves to node 2, so the check above is " +
+			"weaker than intended: it would pass even if the RTT term did nothing")
+	} else {
+		t.Logf("confirmed: with no links the tie goes to node %d, so RTT is what moved it",
+			plan2.Placements[0].Node[0])
+	}
+}
+
+// TestRTTPenaltyIsTinyAgainstTheOtherTerms measures how much RTT it actually
+// takes to overcome one unit of another signal, because the term's WEIGHT is as
+// important as its existence and `score -= worstRTT/100` is very small.
+//
+// One free CPU thread is worth 5 points (freeCPU*5), so out-ranking a node with
+// one extra free thread costs 500ms of RTT. On a LAN (~1ms) the penalty is 0.01
+// points against a score that includes a flat HeadroomC of 30 — i.e. the RTT term
+// cannot change any placement that is not otherwise an exact tie. This test pins
+// that scale so the number is a measured fact rather than an impression.
+func TestRTTPenaltyIsTinyAgainstTheOtherTerms(t *testing.T) {
+	m := DefaultCostModel{}
+	base, ok := m.Score(task(1), linkNode(1, 8_000_000_000, 0))
+	if !ok {
+		t.Fatal("base node infeasible")
+	}
+	for _, rtt := range []float64{1, 10, 100, 500} {
+		got, _ := m.Score(task(1), linkNode(1, 8_000_000_000, rtt))
+		t.Logf("RTT %6.0fms -> score %.4f (penalty %.4f of base %.4f = %.3f%%)",
+			rtt, got, base-got, base, 100*(base-got)/base)
+	}
+	// A 1ms LAN link must cost exactly 0.01 points.
+	got, _ := m.Score(task(1), linkNode(1, 8_000_000_000, 1))
+	if d := base - got; d < 0.0099 || d > 0.0101 {
+		t.Fatalf("1ms RTT penalty = %.6f, want 0.01 (score -= worstRTT/100)", d)
+	}
+}

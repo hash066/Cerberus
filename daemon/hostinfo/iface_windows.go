@@ -49,6 +49,10 @@ func osInterfaces() ([]Interface, error) {
 		in := Interface{
 			Name: windows.UTF16PtrToString(a.FriendlyName),
 			MTU:  a.Mtu,
+			// IfOperStatus. A classified medium says what a link IS, not whether
+			// it exists: the dev rig's unplugged Realtek GbE reports a real 802.3
+			// physical medium and would otherwise look like a usable Ethernet link.
+			Up: a.OperStatus == windows.IfOperStatusUp,
 		}
 		// ReceiveLinkSpeed is in bits/sec. Some virtual/disconnected adapters
 		// report the sentinel ^uint64(0); treat that as unknown rather than as an

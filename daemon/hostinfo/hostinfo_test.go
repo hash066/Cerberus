@@ -117,6 +117,49 @@ func TestInterfaceTowardLoopbackResolves(t *testing.T) {
 	}
 }
 
+// TestUpIsPopulated guards a failure mode the Up field introduces: LinkFor now
+// refuses a link whose interface is not Up, so an Up that is ALWAYS false (a
+// platform that never populates it) would make LinkFor refuse everything and
+// silently return NodeTelemetry.Links to being permanently empty — which is the
+// exact bug this package was written to fix, reintroduced from the other side.
+//
+// Any machine running this test has at least one interface that is up.
+func TestUpIsPopulated(t *testing.T) {
+	ifaces, err := Interfaces()
+	if err != nil {
+		t.Fatalf("Interfaces: %v", err)
+	}
+	for _, in := range ifaces {
+		if in.Up {
+			return
+		}
+	}
+	t.Fatal("no interface reports Up=true. Either this host genuinely has no live " +
+		"interface, or Up is not being populated on this platform — in which case " +
+		"LinkFor now refuses every link and NodeTelemetry.Links is empty again")
+}
+
+// TestClassifiedMediumDoesNotImplyAUsableLink pins the distinction the Up field
+// exists to draw. A medium says what a link IS, not whether it EXISTS: the
+// Windows dev rig's Realtek GbE NIC is unplugged (APIPA address, 0 Mbps) and
+// still reports a real 802.3 NDIS physical medium, so it classifies as MediumEth
+// with MediumKnown=true. Anything choosing a link by medium alone would pick a
+// dead NIC.
+//
+// This asserts the invariant that makes that safe: the routing table never hands
+// back a down interface, so the interface chosen toward a reachable destination
+// is always Up.
+func TestInterfaceTowardReturnsAnUpInterface(t *testing.T) {
+	in, ok := InterfaceToward("127.0.0.1")
+	if !ok {
+		t.Skip("could not resolve an interface toward loopback on this platform")
+	}
+	if !in.Up {
+		t.Fatalf("routing table resolved to interface %q with Up=false; a destination "+
+			"that routes must route over a live interface", in.Name)
+	}
+}
+
 // TestLinkForOmitsUnclassifiableLink pins the contract-gap workaround: LinkFor
 // must REFUSE (ok=false) rather than hand back a zero-valued Link, because a
 // zero-valued contract.Link says "MediumWiFi" to the scheduler.

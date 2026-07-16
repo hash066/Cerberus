@@ -15,26 +15,55 @@ import (
 // peer, not for the intra-site link Cerberus actually runs on (ARCHITECTURE.md
 // §4.1: the data plane is the bulk-byte path between machines in one site).
 //
-// WHAT THE DEFAULTS COST US (measured, see bench_test.go — do not take this on
-// faith, `go test -bench` reproduces it):
+// WHAT THE DEFAULTS COST US — and, honestly, what they do NOT:
 //
 //   - Flow control. quic-go starts each stream at a 512 KiB receive window and
 //     auto-tunes up to 6 MiB (connection: 512 KiB up to 15 MiB). A receiver's
-//     advertised window caps the SENDER at window/RTT, so the ceiling is not the
-//     link speed but the window. Raising the MAX window lifts that ceiling on a
-//     high-RTT path (a Tailscale/WireGuard overlay between sites): measured
-//     +17.9% at an emulated 100ms RTT. On a LAN it changes nothing, because the
-//     window there is already ~4x from binding — see DefaultTuning's doc for the
-//     numbers and for why the INITIAL windows are deliberately NOT raised.
+//     advertised window caps the SENDER at window/RTT, so in THEORY the ceiling
+//     is not the link speed but the window.
+//
+//     THAT THEORY IS NOT WHAT THIS REPO MEASURES. An earlier revision of this file
+//     claimed "+17.9% at an emulated 100ms RTT" with a supporting table. That
+//     number does not reproduce, and the table it came from cannot be regenerated
+//     by any benchmark in this package (see the note on the sweep helpers below).
+//     Re-measured on the dev box (i7-12700H, Windows, ~50% background load), each
+//     config in its own process, interleaved A/B:
+//
+//       rig                        untuned          tuned (this file)
+//       32 MiB payload, RTT 100ms  19.41 MB/s med   19.80 MB/s med   => +2.0%
+//       512 MiB payload, RTT 100ms 40.99 MB/s max   42.29 MB/s max   => +3.2% max
+//                                  39.23 MB/s med   39.06 MB/s med   => -0.4% med
+//
+//     On the 512 MiB rig, UNTUNED won 5 of 8 interleaved pairs. Raising the
+//     ceiling further, to 128 MiB, measured 44.41 MB/s max — i.e. quadrupling the
+//     window past 32 MiB buys nothing, which is the signature of a path where the
+//     window ceiling is NOT the binding constraint at all.
+//
+//     WHY THE WINDOW DOESN'T BIND HERE, mechanically: Client.Send dials a FRESH
+//     QUIC connection per transfer, so every transfer starts at the 512 KiB
+//     INITIAL window and must let auto-tuning ramp from there. At 100ms RTT a
+//     32 MiB payload is ~16 RTTs — the transfer is over before the window reaches
+//     even quic-go's 6 MiB default, so a 32 MiB ceiling is unreachable by
+//     construction. Even the 512 MiB rig (~256 RTTs) only reaches a ~4 MB
+//     effective window (40 MB/s x 0.1s), still under the 6 MiB default. The
+//     limiter is the auto-tuner's RAMP RATE and the per-transfer reconnect, not
+//     the ceiling. Raising MaxStreamReceiveWindow cannot fix either.
+//
+//     So this tuning is kept as a CEILING RAISE THAT COSTS NOTHING and would only
+//     pay on a path that can actually reach it (a long-lived connection on a fat,
+//     high-RTT link). It is not a measured win on any rig in this repo, and must
+//     not be quoted as one. What WOULD show a real win is connection reuse (so the
+//     window survives across transfers) — see the lane report.
 //
 //   - Liveness. MaxIdleTimeout and KeepAlivePeriod were both unset, so quic-go
 //     applied a 30s idle timeout with NO keep-alive. Any transfer whose peer went
 //     quiet for 30s — e.g. a receiving sink blocked behind a loaded machine's
 //     scheduler during a parallel test run — was torn down as
 //     "timeout: no recent network activity", surfacing as contract.ErrPartitioned.
-//     That is a real, reproduced flake, not a hypothetical (see the T2 notes in
-//     the lane report). A keep-alive well inside the idle window fixes it: the
-//     connection stays alive across a stall instead of being declared dead.
+//     A keep-alive well inside the idle window fixes it: the connection stays
+//     alive across a stall instead of being declared dead. This is the part of
+//     this file with an honest reason to exist; see the lane report for the
+//     repeated full-suite runs of daemon/system that check the flake is gone.
 //
 // HONEST NON-GOALS, so nobody reads more into this file than it does:
 //
@@ -69,14 +98,31 @@ type Tuning struct {
 	// (512 KiB / 15 MiB).
 	InitialConnectionReceiveWindow uint64
 	MaxConnectionReceiveWindow     uint64
-	// MaxIdleTimeout is how long a connection may see no inbound packet before
-	// it is declared dead. KeepAlivePeriod must be comfortably smaller or a
-	// merely-stalled peer gets torn down (the flake described above).
+	// MaxIdleTimeout is how long an ESTABLISHED connection may see no inbound
+	// packet before it is declared dead. KeepAlivePeriod must be comfortably
+	// smaller or a merely-stalled peer gets torn down.
 	MaxIdleTimeout time.Duration
 	// KeepAlivePeriod is how often this side sends a keep-alive ping on an
-	// otherwise idle connection. Zero disables keep-alives — which is exactly
-	// the setting that produced the "no recent network activity" flake.
+	// otherwise idle connection. Zero disables keep-alives.
+	//
+	// SCOPE, because this was already misread once: a keep-alive only exists on an
+	// ESTABLISHED connection. It does nothing during the handshake, so it cannot
+	// prevent a dial from failing — see HandshakeIdleTimeout.
 	KeepAlivePeriod time.Duration
+	// HandshakeIdleTimeout bounds the handshake: quic-go applies it INSTEAD of
+	// MaxIdleTimeout until the handshake completes, and derives the dial timeout
+	// from it (2x). Zero means quic-go's 5s default.
+	//
+	// This exists because MaxIdleTimeout/KeepAlivePeriod do NOT cover the dial.
+	// The "timeout: no recent network activity" flake was diagnosed as a
+	// post-handshake idle timeout and fixed with a keep-alive; it then kept
+	// happening, because quic-go's IdleTimeoutError returns that IDENTICAL string
+	// for both phases (internal/qerr/errors.go) and the failure was actually in
+	// the handshake. Observed: daemon/system's
+	// TestComposeGpuDeviceRunsKernelOverDataPlane failing in 10.29s from
+	// Client.Send's dial — which a 30s MaxIdleTimeout cannot produce, and a 5s
+	// handshake timeout can.
+	HandshakeIdleTimeout time.Duration
 	// MaxIncomingStreams caps concurrent inbound bidirectional streams (one
 	// transfer per stream).
 	MaxIncomingStreams int64
@@ -88,69 +134,76 @@ type Tuning struct {
 	EnableDatagrams bool
 }
 
-// DefaultTuning is the tuning the daemon ships with. Every value below is what
-// bench_test.go MEASURED, not what seemed plausible; the two disagreed, and the
-// measurements won. Re-run with:
+// DefaultTuning is the tuning the daemon ships with. Re-measure with:
 //
 //	GOARCH=amd64 go test -run XXX -bench BenchmarkTransfer ./daemon/dataplane/
 //
-// (benchmark each config in its OWN process — running them in one process makes
-// thermal drift look like a 2.4x effect, which is how the first draft of this
-// file got its sizing backwards.)
+// Benchmark each config in its OWN process and interleave A/B/A/B. The dev box is
+// an i7-12700H — a HYBRID CPU (6 P-cores + 8 E-cores) — and the loopback rig is
+// CPU-bound on AEAD, so which core type the OS picks changes the result by ~2x.
+// Under normal desktop load the same config measures anywhere from 50 to 131 MB/s
+// on loopback. Any loopback A/B difference smaller than that spread is noise, and
+// this package has produced confident-looking numbers that were exactly that.
 //
-// WHY THE MAX WINDOWS ARE RAISED. A receiver's advertised window caps the sender
-// at window/RTT. quic-go's 6 MiB default stream window therefore only binds once
-// 6 MiB/RTT drops below what the machine can otherwise do (~115 MB/s of AEAD on
-// the dev box), i.e. above ~52ms RTT. Measured at an emulated 100ms RTT, 5 paired
-// reps, each config in its own process:
+// WHY THE MAX WINDOWS ARE RAISED — and what that is honestly worth. A receiver's
+// advertised window caps the sender at window/RTT, so a bigger ceiling CAN lift
+// throughput on a high-RTT path. Measured on this rig, it does not: see the table
+// at the top of this file. untuned vs tuned is +2.0% (32 MiB payload) and +3.2%
+// best-case / -0.4% median (512 MiB payload) at an emulated 100ms RTT, with
+// untuned winning 5 of 8 interleaved pairs; and a 128 MiB ceiling measures the
+// same as a 32 MiB one, which proves the ceiling is not what binds.
 //
-//	quic-go defaults      20.14  20.28  20.24  20.27  20.14  MB/s  (median 20.24)
-//	max windows raised    23.91  23.75  22.87  23.92  23.86  MB/s  (median 23.86)
-//	                                                          => +17.9%, 5/5 wins
+// These values are therefore kept as a cheap ceiling raise for a path that could
+// one day reach them, NOT because they were measured to help. They cost nothing
+// when unreached: quic-go grows toward a window only when the peer actually fills
+// it, and worst-case receive buffering per peer connection is bounded by the
+// connection window (64 MiB), NOT by 32 MiB x MaxIncomingStreams.
 //
-// That is a cross-site / Tailscale-overlay figure. It is NOT the LAN case: on the
-// 2-PC LAN rig (~1ms RTT) the BDP is ~125 KB against a 512 KiB default window, so
-// the window is ~4x from binding before auto-tuning even starts and this knob is
-// a no-op. Measured on loopback it is exactly that — a no-op within noise
-// (107-137 MB/s across every config tested, overlapping ranges). So: this tuning
-// buys a real ~18% on a high-RTT path and honestly buys nothing on a LAN. It is
-// kept because cross-site over an overlay is a supported topology, not because it
-// helps the demo.
-//
-// WHY THE INITIAL WINDOWS ARE *NOT* RAISED — the counterintuitive part. Raising
-// InitialStreamReceiveWindow to 4 MiB looked like free money (it skips the
-// auto-tuner's ramp). Measured, it was the opposite: it made throughput ERRATIC
-// at high RTT, collapsing to 7.81 and 3.56 MB/s in some reps versus a rock-steady
-// 22.9-23.9 for max-windows-only. The mechanism is real and not just a rig
-// artifact: a large initial window lets the sender burst megabytes before it has
-// received any feedback, and a burst that overruns a shallow queue anywhere on
-// the path takes loss and hands the transfer to congestion-control recovery.
-// Real switches have shallow buffers. Leaving these at quic-go's 512 KiB default
-// lets the auto-tuner grow the window only once the receiver has DEMONSTRATED it
-// is draining fast enough to deserve it — which is both faster in the median and
-// dramatically more predictable in the tail. Zero here means "quic-go's default",
-// and that is a deliberate choice backed by the numbers above, not an oversight.
+// WHY THE INITIAL WINDOWS ARE *NOT* RAISED. The honest answer is "unproven, so
+// leave quic-go's default alone". A previous revision claimed raising
+// InitialStreamReceiveWindow to 4 MiB made throughput collapse to 7.81/3.56 MB/s;
+// that is not reproducible (no benchmark here sets a nonzero initial window — see
+// initialOnlyTuning in bench_test.go, which is a no-op), and a 16 MiB initial
+// window measured 41.45 MB/s max at RTT 100ms, i.e. in line with every other
+// config rather than collapsing. The burst-into-a-shallow-queue mechanism that
+// argument appealed to is real in principle, but this rig has no shallow queue to
+// overrun (it is loopback plus a software delay), so it CANNOT test it. Zero here
+// means "quic-go's default" and stands because nothing here justifies changing
+// it — not because the alternative was measured and lost.
 func DefaultTuning() Tuning {
 	return Tuning{
-		// Left at quic-go's 512 KiB defaults ON PURPOSE — see the doc above.
-		// Raising these measured WORSE (bursty, loss-prone) than leaving them.
+		// Left at quic-go's 512 KiB defaults: no measurement here justifies
+		// changing them. See the doc above.
 		InitialStreamReceiveWindow:     0,
 		InitialConnectionReceiveWindow: 0,
 
-		// Raised: the ceiling auto-tuning may grow TO. Only reached when the
-		// receiver is actually draining fast enough, so this is ~free on paths
-		// that never need it, and worth a measured +17.9% on one that does.
-		// Worst-case receive buffering per peer connection is bounded by the
-		// connection window (64 MiB), NOT by 32 MiB x MaxIncomingStreams.
+		// Raised: the ceiling auto-tuning may grow TO. Free when unreached, and
+		// unreached on every rig measured here (the auto-tuner's ramp and the
+		// per-transfer reconnect bind first). Not a measured win — see above.
 		MaxStreamReceiveWindow:     32 << 20, // 32 MiB (quic-go default: 6 MiB)
 		MaxConnectionReceiveWindow: 64 << 20, // 64 MiB (quic-go default: 15 MiB)
 
 		// 30s idle with a 5s keep-alive: a peer must miss six keep-alives before
 		// we call it dead. The old config had the same 30s idle timeout (quic-go's
 		// default) but NO keep-alive at all, so a merely-stalled receiver was
-		// indistinguishable from a dead one. This is the flake fix.
+		// indistinguishable from a dead one.
 		MaxIdleTimeout:  30 * time.Second,
 		KeepAlivePeriod: 5 * time.Second,
+
+		// The handshake gets the same tolerance the established connection got,
+		// and for the same reason: a peer that is briefly starved (a loaded box
+		// running the full test suite, or a real machine under load) must not be
+		// mistaken for an absent one. quic-go's 5s default was never chosen here,
+		// it was inherited — the same class of bug as the empty &quic.Config{}
+		// this file was written to fix.
+		//
+		// HONESTY: this is NOT yet proven to fix the observed flake. It is the
+		// timeout that actually governs the phase the flake occurs in, which the
+		// keep-alive was not; but the flake also shows up as a libp2p mesh dial
+		// timeout in the same runs, which points at the BOX failing to complete
+		// connection setup under full-suite load rather than at this constant. See
+		// the lane report for the runs and the honest read.
+		HandshakeIdleTimeout: 20 * time.Second,
 
 		MaxIncomingStreams: 256,
 
@@ -190,6 +243,7 @@ func (t Tuning) base() *quic.Config {
 		MaxConnectionReceiveWindow:     t.MaxConnectionReceiveWindow,
 		MaxIdleTimeout:                 t.MaxIdleTimeout,
 		KeepAlivePeriod:                t.KeepAlivePeriod,
+		HandshakeIdleTimeout:           t.HandshakeIdleTimeout,
 		EnableDatagrams:                t.EnableDatagrams,
 	}
 }

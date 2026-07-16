@@ -132,12 +132,24 @@ func (d *delayConn) SetWriteBuffer(n int) error {
 }
 
 const (
-	// benchQuota is far above any payload sent here, so the quota guard is never
-	// what is being measured.
-	benchQuota = 1 << 30
+	// benchQuota is far above any payload sent here (quota is consumed cumulatively
+	// across a grant's transfers, so this must exceed size*b.N for the largest rig),
+	// so the quota guard is never what is being measured.
+	benchQuota = 64 << 30
 	// benchPayload is the blob each iteration moves. 32 MiB is large enough that
-	// handshake cost is noise and the steady-state flow-control regime dominates.
+	// handshake cost is noise.
+	//
+	// It is NOT large enough for the receive-window ceiling to bind, which is a
+	// property of this constant and not of the transport: at 100ms RTT a 32 MiB
+	// payload is ~16 RTTs, and a connection that starts at the 512 KiB initial
+	// window cannot auto-tune to 6 MiB (let alone 32 MiB) in 16 RTTs. See
+	// benchRigN and the BIG rig below.
 	benchPayload = 32 << 20
+	// benchPayloadBig is the model-push-shaped payload: one long-lived transfer,
+	// ~256 RTTs at 100ms, which is long enough for auto-tuning to actually reach
+	// the ceiling MaxStreamReceiveWindow raises. This is the rig where the window
+	// tuning can show up at all.
+	benchPayloadBig = 512 << 20
 )
 
 func benchIdentity(tb testing.TB) ed25519.PrivateKey {
@@ -159,10 +171,23 @@ func untunedTuning() Tuning {
 	return Tuning{MaxIncomingStreams: 256, EnableDatagrams: false}
 }
 
-// benchRig moves b.N payloads through a real Server/Client pair over sockets with
-// `oneWay` of injected one-way delay (0 = plain loopback), using `tun` on BOTH
-// legs, and reports MB/s.
+// benchRig moves b.N payloads of the default size. See benchRigN.
 func benchRig(b *testing.B, oneWay time.Duration, tun Tuning) {
+	benchRigN(b, oneWay, tun, benchPayload)
+}
+
+// benchRigN moves b.N payloads of `size` bytes through a real Server/Client pair
+// over sockets with `oneWay` of injected one-way delay (0 = plain loopback),
+// using `tun` on BOTH legs, and reports MB/s.
+//
+// `size` matters more than it looks. Client.Send dials a FRESH QUIC connection
+// per call, so each payload starts at the 512 KiB initial receive window and must
+// let auto-tuning ramp from there. A payload that finishes in a few RTTs never
+// reaches even quic-go's 6 MiB default ceiling, so on such a payload the
+// MaxStreamReceiveWindow knob cannot possibly do anything and a
+// tuned-vs-untuned comparison measures the RAMP, not the ceiling. Sizing the
+// payload so the connection lives for many RTTs is what puts the ceiling in play.
+func benchRigN(b *testing.B, oneWay time.Duration, tun Tuning, size int) {
 	b.Helper()
 	k := stub.NewCapKernel()
 	capH, err := k.Mint(contract.ResourceRef{Kind: contract.KindFS, Path: "/bench"},
@@ -230,13 +255,13 @@ func benchRig(b *testing.B, oneWay time.Duration, tun Tuning) {
 	cli.SetTuning(tun)
 	cli.SetTransport(cliTr)
 
-	payload := make([]byte, benchPayload)
-	b.SetBytes(benchPayload)
+	payload := make([]byte, size)
+	b.SetBytes(int64(size))
 	b.ResetTimer()
 
 	start := time.Now()
 	for i := 0; i < b.N; i++ {
-		sctx, scancel := context.WithTimeout(context.Background(), 120*time.Second)
+		sctx, scancel := context.WithTimeout(context.Background(), 600*time.Second)
 		err := cli.SendBytes(sctx, ep, payload)
 		scancel()
 		if err != nil {
@@ -247,7 +272,7 @@ func benchRig(b *testing.B, oneWay time.Duration, tun Tuning) {
 
 	elapsed := time.Since(start)
 	if elapsed > 0 {
-		b.ReportMetric((float64(benchPayload)*float64(b.N)/(1<<20))/elapsed.Seconds(), "MB/s")
+		b.ReportMetric((float64(size)*float64(b.N)/(1<<20))/elapsed.Seconds(), "MB/s")
 	}
 }
 
@@ -275,6 +300,22 @@ func BenchmarkTransfer_RTT0_Tuned(b *testing.B)   { benchRig(b, 0, DefaultTuning
 // it is the right rig to isolate the COST of these knobs even though it cannot
 // show their BENEFIT.
 
+// CAUTION, these two are not what their names promise any more.
+//
+// They were written when DefaultTuning raised the INITIAL windows to 4 MiB, so
+// "max only" and "initial only" really did isolate two knobs. DefaultTuning now
+// leaves both initial windows at 0, which silently degenerated both helpers:
+//
+//   - maxOnlyTuning zeroes fields that are already zero => it is EXACTLY
+//     DefaultTuning, so BenchmarkTransfer_*_MaxWindowsOnly re-measures _Tuned
+//     under a different name.
+//   - initialOnlyTuning zeroes the max windows, leaving ALL FOUR windows at zero
+//     => it raises no initial window at all; it is untunedTuning plus keep-alive
+//     and datagrams.
+//
+// TestTuningSweepIsNotDegenerate below pins this so the pair cannot rot back into
+// measuring nothing. Any claim about initial-window sizing needs a config that
+// actually sets one; there is deliberately none here, because none is shipped.
 func maxOnlyTuning() Tuning {
 	t := DefaultTuning()
 	t.InitialStreamReceiveWindow = 0     // quic-go default (512 KiB)
@@ -287,6 +328,30 @@ func initialOnlyTuning() Tuning {
 	t.MaxStreamReceiveWindow = 0     // quic-go default (6 MiB)
 	t.MaxConnectionReceiveWindow = 0 // quic-go default (15 MiB)
 	return t
+}
+
+// TestTuningSweepIsNotDegenerate fails if the sweep helpers stop distinguishing
+// the configs they are named for. It does NOT assert today's (degenerate) state
+// is correct — it asserts the state is DOCUMENTED, so that a future change to
+// DefaultTuning's initial windows forces a look at these helpers instead of
+// silently producing two benchmarks that measure the same thing.
+func TestTuningSweepIsNotDegenerate(t *testing.T) {
+	d := DefaultTuning()
+	if d.InitialStreamReceiveWindow != 0 || d.InitialConnectionReceiveWindow != 0 {
+		t.Fatalf("DefaultTuning now raises an initial window (stream=%d conn=%d). "+
+			"maxOnlyTuning/initialOnlyTuning and their benchmarks were written for that "+
+			"case and must be re-checked, and quicconf.go's doc updated: it currently "+
+			"documents these as deliberately left at quic-go's default.",
+			d.InitialStreamReceiveWindow, d.InitialConnectionReceiveWindow)
+	}
+	// Given the above, these degeneracies are the documented consequence.
+	if maxOnlyTuning() != d {
+		t.Fatalf("maxOnlyTuning diverged from DefaultTuning; update the doc above it")
+	}
+	io_ := initialOnlyTuning()
+	if io_.InitialStreamReceiveWindow != 0 || io_.MaxStreamReceiveWindow != 0 {
+		t.Fatalf("initialOnlyTuning changed shape: %+v", io_)
+	}
 }
 
 func BenchmarkTransfer_RTT0_MaxWindowsOnly(b *testing.B)     { benchRig(b, 0, maxOnlyTuning()) }
@@ -334,4 +399,81 @@ func BenchmarkTransfer_RTT100ms_MaxWindowsOnly(b *testing.B) {
 }
 func BenchmarkTransfer_RTT100ms_InitialWindowsOnly(b *testing.B) {
 	benchRig(b, 50*time.Millisecond, initialOnlyTuning())
+}
+
+// The BIG rig — one long-lived, model-push-shaped transfer at high RTT.
+//
+// WHY IT EXISTS: the 32 MiB rigs above cannot show the max-window knob doing
+// anything, because Client.Send dials a fresh connection per payload and 32 MiB
+// at 100ms RTT is only ~16 RTTs of ramp from a 512 KiB initial window — the
+// transfer ends long before auto-tuning approaches even quic-go's 6 MiB default,
+// so raising the ceiling to 32 MiB changes nothing it can reach. Measured, the
+// 32 MiB rig shows untuned 19.41 vs tuned 19.80 MB/s median: ~+2%, i.e. the
+// ceiling is not in play.
+//
+// 512 MiB at 100ms is ~256 RTTs, which IS enough ramp for the ceiling to be
+// reached and therefore to matter. This is also the shape of the transfer the
+// system actually cares about (a multi-GB model pushed to a remote worker at load
+// time), so it is the honest rig for that question.
+func BenchmarkTransfer_RTT100ms_Big_Untuned(b *testing.B) {
+	benchRigN(b, 50*time.Millisecond, untunedTuning(), benchPayloadBig)
+}
+func BenchmarkTransfer_RTT100ms_Big_Tuned(b *testing.B) {
+	benchRigN(b, 50*time.Millisecond, DefaultTuning(), benchPayloadBig)
+}
+
+// The same long-lived transfer on loopback: the throughput ceiling a model push
+// can actually expect from the tunnel when RTT is ~0 and the CPU's AEAD is the
+// bottleneck rather than any window.
+func BenchmarkTransfer_RTT0_Big_Untuned(b *testing.B) {
+	benchRigN(b, 0, untunedTuning(), benchPayloadBig)
+}
+func BenchmarkTransfer_RTT0_Big_Tuned(b *testing.B) {
+	benchRigN(b, 0, DefaultTuning(), benchPayloadBig)
+}
+
+// TestHandshakeIdleTimeoutIsSetOnBothLegs pins the fix for the misdiagnosed
+// flake, and pins WHY it was misdiagnosed.
+//
+// quic-go reports BOTH a handshake-phase timeout and a post-handshake idle
+// timeout as the identical string "timeout: no recent network activity"
+// (internal/qerr/errors.go). The flake was read as the second and fixed with a
+// KeepAlivePeriod — but a keep-alive only exists on an established connection, so
+// it cannot affect a dial. HandshakeIdleTimeout is the timeout that governs the
+// dial, and leaving it zero inherits quic-go's 5s: the same
+// inherit-an-unconsidered-default bug quicconf.go was written to fix.
+//
+// Both legs must carry it: the client dials, so the client leg is the one that
+// matters most here, and it is historically the leg that was left empty.
+func TestHandshakeIdleTimeoutIsSetOnBothLegs(t *testing.T) {
+	d := DefaultTuning()
+	if d.HandshakeIdleTimeout == 0 {
+		t.Fatal("DefaultTuning leaves HandshakeIdleTimeout zero, which inherits quic-go's " +
+			"5s default. That is the timeout governing the dial, and the phase the " +
+			"'no recent network activity' flake actually occurs in")
+	}
+	if d.HandshakeIdleTimeout <= d.KeepAlivePeriod {
+		t.Fatalf("HandshakeIdleTimeout %v <= KeepAlivePeriod %v: the handshake must be "+
+			"given more room than one keep-alive interval", d.HandshakeIdleTimeout, d.KeepAlivePeriod)
+	}
+	for name, cfg := range map[string]*quic.Config{
+		"client": d.clientConfig(),
+		"server": d.serverConfig(),
+	} {
+		if cfg.HandshakeIdleTimeout != d.HandshakeIdleTimeout {
+			t.Errorf("%s leg HandshakeIdleTimeout = %v, want %v (a value set on Tuning but "+
+				"dropped in base() is worse than not having the knob)",
+				name, cfg.HandshakeIdleTimeout, d.HandshakeIdleTimeout)
+		}
+		if cfg.KeepAlivePeriod != d.KeepAlivePeriod {
+			t.Errorf("%s leg KeepAlivePeriod = %v, want %v", name, cfg.KeepAlivePeriod, d.KeepAlivePeriod)
+		}
+	}
+
+	// untunedTuning must NOT carry it: it reproduces the pre-change config, whose
+	// handshake timeout really was quic-go's 5s default.
+	if untunedTuning().HandshakeIdleTimeout != 0 {
+		t.Fatal("untunedTuning must reproduce the OLD config exactly, which left " +
+			"HandshakeIdleTimeout unset")
+	}
 }

@@ -33,6 +33,12 @@ func osInterfaces() ([]Interface, error) {
 			Name:     si.Name,
 			MTU:      uint32(si.MTU),
 			Loopback: si.Flags&net.FlagLoopback != 0,
+			// IFF_UP is the only portable signal here. It is weaker than the
+			// Windows/Linux paths' operational state (it is administrative, so it
+			// stays true for an unplugged NIC), but it is a real OS fact and
+			// strictly better than claiming every interface is up. Medium stays
+			// unknown regardless, so LinkFor refuses these anyway.
+			Up: si.Flags&net.FlagUp != 0,
 			// Medium deliberately left unknown, Mbps left 0.
 		}
 		if addrs, aerr := si.Addrs(); aerr == nil {
