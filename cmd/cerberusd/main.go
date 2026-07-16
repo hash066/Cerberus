@@ -105,17 +105,35 @@ func main() {
 		"data-plane QUIC listen address (host:port) for bulk bytes; 0.0.0.0 makes this node's data plane reachable from other machines. Previously hardcoded to 127.0.0.1:0, which made cross-machine bulk transfer impossible.")
 	dpAdvertise := flag.String("dataplane-advertise", "",
 		"host advertised to peers in data-plane endpoints. Empty = ask the OS routing table which local address reaches the peer (correct on a multi-homed box). Set this only where the routing table cannot be asked, e.g. behind a NAT/port-forward.")
-	// Lend THIS node's GPU/CPU to peers for llama.cpp tensor work. OFF by default
-	// and it must stay that way: enabling it grants code execution to any peer
-	// holding a valid signed capability for the llama-offload resource. ggml-rpc's
-	// deserializer trusts its peer (CVE-2026-34159 was a pre-auth RCE there), so
-	// the capability gate narrows WHO may try — it does NOT make trying safe, and
-	// nothing here is a sandbox. See daemon/llama/doc.go.
+	// Lend THIS node's GPU/CPU to peers for llama.cpp tensor work. OFF by default,
+	// and the honest description of what enabling it means is much worse than
+	// "peers holding a capability", so the flag text says the true thing:
+	//
+	//   1. The llama-rpc gate resolves issuers via mesh.SelfIssuerResolver, which
+	//      returns the claimed issuer's PeerID AS its public key (shard.go:100).
+	//      Its only real assertion is "the signer is the authenticated peer on this
+	//      stream" — so ANY peer can self-sign a capability naming the llama
+	//      resource and pass. There is no set of issuers an operator authorized.
+	//   2. mDNS auto-connects to peers found on the LAN (discovery.go), and there is
+	//      NO ConnectionGater / allowlist anywhere in the tree — nothing decides
+	//      WHICH peers may join the mesh.
+	//   3. ggml-rpc's deserializer trusts its client (CVE-2026-34159 was a pre-auth
+	//      RCE there); the pack pin keeps us past the fix, but the trust model is
+	//      unchanged and this is not a sandbox.
+	//
+	// Compose those and the truth is: enabling this lets any machine on your LAN
+	// running cerberusd execute code on this one. The resource scoping added in
+	// daemon/mesh/capscope.go stops a cap for one service being reused on another —
+	// real, and necessary — but it does not make this authorization, because the
+	// attacker mints their own cap. Do not soften this text until there is a real
+	// trust-anchor set to point at.
 	llamaWorker := flag.Bool("llama-worker", false,
 		"lend this node's GPU/CPU to peers for llama.cpp inference. OFF by default. "+
-			"ENABLING THIS GRANTS CODE EXECUTION to peers holding a valid capability: "+
-			"llama.cpp's RPC backend trusts its client, so the capability gate limits who "+
-			"can ask, not what a malicious authorized peer could do. Only enable for peers you trust.")
+			"WARNING: this grants CODE EXECUTION on this machine to ANY PEER THAT CAN JOIN "+
+			"YOUR MESH — which today means any machine on your LAN running cerberusd with the "+
+			"same site, because peers self-issue their own capabilities and there is no peer "+
+			"allowlist yet. llama.cpp's RPC backend trusts its client and is not sandboxed. "+
+			"Only enable on a network where you trust every machine.")
 	llamaModel := flag.String("llama-model", envOr("CERBERUS_LLAMA_MODEL", ""),
 		"path to a GGUF model to serve at /v1/chat/completions. Empty = no chat backend "+
 			"(the route reports that none is wired). Only THIS node needs the weights: "+
@@ -438,8 +456,12 @@ func main() {
 			case err != nil:
 				log.Printf("cerberusd: llama worker wiring failed: %v", err)
 			default:
-				log.Println("cerberusd: llama offload worker ACTIVE — peers holding a valid " +
-					"capability may execute llama.cpp tensor work on this node's GPU/CPU")
+				// Say the true thing at runtime too, not just in --help: an operator
+				// who leaves this on should be reminded what they exposed.
+				log.Println("cerberusd: llama offload worker ACTIVE — WARNING: any peer that " +
+					"can join this mesh (today: any machine on your LAN running cerberusd with " +
+					"site=" + site + ") can execute llama.cpp code on this node. Peers self-issue " +
+					"their own capabilities and there is no peer allowlist yet.")
 			}
 		}
 	}
