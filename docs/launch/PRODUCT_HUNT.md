@@ -47,19 +47,21 @@ capability-gated devices:
   that tells you whether the GPU or the CPU actually ran it.
 - **One distributed filesystem** — save on your laptop, read on your desktop;
   files are erasure-coded and scattered across the mesh.
-- **Cross-machine audio** — your mic playing on another machine's speaker
-  (Windows/WASAPI in beta).
-- **Layer-split pipeline inference** — stages placed on different nodes,
-  activations streamed between them (demo fixture model; we're honest that
-  this isn't LLM serving yet).
-- **Made for AI agents too** — an MCP server for Claude/Cursor and an
-  OpenAI-compatible API, so agents drive the mesh with scoped, revocable
-  tokens instead of your admin rights.
+- **Cross-machine audio** — your mic playing on another machine's speaker.
+  Real on Windows and Linux; the macOS backend is written but not yet compiled.
+- **Mount a peer's devices as a real filesystem** — a genuine FUSE mount on
+  Linux, capability-scoped, no ambient authority.
+- **Made for AI agents too** — an MCP server for Claude/Cursor, so agents drive
+  the mesh with scoped, revocable tokens instead of your admin rights.
 
 The security model is the product: no passwords, no roles, no ambient
 authority. Every action presents a signed capability you can narrow, delegate,
-and revoke — revocations propagate across the whole mesh. Open source, Go +
-Rust, Windows-first beta with a one-click tray app.
+and revoke — revocations propagate across the whole mesh. Go + Rust, Windows and
+Linux, with a one-click tray app.
+
+**What it is not: an LLM tool.** Cerberus runs no language models. It pools and
+secures machines; that's the whole pitch. If you want to run a model across your
+devices, use exo — genuinely.
 
 ## First comment (from the maker)
 
@@ -78,22 +80,35 @@ the revocation spreads to every node and survives restarts.
 
 What you can do with the beta today, for real: run sandboxed WASM workloads on
 your other machines, dispatch GPU kernels to a peer, pool disks into one
-erasure-coded filesystem, stream your mic to another machine's speaker, and
-run a layer-split inference demo whose stages land on different nodes.
+erasure-coded filesystem, stream your mic to another machine's speaker, mount a
+peer's device namespace as a real filesystem on Linux, and run a layer-split
+pipeline demo whose stages land on different nodes.
 
-Where I want to be straight with you (it's also in the README): the installers
-are unsigned (beta — you'll click through SmartScreen once), physical-GPU
-execution needs a from-source build (default binaries honestly report they ran
-on CPU), the compute "wallet" logs usage but moves no real money, and the
-fancy frontier stuff (zk proof-of-inference, RDMA, TEE) is documented design,
-not shipped features. The repo has a rule that a feature either works or tells
-you it isn't wired — nothing is faked.
+Where I want to be straight with you (all of this is in the README too):
 
-It's open source (Go + Rust). If you've got two Windows machines on one Wi-Fi,
-QUICKSTART.md gets you from install to "my mic is playing on that other
-machine" in about ten minutes. I'll be here all day — happy to go as deep as
-you like on the capability model, the 9P namespace, or why guests can't import
-*anything* in v0.1.
+- **It doesn't run LLMs.** The pipeline demo distributes a 4×4 MLP fixture, not
+  a language model. v0.1 had "llama.cpp" and "MLX" backends; they were mocks
+  wearing real engines' names and I deleted them rather than dress them up. The
+  real llama.cpp integration is written but not yet wired in.
+- **`/v1/chat/completions` currently answers for models it doesn't have** — a
+  known bug, flagged in the README, being fixed.
+- The installers are unsigned (beta — you'll click through SmartScreen once).
+- Physical-GPU execution needs a from-source build; default binaries honestly
+  report they ran on CPU.
+- The compute "wallet" logs usage but moves no real money.
+- The frontier stuff (zk proof-of-inference, RDMA, TEE) is documented design,
+  not shipped features — and there's a test that fails the build if any code
+  ever claims RDMA, because I trust a test more than I trust my own copy.
+- **There's no LICENSE file yet.** That's on me and it's being fixed.
+
+The repo has a rule that a feature either works or tells you it isn't wired.
+Most of the honesty above came from running an audit against my own docs before
+posting this, and finding several claims that had gone stale.
+
+Go + Rust. If you've got two machines on one Wi-Fi, QUICKSTART.md gets you from
+install to "my mic is playing on that other machine" in about ten minutes. I'll
+be here all day — happy to go as deep as you like on the capability model, the
+9P namespace, or why guests can't import *anything* in v0.1.
 
 ## Gallery — 5 images/captions
 
@@ -121,6 +136,11 @@ rules — real output only, no mockups):
    Claude/Cursor with the Cerberus MCP tools listed, running "check the mesh
    and run the hello workload on the other node," and the honest
    `backend: cpu-software` line from a `cerberus gpu` dispatch alongside.
+
+**Caption rule:** no caption may promise LLM inference, a Windows drive-letter
+mount, or browsing `/cer/fs` in Explorer — none of those are real. Captions
+describe only what the screenshot literally shows (docs/DEMO.md is the capture
+rule: real output, no mockups).
 
 ## Launch-day notes (PH-specific)
 
