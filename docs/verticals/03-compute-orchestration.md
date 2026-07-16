@@ -4,6 +4,28 @@
 
 > Owner archetype: **The AI Orchestrator.** Conforms to [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
+> [!IMPORTANT]
+> **This is a DESIGN document, not a status report.** Read the boxes below as the
+> intended architecture. What exists in the tree today is narrower, and
+> [README.md](../../README.md) is the authority on it:
+>
+> - **There is no MLX backend.** The `mlx` and `llamacpp` "backends" this doc's
+>   diagrams imply were mock transforms wearing real engines' names; they were
+>   **deleted** in `72a0f4a`, not repaired. See
+>   [11-pipeline-layer-range-reference.md](11-pipeline-layer-range-reference.md).
+>   Do not describe Cerberus as "supporting MLX".
+> - **There is no tinygrad integration.** The real GPU backend is wgpu, off by
+>   default; stock binaries honestly report `backend: cpu-software`.
+> - **No LLM runs through Cerberus.** The pipeline shards a 4×4 MLP **fixture**.
+>   Real llama.cpp integration lives in `daemon/llama` — written, unit-tested,
+>   and imported by no binary yet.
+> - **Tensor (intra-layer) parallelism is not implemented.** Pipeline
+>   (layer-group) placement is. `contract.ShardTensor` is declared and set by no
+>   code; `TPRank`/`TPWorld` are plumbed through the mesh wire
+>   (`daemon/mesh/compute.go:114`) as pass-through fields that nothing acts on.
+> - **Promise pipelining is partial**, and the trust bootstrap is the
+>   self-issuer model rather than full CapTP.
+
 ## 1. Purpose & Responsibilities
 - Execute agent/worker code **portably** across ARM/x86/Metal/Vulkan via **WASM components** + native acceleration backends.
 - Split models that exceed a single node: **pipeline parallelism** (layer groups per node) and **tensor parallelism** (intra-layer shards).
@@ -73,7 +95,8 @@ type Executor interface {
 | Model too big for any node | pipeline + tensor sharding across telemetry-fit layer groups |
 
 ## 10. Verdict
-- **WASM component execution + tensor/pipeline sharding + promise pipelining: Shippable** (exo proves sharding; Wasmtime proves portable exec).
-- **Real-time inference of very large models over Wi-Fi: Frontier** — fundamentally latency-bound; viable today over Thunderbolt/RDMA, marginal over Wi-Fi. Honest margin.
+- **WASM component execution + pipeline sharding + promise pipelining: Shippable** (exo proves sharding; Wasmtime proves portable exec). *Tensor sharding is design-only — see the banner at the top.*
+- **Real-time inference of very large models over Wi-Fi: Frontier** — fundamentally latency-bound. Marginal over Wi-Fi. **The previous claim that this is "viable today over Thunderbolt/RDMA" was aspiration, not measurement, and is withdrawn:** Cerberus has no RDMA transport, `EndpointRDMA` is a constant no code path uses, and `daemon/hostinfo/hostinfo_test.go:63` fails the build if any code claims RDMA at all. Thunderbolt *link classification* is real (`iface_linux.go:78` reads the kernel driver name); classifying a link is not transporting over it.
+- **The measured reality, so nobody has to rediscover it:** tested out-of-tree with upstream llama.cpp on one machine (single run, not through Cerberus), splitting a model over `ggml-rpc` ran ~45 tok/s against ~396 tok/s for a single node holding the whole model — **~9× slower**. Activations cross the network at every layer boundary; that cost is structural, not a tuning bug. The honest value proposition for distributed inference is therefore *"run a model that fits on no single machine you own"* — **never** *"go faster"*. Do not let a design doc imply otherwise.
 
 Open questions: optimal micro-batch size vs link RTT; whether to expose a WASI-NN path for accel instead of bespoke `gpu` capability.

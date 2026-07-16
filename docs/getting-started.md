@@ -336,14 +336,23 @@ versus what is a labelled stub or hardware-gated. (Full matrix:
 - **`cerberus run`** — a stub today (prints a placeholder). Use the **gateway**
   path for real compute dispatch. See [docs/cli.md](cli.md#run).
 - **Gateway content** — real dispatch, but the wired component is the demo shard,
-  not an LLM (see §6).
-- **GPU dispatch (wgpu/MLX)** — a real wgpu backend exists (and has run on the
-  dev box's NVIDIA GPU) but is off by default and needs real GPU hardware to
-  validate honestly.
-- **FUSE/WinFsp mounts** — the 9P namespace and QUIC data plane are real; mounting
-  a peer's device as a local drive needs a kernel driver (labelled stub).
-- **OS microphone/speaker capture** — the network audio *transport* is real; the
-  CoreAudio/WASAPI/PipeWire capture source is a labelled stub.
+  not an LLM (see §6). It also **answers for any model name you send it**, with
+  fabricated `usage` counts — a known bug; see [gateway.md](gateway.md).
+- **LLM inference** — none. The v0.1 `llamacpp`/`mlx` backends were mocks and
+  were deleted; `daemon/llama` (real llama.cpp) is written, unit-tested, and not
+  imported by any binary yet.
+- **GPU dispatch (wgpu)** — a real wgpu backend exists (and has run on the dev
+  box's NVIDIA GPU) but is off by default and needs real GPU hardware to
+  validate honestly. (There is no MLX backend; that was a deleted mock.)
+- **Mounts** — `cerberusd -mount` is a **real FUSE mount on Linux** (verified on
+  WSL2; pure-Go, no cgo, nothing to install). **Windows is unverified** — the
+  cgofuse→WinFsp path exists in code but needs a kernel driver we haven't tested
+  against. macOS is not shipped. `/cer/fs` is **not** browsable through a mount
+  either way (fs files aren't enumerated; read-open returns `ENOSYS`).
+- **OS microphone/speaker capture** — **real on Windows** (WASAPI) and **real on
+  Linux** (PulseAudio native protocol, pure Go, no cgo; also covers PipeWire via
+  pipewire-pulse). **macOS CoreAudio is written but has never been compiled or
+  run** — it is behind an opt-in build tag and default macOS builds get a stub.
 - **Tauri desktop GUI** — real code, but not launched/verified headlessly here;
   needs the Tauri toolchain + WebView2 and a real desktop session.
 - **Frontier (research bets, opt-in):** zk-WASM proof-of-inference, host-TEE
