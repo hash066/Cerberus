@@ -52,9 +52,26 @@ func WireWorker(fab *mesh.Fabric, cfg WorkerConfig) error {
 	}
 
 	now := func() int64 { return time.Now().Unix() }
+	want := mesh.MeshComputeResource(cfg.Site)
 	fab.ServeComputeSigned(
 		func(ctx context.Context, task contract.ComputeTask, grant auth.Grant) (contract.ComputeResult, error) {
-			_ = grant
+			// A capability must authorize THIS resource, not merely carry the
+			// exec right. The mesh layer verifies the envelope's issuer,
+			// signature, validity window, revocation, and that it conveys
+			// RightExec — but it does not look at WHAT the grant names, so
+			// without this check any exec-bearing cap ran arbitrary WASM here: a
+			// GPU device's cap, a 9P device path's cap, or a mesh-compute cap
+			// minted for a DIFFERENT SITE, which crosses the tenancy boundary.
+			// That is authority from holding any exec cap rather than from
+			// holding a cap for this endpoint. Same shape as the 9P device
+			// scoping fixed in 6475759, one layer up.
+			if err := checkComputeScope(grant, want); err != nil {
+				return contract.ComputeResult{
+					TaskID: append([]byte(nil), task.TaskID...),
+					OK:     false,
+					Error:  err.Error(),
+				}, nil
+			}
 			self := fab.PeerID()
 			if cfg.Sched != nil {
 				if !cfg.Sched.AcquireCPU(self, scheduler.ThreadsPerTask) {
@@ -74,6 +91,23 @@ func WireWorker(fab *mesh.Fabric, cfg WorkerConfig) error {
 		contract.RightExec,
 	)
 	fab.ServeComponentFetch(cfg.Store, mesh.SelfIssuerResolver, now, cfg.Revoked)
+	return nil
+}
+
+// checkComputeScope enforces that a verified grant actually names this node's
+// mesh-compute resource.
+//
+// Kind AND Path must both match. Path carries the site
+// ("cerberus/<site>/mesh-compute"), so this is also what keeps one site's exec
+// capability from being spent on another's. Quota is deliberately NOT compared:
+// a legitimately attenuated child cap narrows its quota, and rejecting that
+// would break delegation — quota enforcement is a separate concern from scope.
+func checkComputeScope(grant auth.Grant, want contract.ResourceRef) error {
+	if grant.Resource.Kind != want.Kind || grant.Resource.Path != want.Path {
+		return fmt.Errorf(
+			"compute: capability denied: grant is scoped to resource %s:%q, not this node's compute endpoint %s:%q",
+			grant.Resource.Kind, grant.Resource.Path, want.Kind, want.Path)
+	}
 	return nil
 }
 
