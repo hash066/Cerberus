@@ -12,8 +12,15 @@ const (
 	// PinnedTag is the llama.cpp release tag this package targets.
 	PinnedTag = "b10021"
 
-	// PinnedCommit is the commit refs/tags/b10021 resolves to. The submodule at
-	// third_party/llama.cpp must sit on exactly this commit.
+	// PinnedCommit is the commit refs/tags/b10021 resolves to. It is the commit
+	// the fetched pack's binaries report alongside their build number (verified:
+	// `llama-server --version` prints "version: 10021 (33a75f41c)" to stderr), so
+	// it identifies exactly which upstream build is installed.
+	//
+	// There is NO third_party/llama.cpp submodule and there never was: an earlier
+	// comment here referenced one, from a plan to build llama.cpp from source that
+	// was abandoned once upstream's prebuilt releases turned out to ship
+	// ggml-rpc-server after all. Packs are fetched and digest-verified (pack.go).
 	PinnedCommit = "33a75f41c30052fd3d1c38e8ed2f86ee3c3f8fba"
 
 	// PinnedBuild is PinnedTag as an integer, for comparison against the build

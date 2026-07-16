@@ -21,10 +21,16 @@ type Binaries struct {
 	// Server is the absolute path to llama-server.
 	Server string
 	// RPCServer is the absolute path to ggml-rpc-server. NOTE the name: upstream's
-	// tools/rpc/CMakeLists.txt does `set(TARGET ggml-rpc-server)`. It is NOT
-	// "rpc-server", and upstream's prebuilt release archives do NOT contain it at
-	// all — GGML_RPC=ON is compile-time and off in release builds, which is why
-	// Cerberus builds its own pack (.github/workflows/llama-pack.yml).
+	// tools/rpc/CMakeLists.txt does `set(TARGET ggml-rpc-server)` — it is NOT
+	// "rpc-server", which is the historical name from examples/rpc/.
+	//
+	// Upstream's prebuilt release archives DO contain it. An earlier version of
+	// this comment claimed the opposite and drove a plan to vendor and build
+	// llama.cpp from source; that was wrong, and it was checked three ways before
+	// being corrected: upstream's release.yml sets -DGGML_RPC=ON in its
+	// workflow-level CMAKE_ARGS, all nine published assets contain the binary, and
+	// it runs. So Cerberus fetches the official pack (pack.go) rather than
+	// building one.
 	RPCServer string
 	// Build is the build number both binaries reported (e.g. 10021).
 	Build int
@@ -214,8 +220,9 @@ func Locate(ctx context.Context) (Binaries, error) {
 	}
 	if rpcServer == "" {
 		return Binaries{}, fmt.Errorf("%w: found llama-server at %s but no %s beside it — "+
-			"upstream's prebuilt releases do NOT ship ggml-rpc-server (GGML_RPC is compile-time and "+
-			"off in release builds); use a Cerberus llama pack",
+			"an upstream llama.cpp release archive contains both, so this looks like a "+
+			"partial or hand-assembled directory; run `cerberus llama fetch` to install a "+
+			"complete, digest-verified pack",
 			ErrPackMissing, server, exeName("ggml-rpc-server"))
 	}
 
