@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -478,6 +479,89 @@ func TestFetchPackRefusesWrongContentLength(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "refusing") {
 		t.Fatalf("expected a length refusal, got: %v", err)
+	}
+}
+
+// TestPinnedDigestsMatchUpstream re-checks every pinned digest against the live
+// upstream release. Skipped unless CERBERUS_TEST_UPSTREAM=1, so the normal suite
+// stays offline and hermetic; .github/workflows/llama-pack.yml runs it.
+//
+// This is drift detection. A GitHub release is mutable: assets can be deleted and
+// re-uploaded, and a re-cut b10021 would leave every pinned digest here pointing
+// at bytes that no longer exist. Because FetchPack is fail-closed, that does not
+// produce a security hole — it produces a pack nobody can install. This test is
+// how we find that out before users do.
+func TestPinnedDigestsMatchUpstream(t *testing.T) {
+	if os.Getenv("CERBERUS_TEST_UPSTREAM") != "1" {
+		t.Skip("set CERBERUS_TEST_UPSTREAM=1 to check the pinned digests against the live upstream release")
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/"+PinnedTag, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	// CI has a token; using it avoids the 60/hr unauthenticated rate limit.
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("querying the upstream release: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("upstream release API returned HTTP %s", resp.Status)
+	}
+
+	var rel struct {
+		TagName         string `json:"tag_name"`
+		TargetCommitish string `json:"target_commitish"`
+		Assets          []struct {
+			Name   string `json:"name"`
+			Size   int64  `json:"size"`
+			Digest string `json:"digest"` // "sha256:<hex>"
+		} `json:"assets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		t.Fatal(err)
+	}
+
+	// The tag must still resolve to the commit version.go pins.
+	if rel.TargetCommitish != PinnedCommit {
+		t.Errorf("upstream tag %s now points at %s, but version.go pins %s",
+			PinnedTag, rel.TargetCommitish, PinnedCommit)
+	}
+
+	upstream := map[string]struct {
+		size   int64
+		digest string
+	}{}
+	for _, a := range rel.Assets {
+		upstream[a.Name] = struct {
+			size   int64
+			digest string
+		}{a.Size, strings.TrimPrefix(a.Digest, "sha256:")}
+	}
+
+	for key, a := range packs {
+		u, ok := upstream[a.Name]
+		if !ok {
+			t.Errorf("%s: upstream release %s no longer contains %s — FetchPack would 404 for this platform",
+				key, PinnedTag, a.Name)
+			continue
+		}
+		if u.digest == "" {
+			t.Logf("%s: upstream reports no digest for %s; size-only check", key, a.Name)
+		} else if u.digest != a.SHA256 {
+			t.Errorf("%s: DIGEST DRIFT for %s\n  pinned   %s\n  upstream %s\n"+
+				"Upstream re-cut this asset. Every user on this platform now gets a fail-closed "+
+				"refusal from FetchPack until the pin is updated.", key, a.Name, a.SHA256, u.digest)
+		}
+		if u.size != a.Size {
+			t.Errorf("%s: %s is %d bytes upstream, pinned as %d", key, a.Name, u.size, a.Size)
+		}
 	}
 }
 
