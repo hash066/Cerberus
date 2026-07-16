@@ -54,6 +54,9 @@ func WireWorker(fab *mesh.Fabric, cfg WorkerConfig) error {
 	now := func() int64 { return time.Now().Unix() }
 	fab.ServeComputeSigned(
 		func(ctx context.Context, task contract.ComputeTask, grant auth.Grant) (contract.ComputeResult, error) {
+			// grant is already scope-verified against `want` by the mesh layer
+			// (verifySignedCap), which rejects a wrong-resource cap before this
+			// handler is ever reached — so there is nothing left to check here.
 			_ = grant
 			self := fab.PeerID()
 			if cfg.Sched != nil {

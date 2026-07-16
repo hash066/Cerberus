@@ -5,6 +5,7 @@
 package scheduler
 
 import (
+	"bytes"
 	"encoding/hex"
 	"sort"
 	"sync"
@@ -63,7 +64,19 @@ func (m DefaultCostModel) Score(_ contract.ComputeTask, n contract.NodeTelemetry
 }
 
 // Scheduler holds the live node view and produces placements.
+//
+// LOCK ORDER — placeMu -> mu -> cpuMu. Never acquire in any other order, and
+// never hold mu while calling out through the CostModel: DefaultCostModel.Score
+// calls back into FreeCPU, which takes mu then cpuMu. Holding mu across that
+// callback is exactly the ABBA deadlock this ordering exists to prevent (rank
+// held mu and reached for cpuMu via Score->FreeCPU, while AcquireCPU held cpuMu
+// and reached for mu to look up the node's core count). rank() therefore
+// snapshots the node view under mu, RELEASES mu, and only then scores.
 type Scheduler struct {
+	// placeMu serializes whole placement decisions (rank + record) so a
+	// read-modify-write like Reroute stays atomic even though mu is dropped
+	// across the cost-model callback. Outermost lock.
+	placeMu    sync.Mutex
 	mu         sync.Mutex
 	nodes      map[contract.PeerID]contract.NodeTelemetry
 	cpuMu      sync.Mutex
@@ -113,21 +126,39 @@ func (s *Scheduler) NodeSnapshots() []contract.NodeTelemetry {
 }
 
 // rank returns feasible nodes (excluding `exclude`) best-first.
+//
+// It must be called WITHOUT mu held: it snapshots the node view under mu, drops
+// mu, and only then invokes the CostModel — whose default implementation calls
+// back into FreeCPU (mu -> cpuMu). Scoring under mu would self-deadlock or
+// invert the lock order. Ties are broken by PeerID so ranking is deterministic
+// rather than dependent on Go's randomized map iteration order.
 func (s *Scheduler) rank(t contract.ComputeTask, exclude map[contract.PeerID]bool) []contract.PeerID {
+	s.mu.Lock()
+	snap := make([]contract.NodeTelemetry, 0, len(s.nodes))
+	for id, tel := range s.nodes {
+		if exclude[id] {
+			continue
+		}
+		snap = append(snap, tel)
+	}
+	s.mu.Unlock()
+
 	type scored struct {
 		id contract.PeerID
 		sc float64
 	}
 	var cands []scored
-	for id, tel := range s.nodes {
-		if exclude[id] {
-			continue
-		}
+	for _, tel := range snap {
 		if sc, ok := s.cost.Score(t, tel); ok {
-			cands = append(cands, scored{id, sc})
+			cands = append(cands, scored{tel.PeerID, sc})
 		}
 	}
-	sort.SliceStable(cands, func(i, j int) bool { return cands[i].sc > cands[j].sc })
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].sc != cands[j].sc {
+			return cands[i].sc > cands[j].sc
+		}
+		return bytes.Compare(cands[i].id[:], cands[j].id[:]) < 0
+	})
 	out := make([]contract.PeerID, len(cands))
 	for i, c := range cands {
 		out[i] = c.id
@@ -135,12 +166,29 @@ func (s *Scheduler) rank(t contract.ComputeTask, exclude map[contract.PeerID]boo
 	return out
 }
 
+// BestNodeByCost returns the best node for t under the configured CostModel —
+// the SAME ranking Place uses (load-adjusted FLOPS, free threads, thermal
+// headroom, VRAM, power, link RTT), without recording a plan.
+//
+// This exists because the dispatch path needs a placement decision on every
+// task but must not accumulate a plan per dispatch in s.placements. BestNode,
+// which dispatch used to call, ranks on free pool threads ALONE: it cannot see
+// host load, so two idle-pool nodes tie and the winner fell out of map order —
+// the "telemetry-driven placement" claim was never actually exercised.
+func (s *Scheduler) BestNodeByCost(t contract.ComputeTask, exclude map[contract.PeerID]bool) (contract.PeerID, bool) {
+	ranked := s.rank(t, exclude)
+	if len(ranked) == 0 {
+		return contract.PeerID{}, false
+	}
+	return ranked[0], true
+}
+
 // Place selects a primary node and a hot standby for the task's shard.
 func (s *Scheduler) Place(t contract.ComputeTask) (contract.Plan, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.placeMu.Lock()
+	defer s.placeMu.Unlock()
 
-	ranked := s.rank(t, nil)
+	ranked := s.rank(t, nil) // must not hold mu here — see rank's doc comment
 	if len(ranked) == 0 {
 		return contract.Plan{}, contract.Errf(contract.ErrThermalShed, "no feasible node")
 	}
@@ -151,8 +199,14 @@ func (s *Scheduler) Place(t contract.ComputeTask) (contract.Plan, error) {
 	if len(ranked) > 1 {
 		plan.Standbys = []contract.Placement{{Shard: t.Shard, Node: ranked[1], Caps: t.Caps}}
 	}
-	s.placements[hex.EncodeToString(t.TaskID)] = plan
+	s.recordPlan(hex.EncodeToString(t.TaskID), plan)
 	return plan, nil
+}
+
+func (s *Scheduler) recordPlan(key string, plan contract.Plan) {
+	s.mu.Lock()
+	s.placements[key] = plan
+	s.mu.Unlock()
 }
 
 // PlacePipeline spreads a multi-shard task (pipeline/tensor parallelism) across
@@ -160,8 +214,8 @@ func (s *Scheduler) Place(t contract.ComputeTask) (contract.Plan, error) {
 // hot standby per shard where capacity allows. This is the scale path: a model
 // too big for one node is split and placed across the mesh.
 func (s *Scheduler) PlacePipeline(taskID []byte, shards []contract.Shard) (contract.Plan, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.placeMu.Lock()
+	defer s.placeMu.Unlock()
 
 	ranked := s.rank(contract.ComputeTask{TaskID: taskID}, nil)
 	if len(ranked) == 0 {
@@ -176,7 +230,7 @@ func (s *Scheduler) PlacePipeline(taskID []byte, shards []contract.Shard) (contr
 			plan.Standbys = append(plan.Standbys, contract.Placement{Shard: sh, Node: standby})
 		}
 	}
-	s.placements[hex.EncodeToString(taskID)] = plan
+	s.recordPlan(hex.EncodeToString(taskID), plan)
 	return plan, nil
 }
 
@@ -195,24 +249,31 @@ func (s *Scheduler) PlacePipeline(taskID []byte, shards []contract.Shard) (contr
 // independent of the CPU-oriented cost weighting. It records the plan under taskID
 // so Reroute/RerouteNode apply to it too.
 func (s *Scheduler) PlaceGPU(taskID []byte, minVRAM uint64) (contract.Plan, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.placeMu.Lock()
+	defer s.placeMu.Unlock()
 
 	type scored struct {
 		id   contract.PeerID
 		vram uint64
 	}
 	var cands []scored
+	s.mu.Lock()
 	for id, tel := range s.nodes {
 		if tel.Thermal.Throttling || tel.Memory.VRAMFree < minVRAM {
 			continue
 		}
 		cands = append(cands, scored{id, tel.Memory.VRAMFree})
 	}
+	s.mu.Unlock()
 	if len(cands) == 0 {
 		return contract.Plan{}, contract.Errf(contract.ErrThermalShed, "no node with enough free VRAM")
 	}
-	sort.SliceStable(cands, func(i, j int) bool { return cands[i].vram > cands[j].vram })
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].vram != cands[j].vram {
+			return cands[i].vram > cands[j].vram
+		}
+		return bytes.Compare(cands[i].id[:], cands[j].id[:]) < 0
+	})
 
 	shard := contract.Shard{Kind: contract.ShardData}
 	plan := contract.Plan{
@@ -222,17 +283,23 @@ func (s *Scheduler) PlaceGPU(taskID []byte, minVRAM uint64) (contract.Plan, erro
 	if len(cands) > 1 {
 		plan.Standbys = []contract.Placement{{Shard: shard, Node: cands[1].id}}
 	}
-	s.placements[hex.EncodeToString(taskID)] = plan
+	s.recordPlan(hex.EncodeToString(taskID), plan)
 	return plan, nil
 }
 
 // Reroute promotes the standby (or re-places excluding the lost node) when a node fails.
 func (s *Scheduler) Reroute(taskID []byte, lost contract.PeerID) (contract.Plan, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.placeMu.Lock()
+	defer s.placeMu.Unlock()
+	return s.rerouteLocked(taskID, lost)
+}
 
+// rerouteLocked is Reroute's body; caller must hold placeMu.
+func (s *Scheduler) rerouteLocked(taskID []byte, lost contract.PeerID) (contract.Plan, error) {
 	key := hex.EncodeToString(taskID)
+	s.mu.Lock()
 	prev, ok := s.placements[key]
+	s.mu.Unlock()
 	if !ok {
 		return contract.Plan{}, contract.Errf(contract.ErrDenied, "unknown task")
 	}
@@ -247,7 +314,7 @@ func (s *Scheduler) Reroute(taskID []byte, lost contract.PeerID) (contract.Plan,
 		if ranked := s.rank(contract.ComputeTask{TaskID: taskID, Shard: prev.Placements[0].Shard}, exclude); len(ranked) > 0 {
 			newPlan.Standbys = []contract.Placement{{Shard: prev.Placements[0].Shard, Node: ranked[0]}}
 		}
-		s.placements[key] = newPlan
+		s.recordPlan(key, newPlan)
 		return newPlan, nil
 	}
 	// Otherwise re-place from scratch excluding the lost node.
@@ -263,7 +330,7 @@ func (s *Scheduler) Reroute(taskID []byte, lost contract.PeerID) (contract.Plan,
 	if len(ranked) > 1 {
 		newPlan.Standbys = []contract.Placement{{Shard: prevShard(prev), Node: ranked[1]}}
 	}
-	s.placements[key] = newPlan
+	s.recordPlan(key, newPlan)
 	return newPlan, nil
 }
 
@@ -272,6 +339,11 @@ func (s *Scheduler) Reroute(taskID []byte, lost contract.PeerID) (contract.Plan,
 // (ARCHITECTURE §4.2: when a node announces SLEEP_IMMINENT, its shards move to
 // hot standbys before it goes dark). Returns the new plan for each affected task.
 func (s *Scheduler) RerouteNode(lost contract.PeerID) []contract.Plan {
+	// Hold placeMu across the whole sweep so the affected-task set cannot shift
+	// under us mid-reroute; rerouteLocked is the placeMu-free body of Reroute.
+	s.placeMu.Lock()
+	defer s.placeMu.Unlock()
+
 	s.mu.Lock()
 	var keys []string
 	for key, plan := range s.placements {
@@ -283,6 +355,7 @@ func (s *Scheduler) RerouteNode(lost contract.PeerID) []contract.Plan {
 		}
 	}
 	s.mu.Unlock()
+	sort.Strings(keys) // deterministic order, independent of map iteration
 
 	var out []contract.Plan
 	for _, key := range keys {
@@ -290,7 +363,7 @@ func (s *Scheduler) RerouteNode(lost contract.PeerID) []contract.Plan {
 		if err != nil {
 			continue
 		}
-		if np, rerr := s.Reroute(taskID, lost); rerr == nil {
+		if np, rerr := s.rerouteLocked(taskID, lost); rerr == nil {
 			out = append(out, np)
 		}
 	}
