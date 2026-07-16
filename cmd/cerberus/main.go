@@ -168,6 +168,10 @@ func run(args []string) int {
 		return cmdConflicts(rest, jsonOut)
 	case "economy":
 		return cmdEconomy(rest, jsonOut)
+	case "model":
+		return cmdModel(rest, jsonOut)
+	case "llama":
+		return cmdLlama(rest, jsonOut)
 	case "metrics":
 		return cmdMetrics(rest, jsonOut)
 	case "doctor":
@@ -212,6 +216,11 @@ Commands:
   conflicts resolve <subject> <value> [--doc <hex>]
   economy challenge <tx-id> --component-cid C --input-cid I --claimed-output-cid O --actual-output-cid A [--challenger P]
                                        Dispute a pending settlement with a fraud proof
+  model list                          Models available to pull (size + licence), and what's installed
+  model pull <id>                     Download a GGUF model; verifies a pinned sha256. Never automatic.
+  model path <id>                     Print the local path of an installed model
+  llama status                        Show the llama.cpp pack: pinned build, version gate, install state
+  llama fetch [--backend NAME]        Download the pinned llama.cpp pack (vulkan|metal|cpu)
   metrics                             Fetch the local Prometheus /metrics text
   doctor                              Diagnose daemon discovery + reachability
   version                             Print client + contract version
