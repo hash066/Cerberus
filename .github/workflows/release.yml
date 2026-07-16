@@ -161,6 +161,17 @@ jobs:
         run: |
           npm ci
           npm run tauri build
+      # This job does NOT touch the Release. It used to call action-gh-release
+      # itself, which meant it raced the `release` job below: both created/updated
+      # the same draft for the same tag, concurrently, with no ordering between
+      # them. Whichever lost the race appended to a Release the other had already
+      # built, and `release` published a checksums.txt that described only its own
+      # half. Installers now flow to `release` as artifacts, and exactly one job
+      # writes the Release.
+      #
+      # if-no-files-found: error (was: warn) — a leg that produced no installer at
+      # all is a build failure, and `release` needs it to fail here so that
+      # `needs: desktop` blocks publication.
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -171,25 +182,19 @@ jobs:
             tray/src-tauri/target/release/bundle/dmg/*.dmg
             tray/src-tauri/target/release/bundle/deb/*.deb
             tray/src-tauri/target/release/bundle/appimage/*.AppImage
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
-      - name: Attach installers to the draft release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ver.outputs.version }}
-          draft: true
-          fail_on_unmatched_files: false
-          files: |
-            tray/src-tauri/target/release/bundle/msi/*.msi
-            tray/src-tauri/target/release/bundle/nsis/*.exe
-            tray/src-tauri/target/release/bundle/dmg/*.dmg
-            tray/src-tauri/target/release/bundle/deb/*.deb
-            tray/src-tauri/target/release/bundle/appimage/*.AppImage
 
   # ---------------------------------------------------------------- aggregate + publish
   release:
     name: publish draft release
-    needs: build
+    # BOTH, and this is load-bearing. With `needs: build` alone, `desktop` ran
+    # concurrently with this job and attached its own installers to the same draft
+    # release — two jobs writing one Release with no ordering. It also meant a
+    # desktop build that failed outright still let a complete-looking draft
+    # publish, because nothing downstream depended on it. Now a failed installer
+    # leg blocks the Release entirely: no half-published beta.
+    needs: [build, desktop]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -239,6 +244,34 @@ jobs:
         run: |
           echo "::notice::[SCAFFOLD] would upload build/dist/update-manifest.json to \$UPDATE_CHANNEL_URL"
 
+      # Installers arrive as artifacts from the `desktop` job. upload-artifact
+      # stores them relative to their least-common-ancestor
+      # (tray/src-tauri/target/release/bundle), so merge-multiple lands them in
+      # build/dist/{msi,nsis,dmg,deb,appimage}/. That keeps them out of
+      # release.sh's non-recursive `for f in *.tar.gz *.zip` glob, so the Go
+      # checksums stay exactly what they were.
+      - name: Assert the desktop installers actually arrived
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for d in msi nsis dmg deb appimage; do
+            if ! compgen -G "build/dist/$d/*" > /dev/null; then
+              echo "::error::no installer in build/dist/$d — the ${d} bundle did not reach the release job"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || {
+            echo "Refusing to publish a draft that is missing installers: a beta tester"
+            echo "downloading a 'complete' release and finding no .msi is worse than no release."
+            exit 1
+          }
+          ls -R build/dist
+
+      # fail_on_unmatched_files: true now covers the installers too. Previously it
+      # guarded only the Go archives while the desktop job attached its own files
+      # with fail_on_unmatched_files: false — so a total installer failure still
+      # produced a draft that looked complete.
       - name: Create draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -251,3 +284,8 @@ jobs:
             build/dist/*.zip
             build/dist/checksums.txt
             build/dist/update-manifest.json
+            build/dist/msi/*.msi
+            build/dist/nsis/*.exe
+            build/dist/dmg/*.dmg
+            build/dist/deb/*.deb
+            build/dist/appimage/*.AppImage
