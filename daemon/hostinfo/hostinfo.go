@@ -66,9 +66,24 @@ type Interface struct {
 	// Virtual marks an interface the OS describes as having no real physical
 	// medium (Hyper-V/WSL switches, tunnels). These are excluded from medium
 	// classification: see honesty rule 3 above.
+	//
+	// KNOWN FALSE NEGATIVE (measured on the Windows dev rig): this is inferred
+	// from the NDIS physical medium being "Unspecified", which catches Hyper-V/WSL
+	// switches but NOT a Microsoft Wi-Fi Direct Virtual Adapter — that reports a
+	// real Native802.11 medium, so it lands here as Virtual=false even though
+	// Get-NetAdapter reports Virtual=True for it. The medium it gets (WiFi) is
+	// still truthful, since it rides the real radio, and such adapters are
+	// Disconnected so the routing table never selects them — but do not read
+	// Virtual==false as "the OS calls this physical".
 	Virtual bool
 	// Loopback marks the loopback interface.
 	Loopback bool
+	// Up reports whether the OS considers the interface operationally UP. A
+	// classified medium says what a link IS, not whether it EXISTS: the dev rig's
+	// Realtek GbE NIC is unplugged and still reports a real 802.3 physical medium,
+	// so it classifies as MediumEth with MediumKnown=true while carrying no
+	// traffic at all. Callers choosing a link MUST check this; LinkFor does.
+	Up bool
 }
 
 // RAM returns this machine's real total and available physical memory in bytes.
@@ -148,9 +163,14 @@ func InterfaceToward(peer string) (Interface, bool) {
 // value is MediumWiFi, so appending an unclassified Link silently tells the
 // scheduler "this peer is on WiFi". Returning ok=false is how this package
 // refuses to guess.
+//
+// A DOWN interface is also refused. In practice the routing table will not hand
+// back a down interface's source address anyway, so this is belt-and-braces
+// rather than the primary defence — but "classified" and "usable" are different
+// questions and this function answers the second one.
 func LinkFor(peer contract.PeerID, peerAddr string, rttMs float64) (contract.Link, bool) {
 	in, found := InterfaceToward(peerAddr)
-	if !found || !in.MediumKnown {
+	if !found || !in.MediumKnown || !in.Up {
 		return contract.Link{}, false
 	}
 	return contract.Link{

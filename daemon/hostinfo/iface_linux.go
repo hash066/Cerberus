@@ -24,6 +24,12 @@ import (
 //	                                     interface is told apart from a real NIC,
 //	                                     the same distinction NDIS_PHYSICAL_MEDIUM
 //	                                     provides on Windows.
+//	/sys/class/net/<if>/operstate        RFC 2863 operational state ("up"/"down"),
+//	                                     i.e. CARRIER. Deliberately used instead of
+//	                                     net.FlagUp, which is IFF_UP — merely
+//	                                     ADMINISTRATIVELY up, and true for an
+//	                                     unplugged NIC. Windows' IfOperStatus is the
+//	                                     operstate analogue, not the IFF_UP one.
 //
 // NOT VERIFIED ON REAL LINUX HARDWARE: the dev rig is Windows. This code is
 // written against documented sysfs semantics and compiles, but the lane report
@@ -51,10 +57,14 @@ func osInterfaces() ([]Interface, error) {
 			}
 		}
 		if in.Loopback {
+			// Loopback's operstate is "unknown" on Linux; IFF_UP is the right
+			// question for it, and it has no carrier to speak of.
+			in.Up = si.Flags&net.FlagUp != 0
 			out = append(out, in)
 			continue
 		}
 		base := filepath.Join(sysClassNet, si.Name)
+		in.Up = isOperUp(base, si.Flags)
 		in.Mbps = readSpeedMbps(base)
 		// No backing device => virtual (veth, bridge, docker0, tun/tap, wg).
 		if _, derr := os.Stat(filepath.Join(base, "device")); derr != nil {
@@ -110,6 +120,31 @@ func isWirelessLinux(base string) bool {
 		return false
 	}
 	return strings.Contains(string(b), "DEVTYPE=wlan")
+}
+
+// isOperUp reports the interface's RFC 2863 operational state (carrier), which is
+// the honest analogue of Windows' IfOperStatus.
+//
+// net.FlagUp is deliberately NOT the primary signal: it is IFF_UP, meaning
+// "administratively enabled", which stays true for a NIC with its cable pulled —
+// exactly the case this field exists to catch. operstate is only consulted as a
+// fallback when sysfs cannot be read (a container with a masked /sys), where
+// IFF_UP is strictly better than assuming down.
+func isOperUp(base string, flags net.Flags) bool {
+	b, err := os.ReadFile(filepath.Join(base, "operstate"))
+	if err != nil {
+		return flags&net.FlagUp != 0
+	}
+	switch strings.TrimSpace(string(b)) {
+	case "up":
+		return true
+	case "unknown":
+		// Some virtual devices never report a real operstate. Defer to IFF_UP
+		// rather than declaring them down.
+		return flags&net.FlagUp != 0
+	default: // "down", "lowerlayerdown", "dormant", "testing", "notpresent"
+		return false
+	}
 }
 
 // readSpeedMbps reads the negotiated link speed. sysfs reports -1 (and EINVAL on
