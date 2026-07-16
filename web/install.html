@@ -66,7 +66,7 @@
       <section class="tabpanel" id="panel-win" role="tabpanel" aria-labelledby="tab-win" tabindex="0">
         <h2 id="windows" style="font-size:20px;margin:0 0 8px;scroll-margin-top:74px">Windows 10 / 11</h2>
         <ol style="color:var(--text-2);padding-left:20px">
-          <li>Download the <code class="inline">Cerberus_x.y.z_x64-setup.msi</code> installer (or the standalone <code class="inline">.exe</code>) from <a href="https://github.com/hash066/Cerberus/releases" rel="noopener">GitHub Releases</a>.</li>
+          <li>Download <code class="inline">Cerberus_x.y.z_x64_en-US.msi</code> (installer) or <code class="inline">Cerberus_x.y.z_x64-setup.exe</code> (standalone setup) from <a href="https://github.com/hash066/Cerberus/releases" rel="noopener">GitHub Releases</a>. Either one installs the same app.</li>
           <li>Run it. Because the build is unsigned, <b>SmartScreen</b> shows “Windows protected your PC.” Click <b>More info → Run anyway</b>.</li>
           <li>The tray app launches <code class="inline">cerberusd</code> in the background and adds a wolf icon to your system tray. Open it to see the Overview dashboard.</li>
         </ol>
@@ -80,10 +80,16 @@
       <!-- MACOS -->
       <section class="tabpanel" id="panel-mac" role="tabpanel" aria-labelledby="tab-mac" tabindex="0" hidden>
         <h2 id="macos" style="font-size:20px;margin:0 0 8px;scroll-margin-top:74px">macOS (Apple Silicon &amp; Intel)</h2>
+        <div class="callout warn">
+          <span class="mark" aria-hidden="true">!</span>
+          <span><b>There is no macOS download yet.</b> The current release ships Windows installers only —
+            no <code class="inline">.dmg</code> has been published. Build from source below; it is the
+            same code, on both Apple Silicon and Intel.</span>
+        </div>
         <ol style="color:var(--text-2);padding-left:20px">
-          <li>Download the <code class="inline">Cerberus_x.y.z_aarch64.dmg</code> (Apple Silicon) or <code class="inline">_x64.dmg</code> (Intel) from <a href="https://github.com/hash066/Cerberus/releases" rel="noopener">GitHub Releases</a>.</li>
-          <li>Open the <code class="inline">.dmg</code> and drag <b>Cerberus</b> to Applications.</li>
-          <li>Because the build is unsigned/un-notarized, <b>Gatekeeper</b> blocks the first launch. <b>Right-click the app → Open</b>, then confirm <b>Open</b> in the dialog. (Or: System Settings → Privacy &amp; Security → “Open Anyway”.)</li>
+          <li>Follow <a href="#source">Build from source</a> to get <code class="inline">cerberusd</code> and the <code class="inline">cerberus</code> CLI. The daemon is pure-Go and needs no C toolchain.</li>
+          <li>Want the desktop app too? It needs Node and the Tauri CLI: <code class="inline">cd tray &amp;&amp; npm install &amp;&amp; npm run tauri build</code>.</li>
+          <li>A locally built app is unsigned, so <b>Gatekeeper</b> blocks the first launch. <b>Right-click the app → Open</b>, then confirm <b>Open</b>. (Or: System Settings → Privacy &amp; Security → “Open Anyway”.)</li>
         </ol>
         <div class="callout info">
           <span class="mark" aria-hidden="true">i</span>
@@ -98,19 +104,25 @@
       <!-- LINUX -->
       <section class="tabpanel" id="panel-linux" role="tabpanel" aria-labelledby="tab-linux" tabindex="0" hidden>
         <h2 id="linux" style="font-size:20px;margin:0 0 8px;scroll-margin-top:74px">Linux</h2>
-        <p style="color:var(--text-2)"><b>AppImage (portable, any distro):</b></p>
-        <div class="codeblock">
-<pre><code><span class="cmt"># download Cerberus_x.y.z_amd64.AppImage from GitHub Releases, then:</span>
-chmod +x Cerberus_x.y.z_amd64.AppImage
-./Cerberus_x.y.z_amd64.AppImage</code></pre>
+        <div class="callout warn">
+          <span class="mark" aria-hidden="true">!</span>
+          <span><b>There is no Linux download yet.</b> The current release ships Windows installers only —
+            no <code class="inline">.deb</code> or <code class="inline">.AppImage</code> has been published.
+            Build from source below.</span>
         </div>
-        <p style="color:var(--text-2)"><b>Debian / Ubuntu (.deb):</b></p>
+        <p style="color:var(--text-2)">The daemon and CLI are pure-Go and build in one command:</p>
         <div class="codeblock">
-<pre><code>sudo apt install ./cerberus_x.y.z_amd64.deb</code></pre>
+<pre><code>git clone https://github.com/hash066/Cerberus.git
+cd Cerberus
+go build ./cmd/cerberusd ./cmd/cerberus
+./cerberusd</code></pre>
         </div>
         <div class="callout info">
           <span class="mark" aria-hidden="true">i</span>
-          <span>The Tauri tray needs a WebKitGTK runtime (e.g. <code class="inline">libwebkit2gtk-4.1</code>) and an app-indicator library. The <code class="inline">.deb</code> declares these; for the AppImage, install them via your package manager if the tray doesn't appear. Headless server? You only need the daemon — see <a href="#source">Build from source</a>.</span>
+          <span><b>Headless server?</b> The daemon is all you need — it is the whole node, and the desktop app is
+            only a dashboard. If you do want the tray app, it needs a WebKitGTK runtime
+            (<code class="inline">libwebkit2gtk-4.1</code>) and an app-indicator library
+            (<code class="inline">libayatana-appindicator3</code>) for the tray icon to appear.</span>
         </div>
         <p style="color:var(--text-2)">The daemon writes its operator token to <code class="inline">$XDG_CONFIG_HOME/cerberus/operator.token</code> (usually <code class="inline">~/.config/cerberus/operator.token</code>).</p>
       </section>
