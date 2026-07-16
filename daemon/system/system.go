@@ -475,7 +475,18 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 
 	// Seed the scheduler with the local node so it can place work.
 	sched := scheduler.New(nil)
-	localSample := func() contract.NodeTelemetry { return localTelemetry(fab.PeerID()) }
+	// localSample feeds both the scheduler's own node view and the telemetry the
+	// publisher gossips to peers. It measures LINKS as well as CPU/RAM/VRAM:
+	// contract.NodeTelemetry.Links has been declared, and read by the scheduler's
+	// cost model, since the beginning — and never once populated, so the RTT
+	// penalty was permanently zero.
+	//
+	// Honest weighting, measured: 1 ms of RTT moves a ~43-point score by 0.01
+	// (0.023%), while one free CPU thread is worth 5 points — i.e. ~500 ms of RTT.
+	// On a LAN this term can only break near-exact ties. It is wired because a
+	// scheduler that reads a field nothing sets is worse than one that admits it
+	// ignores latency; it is not wired because it will reorder placements.
+	localSample := func() contract.NodeTelemetry { return localTelemetryWithLinks(ctx, fab) }
 	sched.UpdateNode(localSample())
 
 	// CPU device pool: exposes this node's and every telemetry-known peer's CPU
