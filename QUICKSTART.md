@@ -232,17 +232,75 @@ cerberus pipeline-run --model tinyllama-1b
 #   pipeline-run: inference: unknown model "tinyllama-1b"
 ```
 
-`daemon/llama` — supervise a real `llama-server` / `ggml-rpc-server` over a
-capability-gated tunnel — is written and unit-tested, but **no binary imports it
-yet**, so there is nothing to run here. When it lands, the pitch will be *"run a
-model that fits on no single machine you own, safely"*, never *"go faster"*:
-splitting a model over a LAN is materially **slower** than one machine that can
-hold it, because activations cross the network at every layer boundary.
-
 > The `/v1/chat/completions` endpoint will still answer you — with `"1337"`, for
 > any model name, with invented token counts. That is a known bug; see the
 > warning in [README.md](README.md#what-works-today-v01-beta--honest). Don't
 > build on it.
+
+## 6b. Real LLM inference (new, opt-in)
+
+Separately from the fixture above, `cerberusd` can now run a **real llama.cpp
+model** and split it across your machines. This is new and lightly travelled —
+beta inside a beta.
+
+On **A**, point the daemon at a GGUF:
+
+```powershell
+.\cerberusd.exe -llama-model C:\models\your-model.gguf
+#   cerberusd: chat backend ACTIVE — your-model.gguf (single-node), /v1/chat/completions is live
+```
+
+`/v1/chat/completions` now serves a real model: real tokenizer, real sampler,
+real `usage` counts — llama.cpp's, not ours. **This single-node path is the part
+that works.**
+
+### Splitting a model across both machines: not wired yet
+
+Both halves exist and neither reaches the other:
+
+- **B** can lend its GPU (`-llama-worker`): it serves llama tensor work over a
+  capability-gated mesh session, and its `ggml-rpc-server` is bound to
+  **loopback only**, so it is deliberately not reachable from the LAN.
+- **A** can consume RPC workers (`-llama-rpc host:port`), but that is a **raw TCP
+  dial** that bypasses the mesh gate — and it cannot reach B's worker anyway,
+  because B's server isn't listening on anything but loopback.
+
+The missing piece is the forwarder (`daemon/llama/forwarder.go`): a loopback
+listener A's `llama-server` would dial, which pipes into the authenticated mesh
+session to B. It is written and tested, but **no binary constructs one** —
+`OpenLlamaRPCSession` is called only from `forwarder.go`, and nothing calls
+`NewForwarder`. So `-llama-rpc` today is only useful for a `ggml-rpc-server` you
+started yourself, outside Cerberus and outside its capability gate.
+
+**Distributed LLM inference through Cerberus is therefore not a thing you can do
+today.** Single-node chat is.
+
+And when it is wired, do not do it for speed. Measured with upstream llama.cpp on
+one machine: a model split over `ggml-rpc` ran **~45 tok/s** against **~396
+tok/s** for a single node that could hold it — **~9× slower**. Activations cross
+the network at every layer boundary; the cost is structural. The reason to split
+a model is that it **fits on no single machine you own**. If yours fits, don't.
+
+> [!CAUTION]
+> **`-llama-worker` grants code execution on your machine to any peer that can
+> join your mesh** — which today means any machine on your LAN running
+> `cerberusd` with the same site. This is not hedging; it is what the flag does:
+> peers **self-issue their own capabilities** (the llama gate resolves issuers
+> via `SelfIssuerResolver`, which asserts only "the signer is the peer on this
+> stream" — there is no operator-authorised issuer set), mDNS auto-connects to
+> LAN peers, and there is **no peer allowlist anywhere in the tree**. On top of
+> that, `ggml-rpc`'s deserializer trusts its client and is not a sandbox
+> (CVE-2026-34159, CVSS 9.8, was a pre-auth RCE in it).
+>
+> The resource scoping in `daemon/mesh/capscope.go` is real and necessary — it
+> stops a capability for one service being replayed against another — but **it is
+> not authorization here, because the attacker mints their own capability.** Only
+> enable this on a network where you trust every machine.
+
+llama.cpp owns the layer split (it distributes weights by measured free memory;
+override with `--tensor-split`). Only the node with `-llama-model` needs the
+GGUF — it pushes tensors to workers at load time, so a worker needs the binary,
+not the weights.
 
 ## 7. Write a file on A, read it on B
 

@@ -59,9 +59,12 @@ authority. Every action presents a signed capability you can narrow, delegate,
 and revoke — revocations propagate across the whole mesh. Go + Rust, Windows and
 Linux, with a one-click tray app.
 
-**What it is not: an LLM tool.** Cerberus runs no language models. It pools and
-secures machines; that's the whole pitch. If you want to run a model across your
-devices, use exo — genuinely.
+**What it is not: an LLM tool.** It can serve one real llama.cpp model on one
+machine (`-llama-model`, brand new), but pooling a model *across* your devices
+isn't wired yet — and our own measurement says it'd be ~9× slower than a single
+machine that fits the model. Cerberus pools and secures **machines**; that's the
+whole pitch. If you want to run a big model across your devices, use exo —
+genuinely.
 
 ## First comment (from the maker)
 

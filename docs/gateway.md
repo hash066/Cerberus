@@ -20,38 +20,40 @@ dispatches it through the **real WebAssembly executor** (wazero), returning an
 OpenAI-shaped envelope. The scheduler/runtime place and run the task on the mesh.
 
 > [!WARNING]
-> **This gateway will answer for a model it does not have, and its token counts
-> are fabricated.** Both are known bugs; read this section before you build
-> against it.
+> **Without a chat backend, this gateway answers for models it does not have,
+> and its token counts are fabricated.** Both are known bugs; read this before
+> you build against it.
 >
 > `componentFor` ([`gateway.go:160`](../daemon/gateway/gateway.go)) resolves an
 > unknown model name straight to a component CID, which falls through to the
-> seeded `hello-shard`. So `POST {"model":"gpt-4o"}` returns **HTTP 200** with
-> `"content": "1337"` — verified by running it. An unknown model should 404.
+> seeded `hello-shard`. So on a stock daemon, `POST {"model":"gpt-4o"}` returns
+> **HTTP 200** with `"content": "1337"` — verified by running it. An unknown
+> model should 404.
 >
-> Worse, the `usage` block is invented: `prompt_tokens` is the **character
-> count** of your prompt and `completion_tokens` is the **byte length** of the
-> reply ([`chat.go:186`](../daemon/gateway/chat.go)). There is no tokenizer in
-> this path. A field named `prompt_tokens` that contains a character count is a
+> Worse, that path's `usage` block is invented: `prompt_tokens` is the
+> **character count** of your prompt and `completion_tokens` is the **byte
+> length** of the reply ([`chat.go:186`](../daemon/gateway/chat.go)). There is no
+> tokenizer in it. A field named `prompt_tokens` holding a character count is a
 > fabricated measurement, and every OpenAI client will read it as tokens.
+>
+> **Run `cerberusd -llama-model <file.gguf>` and this becomes a different
+> endpoint** — a real `llama-server` serves it, with a real tokenizer, sampler
+> and genuine `usage`. The bug is the fallback, not the llama path.
 
 **Be aware, honestly:**
-- The **wired component is the demo `hello-shard` WASM module**, not a large
-  language model. The `assistant` message `content` you get back is that
-  component's output — the request/response *shape* is genuine OpenAI, the
-  *model* behind it is a WASM shard.
-- **No LLM is served here, and none is planned behind this interface as it
-  stands.** Real llama.cpp inference is `daemon/llama`'s job (proxying a real
-  `llama-server`, which owns tokenization, sampling and genuine `usage` counts).
-  It is written, unit-tested, and **imported by no binary yet**. "Swap in a real
-  LLM component" understates it: real inference needs a tokenizer, GGUF parsing,
-  a KV-cache and a sampler, which is why that work delegates to llama.cpp rather
-  than pretending a component swap covers it.
-- **`/v1/models` lists WASM shards only.** `BuiltinInferenceModels()` returns
-  nil by design and the daemon logs `0 inference model(s) registered on gateway`
-  at boot. The split-MLP fixture is deliberately **not** advertised here — a
-  fixture in a test is honest; a fixture on `/v1/models` pretending to be a chat
-  model is not.
+- **Two modes.** With `-llama-model`, a real llama.cpp model is served
+  (`cmd/cerberusd/main.go:509` → `gw.SetInference`). Without it, the wired
+  component is the demo `hello-shard` WASM module and the `content` you get back
+  is that component's output — genuine OpenAI *shape*, WASM shard behind it.
+- **`/v1/models` lists what is registered — WASM shards, plus your llama model
+  if you passed one.** `BuiltinInferenceModels()` returns nil by design; a stock
+  daemon logs `0 inference model(s) registered on gateway` at boot. The split-MLP
+  fixture is deliberately **not** advertised here — a fixture in a test is
+  honest; a fixture on `/v1/models` pretending to be a chat model is not.
+- **Distributed inference is not wired.** `-llama-rpc` exists but the forwarder
+  that would bridge a local `llama-server` to a capability-gated remote worker is
+  constructed by no binary. Single-node chat works; splitting a model across
+  peers does not. See [README.md](../README.md).
 
 ---
 
@@ -59,8 +61,8 @@ OpenAI-shaped envelope. The scheduler/runtime place and run the task on the mesh
 
 | Method | Path | Status | Auth (right) |
 |---|---|---|---|
-| `POST` | `/v1/chat/completions` | ✅ implemented — **but answers for any model name; see the warning above** | `exec` |
-| `GET`  | `/v1/models` | ✅ implemented (lists WASM shards; no LLMs) | `exec`/`read` |
+| `POST` | `/v1/chat/completions` | ✅ implemented — real LLM with `-llama-model`; **otherwise answers to any model name, see the warning above** | `exec` |
+| `GET`  | `/v1/models` | ✅ implemented (WASM shards + your `-llama-model`, if any) | `exec`/`read` |
 | —      | streaming (`stream: true`) | ✅ implemented — real SSE: role-priming chunk, content deltas, `finish_reason`, `data: [DONE]` | `exec` |
 
 ---

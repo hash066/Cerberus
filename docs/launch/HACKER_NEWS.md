@@ -51,25 +51,49 @@ What that buys you, concretely, today:
   distribution is real. **The model is a 4×4 MLP fixture** — no tokenizer, no
   weights, no KV-cache, no sampler. It is not a language model.
 
-**Cerberus does not run LLMs.** I want to be blunt about this because the
-category invites the assumption. v0.1 shipped `llamacpp` and `mlx` "backends";
-they were mock transforms wearing real engines' names, and one of them
-(`forward.cpp`) had never been compiled — it was protocol-broken in both
-directions and called an API that doesn't exist in llama.cpp. Nobody noticed
-because nothing ever built it. I deleted all of it rather than repair it; asking
-for `--backend llamacpp` now fails to your face. The replacement (`daemon/llama`:
-supervise real `llama-server`/`ggml-rpc-server`, tunnel ggml's RPC over a
-capability-gated mesh session) is written and unit-tested, but **no binary
-imports it yet**, so it does not run. That's the honest status.
+- `cerberusd -llama-model model.gguf` — runs a real `llama-server`, so
+  `/v1/chat/completions` serves a real model with a real tokenizer and real
+  token counts. **Single-node only**, and new — treat it as beta inside a beta.
+  Splitting a model *across* machines is not wired yet; see below, because the
+  reason is more interesting than the feature.
 
-One number, because it's the most useful thing I learned and it argues against
-my own pitch: testing upstream llama.cpp directly (not through Cerberus, on one
-machine, single run), a model split over `ggml-rpc` ran at **~45 tok/s vs ~396
-tok/s** on a single node that could hold it. **Distributing is ~9× slower.**
-That's not a bug — activations cross the network at every layer boundary. So if
-this ever ships, the pitch is *"run a model that fits on no single machine you
-own, safely"*, never *"go faster"*. If you came here for fast local inference,
-you want exo or plain llama.cpp, and I'd rather say that now than in a reply.
+On LLMs, three things I'd rather say up front than have found:
+
+**One.** v0.1 shipped `llamacpp` and `mlx` "backends". They were mock transforms
+wearing real engines' names, and one of them (`forward.cpp`) had **never been
+compiled in its life** — it was protocol-broken in both directions and called an
+API that doesn't exist in llama.cpp. Nobody noticed because nothing ever built
+it. I deleted all of it rather than repair it; `--backend llamacpp` now fails to
+your face, and a test pins the deletion so it can't crawl back.
+
+**Two: splitting a model across machines — the actual headline feature — is not
+wired.** Both halves are in the tree and neither reaches the other. A worker
+(`-llama-worker`) serves tensor work over a capability-gated mesh session with
+its `ggml-rpc-server` bound to loopback only, deliberately unreachable from the
+LAN. A client (`-llama-rpc`) takes a raw `host:port` and dials straight past the
+mesh gate — so it can't reach that worker, by construction. The forwarder that
+bridges them (a loopback listener that pipes into the authenticated session) is
+written and tested, and **no binary ever constructs one**. I'd rather you learn
+that here than by trying it.
+
+**Three, and this argues against the feature anyway:** testing upstream llama.cpp
+directly (one machine, single run), a model split over `ggml-rpc` ran at **~45
+tok/s vs ~396 tok/s** on a single node that could hold it. **Distributing is ~9×
+slower.** That's structural — activations cross the network at every layer
+boundary — not something I can tune away. So the pitch, when this does land, is
+*"run a model that fits on no single machine you own, safely"*, **never** *"go
+faster"*. If you came here for fast local inference you want plain llama.cpp or
+exo, and I'd rather say that in the post than in a reply.
+
+And a warning I won't soften: `-llama-worker` is off by default because turning
+it on **grants code execution to any peer that can join your mesh** — today, any
+machine on your LAN running cerberusd. Peers self-issue their own capabilities
+(the gate's issuer resolver asserts only "the signer is the peer on this
+stream"), mDNS auto-connects, there's no peer allowlist anywhere, and ggml-rpc
+isn't a sandbox. Resource scoping stops capability *substitution*; it is not
+authorization when the attacker mints the capability. That's the honest state of
+it, and it's why the flag's help text says so at length rather than "peers
+holding a capability".
 
 The part I actually care about — and the part I'd most like this crowd to tear
 apart — is the security model. There are no accounts, roles, or ACLs anywhere.
@@ -104,22 +128,28 @@ faking maturity):
 
 Three things I'd rather you hear from me than find:
 
-1. **`/v1/chat/completions` is a live footgun.** It answers HTTP 200 for *any*
-   model name — `{"model":"gpt-4o"}` returns `"1337"` (a WASM shard's output) —
-   and the `usage` token counts are fabricated from character/byte lengths, with
-   no tokenizer anywhere in the path (`daemon/gateway/chat.go:186`). It's in the
-   README as a warning. It should 404 an unknown model and omit `usage` it can't
-   compute. It's the sharpest edge in the repo and I found it by auditing my own
-   docs before posting this.
-2. **Four mesh protocols verify rights but not resource scope.** The kernel that
-   ships scopes capabilities correctly (a cap for `/cer/dev/vram/local/0` is
-   refused on `/cer/dev/gpu/local/0` — there's a regression test). But
-   `daemon/mesh`'s audio/shard/compute/gpu gates check the signature and the
-   *right*, then discard the grant without comparing `grant.Resource`. Only
-   `llamarpc.go` scopes. `auth.Verify` structurally can't close it — the
-   resource isn't one of its arguments. A capability that isn't checked against
-   its resource is a signed permission slip, and I'd rather say that here than
-   have someone find it in the diff.
+1. **`/v1/chat/completions` is a live footgun without `-llama-model`.** With no
+   chat backend wired, it answers HTTP 200 for *any* model name —
+   `{"model":"gpt-4o"}` returns `"1337"` (a WASM shard's output) — and the
+   `usage` counts are fabricated from character/byte lengths, with no tokenizer
+   in *that* path (`daemon/gateway/chat.go:186`). It should 404 an unknown model
+   and omit `usage` it can't compute. It's the sharpest edge in the repo and I
+   found it by auditing my own docs before posting this. (With `-llama-model`, a
+   real llama-server serves it and the counts are llama.cpp's real ones — the
+   bug is the fallback, not the llama path.)
+2. **Until a few hours before this post, four mesh protocols verified rights but
+   not resource scope.** The kernel always scoped correctly, but
+   `daemon/mesh`'s audio/shard/compute/gpu gates checked the signature and the
+   *right*, then discarded the grant without ever comparing `grant.Resource` —
+   two of them literally `if _, verr := verify…`. Since compute and gpu both
+   require `exec`, a peer holding a compute capability could open the GPU
+   endpoint. That's cross-service capability substitution, and it made the
+   central claim of this project false in the exact place it most needed to be
+   true. It's fixed now — one shared gate (`daemon/mesh/capscope.go`) with a
+   per-protocol denial test each, plus tests rejecting prefix-confusion and
+   wildcards — but I'm telling you it existed because "we shipped a capability
+   system that didn't check capabilities" is the most interesting thing an
+   audit found, and you'd have found it in the git log anyway.
 3. **There is no LICENSE file.** Default copyright applies, which means this
    isn't open source in any way that matters yet. Fixing it is on me.
 
@@ -138,8 +168,9 @@ walkthrough; the README table is the authority on what's Real/Partial/Stub, and
 ARCHITECTURE.md §8 now shows the design verdict and what's actually in the tree
 side by side, because those had drifted apart. I'd genuinely value adversarial
 reads of `daemon/auth` (capability envelope, attenuation, revocation),
-`daemon/mesh` (the four gates that don't scope — start there if you want to make
-me look bad, it's the real hole), and `daemon/wasm` (sandbox) more than stars.
+`daemon/mesh/capscope.go` (the scope gate that just closed a real hole — if it's
+still wrong, that's the finding I most want), and `daemon/wasm` (sandbox) more
+than stars.
 
 ---
 
@@ -161,10 +192,12 @@ competing — QUICKSTART documents using it as the underlay across networks.
 
 ### 2. "How is this different from exo?"
 
-Different layer, and on exo's own turf exo simply wins — it serves models and we
-serve none. Our cross-node pipeline is real orchestration over a 4×4 MLP
-fixture; our llama.cpp integration is written and not wired. I haven't
-benchmarked exo and won't quote numbers at it.
+Different layer, and on exo's own turf exo wins — model-parallel LLM serving is
+its whole product and it's mature at it. We only just wired llama.cpp at all
+(`-llama-model`, single-node), splitting a model across machines **isn't wired
+end-to-end**, and our own measurement says it'd be ~9× slower than not splitting
+it. So we're not competing on inference and I'd be lying if I said otherwise. I
+haven't benchmarked exo and won't quote numbers at it.
 
 Cerberus pools **the machines** — sandboxed compute, GPU kernels, files, audio —
 behind an object-capability model, because the problem I wanted solved was "how
@@ -265,9 +298,11 @@ stub) protect a workload from a hostile host.
 | macOS audio written but NEVER COMPILED | `daemon/audio/os_darwin.go` (`//go:build darwin && cgo && cerberus_coreaudio`); default macOS builds get `os_darwin_stub.go` |
 | Pipeline across nodes, activations over data plane | `daemon/system/pipeline.go`, `test/pipeline_e2e/` |
 | Mocks DELETED, not repaired; removed backends fail loudly | `daemon/inference/backend.go:54`, `inference_test.go:34` (pins the deletion) |
-| Real llama.cpp integration exists but is UNWIRED | `daemon/llama/` — `grep -r cerberus/daemon/llama` returns zero importers |
+| Real llama.cpp chat backend, opt-in via `-llama-model` | `cmd/cerberusd/main.go:509` (`llama.NewService` → `gw.SetInference`), `daemon/llama/` |
+| Cap-gated ggml-rpc worker, OFF by default, with an honest flag doc | `-llama-worker` (`cmd/cerberusd/main.go:130`), `daemon/llama/worker.go`, `daemon/mesh/llamarpc.go` |
+| Distributed offload NOT wired: forwarder constructed by nobody | `daemon/llama/forwarder.go` — `OpenLlamaRPCSession` called only there; no caller of `NewForwarder`. Worker's `ggml-rpc-server` is loopback-only (`rpcserver.go:27`); `-llama-rpc` is a raw dial past the gate |
 | Capabilities scoped to their resource (shipping kernel) | `contract/go/stub/stub.go:113`, `daemon/ninep/capscope_proof_test.go` |
-| …but 4 mesh protocols don't scope | `daemon/mesh/audio.go:214`, `shard.go:227`; only `llamarpc.go:329` compares `grant.Resource` |
+| …and at every mesh gate (this closed a real hole) | `daemon/mesh/capscope.go` (`grantCoversResource`), `daemon/mesh/capscope_proof_test.go` (per-protocol denial + prefix/wildcard rejection) |
 | …and the `-tags ffi` kernel structurally can't | `daemon/ffi/kernel_ffi.go:170` — C ABI is `(handle, op, now)`, no resource |
 | VRAM measured, never fabricated; unknown stays unknown | `daemon/gpu/vramprobe_nvidia.go`, [docs/vram.md](../vram.md) |
 | Real Linux FUSE mount (pure Go, no cgo) | `daemon/ninep/mount_linux.go`, `mount_linux_test.go` (`TestMountLive`) |

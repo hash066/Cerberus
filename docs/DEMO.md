@@ -8,11 +8,18 @@ output — never fake a backend (if the GPU build isn't `gpu-wgpu`, say so).
 > **Do not shoot these — they are not real, and a launch video is the worst
 > possible place to find that out:**
 >
-> - **Any LLM / chat scene.** Cerberus runs no language models. `pipeline-run`
->   distributes a 4×4 MLP **fixture**. Do not point an OpenAI client at
->   `/v1/chat/completions` on camera: it returns `"1337"` for any model name with
->   fabricated token counts (known bug — see [gateway.md](gateway.md)). It would
->   look exactly like a working LLM. That shot would be a lie.
+> - **Any chat scene on a daemon without `-llama-model`.** `/v1/chat/completions`
+>   returns `"1337"` for any model name, with fabricated token counts (known bug
+>   — see [gateway.md](gateway.md)). On camera that is indistinguishable from a
+>   working LLM. That shot would be a lie. *With* `-llama-model` a real
+>   llama-server serves it and you may film it — say "single machine", because
+>   that's what it is.
+> - **"Cerberus splits a model across my machines."** Not wired end-to-end (the
+>   forwarder bridging a local llama-server to a cap-gated remote worker is
+>   constructed by no binary). Don't stage it, and don't imply it.
+> - **`pipeline-run` as "distributed LLM inference."** It distributes a 4×4 MLP
+>   **fixture**. Film it as what it is — real placement, real cross-node
+>   activation hand-off, a toy model — which is a good shot on its own.
 > - **A Windows drive letter (`X:`) mount.** Unverified — needs WinFsp. The
 >   Linux FUSE mount is real and fair game.
 > - **Browsing `/cer/fs` in Explorer or a file manager.** Not supported: fs files

@@ -16,9 +16,13 @@
 >   Do not describe Cerberus as "supporting MLX".
 > - **There is no tinygrad integration.** The real GPU backend is wgpu, off by
 >   default; stock binaries honestly report `backend: cpu-software`.
-> - **No LLM runs through Cerberus.** The pipeline shards a 4×4 MLP **fixture**.
->   Real llama.cpp integration lives in `daemon/llama` — written, unit-tested,
->   and imported by no binary yet.
+> - **This vertical's pipeline shards a 4×4 MLP fixture**, not a model. Real LLM
+>   work lives in `daemon/llama` and is deliberately **not** on this path —
+>   llama.cpp owns its own layer split, so `ShardsForLayerCount`/`PlacePipeline`
+>   are not used there. `-llama-model` serves a real model **single-node**;
+>   splitting one across peers is not wired end-to-end (the forwarder bridging a
+>   local `llama-server` to a cap-gated remote worker is constructed by no
+>   binary).
 > - **Tensor (intra-layer) parallelism is not implemented.** Pipeline
 >   (layer-group) placement is. `contract.ShardTensor` is declared and set by no
 >   code; `TPRank`/`TPWorld` are plumbed through the mesh wire
