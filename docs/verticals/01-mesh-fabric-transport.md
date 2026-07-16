@@ -72,10 +72,37 @@ Every `Publish`/`Subscribe` requires a `topic` capability; the fabric calls `cap
 |---|---|---|
 | Intra-site fabric | **Zenoh** | data-centric, ~4-byte overhead, auto mesh routing/healing, robotics-grade; avoids exo's DHT meltdown |
 | Inter-site fabric | **go-libp2p** (DCUtR, Gossipsub v1.1) | best-in-class NAT traversal + relay; Sybil-resistant peer scoring |
-| Transport | **QUIC** (`quic-go`), mTLS | 0-RTT, multiplexed streams, encrypted by default |
-| Discovery | mDNS + libp2p bootstrap | zero-config LAN + WAN |
+| Transport | **QUIC** (`quic-go`), mTLS | multiplexed streams, encrypted by default, 1-RTT handshake ([not 0-RTT](#0-rtt-is-deliberately-off)) |
+| Discovery | mDNS + libp2p bootstrap | zero-config LAN + WAN; the mDNS service tag is scoped by site (`cerberus-<site>`) so different sites on one LAN do not cross-discover |
 | Ephemeral leases | `hashicorp/raft` | sub-200 ms leader election, lease-scoped only |
 | Supervision | custom Go OTP-style supervisor | predictable fault tolerance |
+
+### 0-RTT is deliberately off
+
+This table previously claimed **0-RTT**. Nothing implemented it — `Allow0RTT` was
+never set on either the mesh or the data-plane QUIC config — so the claim was
+simply wrong, and it is corrected here rather than implemented.
+
+It is corrected rather than implemented on purpose. 0-RTT data is, by
+construction, **replayable**: an attacker who captures a 0-RTT first flight can
+re-send it, and the server cannot distinguish the replay from the original
+(RFC 9001 §9.2). The data plane's first flight is the transfer header, and the
+transfer header carries the **capability** that authorizes the transfer
+(`daemon/dataplane/frame.go`). Accepting a replayable capability presentation is
+precisely the property a capability system must not have — it would let a
+captured grant be re-played against its quota. Per CLAUDE.md golden rule 5
+("capabilities, not identities — no ambient authority") that trade is not
+available to us for a one-RTT saving on a LAN where RTT is ~1ms.
+
+Wiring it later is possible but is not a config flip: the header would need an
+anti-replay nonce the server tracks, and only then could `Allow0RTT` be set on
+the listener with a `tls.ClientSessionCache` on the dialer. Until that exists,
+this stays off and undocumented as a feature.
+
+**Congestion control** is Cubic, not BBR: `quic-go` ships Cubic only and exposes
+no pluggable CC hook. Flow-control windows are tuned instead
+(`daemon/dataplane/quicconf.go`), which is measured at +17.9% on a high-RTT path
+and a no-op on a LAN — see that file for the numbers and the method.
 
 ## 7. Security Model
 - All topics are capability-gated; no node can subscribe to telemetry/CRDT streams without a `topic` capability.

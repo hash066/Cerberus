@@ -76,6 +76,16 @@ type Server struct {
 	// SetClientObserver; nil by default.
 	onAuthClient func(transferID uint64, client contract.PeerID)
 
+	// tuning is the QUIC transport tuning this server listens with (see
+	// quicconf.go). Defaults to DefaultTuning(); override with SetTuning before
+	// Listen.
+	tuning Tuning
+
+	// advertiseHost, when non-empty, overrides the host part of the address
+	// RegisterGrant hands to a peer. See advertise.go for why a bound wildcard
+	// listener cannot simply advertise its own listener address.
+	advertiseHost string
+
 	mu         sync.Mutex
 	grants     map[uint64]grant           // transferID -> authorized grant
 	responders map[uint64]Responder       // transferID -> request/response handler (optional)
@@ -100,14 +110,28 @@ type grant struct {
 // rather than generate a new one per server.
 func NewServer(kernel contract.CapKernel, now int64, identity ed25519.PrivateKey) *Server {
 	return &Server{
-		kernel:     kernel,
-		now:        now,
-		identity:   identity,
-		grants:     map[uint64]grant{},
-		responders: map[uint64]Responder{},
-		authBy:     map[uint64]contract.PeerID{},
+		kernel:        kernel,
+		now:           now,
+		identity:      identity,
+		tuning:        DefaultTuning(),
+		advertiseHost: AdvertiseHostFromEnv(),
+		grants:        map[uint64]grant{},
+		responders:    map[uint64]Responder{},
+		authBy:        map[uint64]contract.PeerID{},
 	}
 }
+
+// SetTuning overrides the QUIC transport tuning used by Listen (see quicconf.go).
+// Must be called before Listen to have any effect. Not safe to call concurrently
+// with Listen/Serve.
+func (s *Server) SetTuning(t Tuning) { s.tuning = t }
+
+// SetAdvertiseHost overrides the host RegisterGrant advertises to peers, for
+// deployments where this node's reachable address is not one the OS routing
+// table can derive (e.g. behind a NAT/port-forward, or a specific overlay
+// address). Empty restores the automatic resolution in advertise.go. Not safe to
+// call concurrently with RegisterGrant.
+func (s *Server) SetAdvertiseHost(h string) { s.advertiseHost = h }
 
 // SetClientObserver installs a callback invoked with the authenticated client
 // PeerID (derived from the verified mTLS client certificate) each time a transfer
@@ -151,11 +175,14 @@ func (s *Server) RegisterGrant(transferID uint64, cap contract.CapHandle, quota 
 func (s *Server) RegisterSignedGrant(transferID uint64, cap contract.CapHandle, quota contract.Quota, envelope []byte, issuer contract.PeerID) Endpoint {
 	s.mu.Lock()
 	s.grants[transferID] = grant{cap: cap, quota: quota}
-	addr := ""
-	if s.ln != nil {
-		addr = s.ln.Addr().String()
-	}
 	s.mu.Unlock()
+	// The address handed to the HOLDER must be one the holder can dial. When the
+	// listener is bound to a wildcard host (the only way to be reachable from
+	// another machine), its own Addr() is "0.0.0.0:port", which a remote peer
+	// would resolve to its OWN loopback/wildcard — the exact class of bug that
+	// made this data plane loopback-only. AdvertisedAddr resolves a concretely
+	// reachable host for the bound port. See advertise.go.
+	addr := s.AdvertisedAddr()
 	return Endpoint{
 		Kind:         EndpointQUIC,
 		Addr:         addr,
@@ -181,11 +208,14 @@ func (s *Server) RegisterResponder(transferID uint64, cap contract.CapHandle, qu
 	s.mu.Lock()
 	s.grants[transferID] = grant{cap: cap, quota: quota}
 	s.responders[transferID] = r
-	addr := ""
-	if s.ln != nil {
-		addr = s.ln.Addr().String()
-	}
 	s.mu.Unlock()
+	// Same reachability rule as RegisterSignedGrant: hand the HOLDER an address
+	// the holder can dial, not this listener's own (possibly wildcard) bind
+	// address. A responder endpoint is dialed by a REMOTE peer (that is the whole
+	// point — e.g. dispatching an f32 kernel onto this node's GPU), so advertising
+	// "0.0.0.0:port" or loopback here breaks cross-node dispatch in exactly the
+	// way the raw data plane was already broken. See advertise.go.
+	addr := s.AdvertisedAddr()
 	return Endpoint{
 		Kind:         EndpointQUIC,
 		Addr:         addr,
@@ -221,16 +251,19 @@ func (s *Server) Addr() string {
 }
 
 // Listen binds a QUIC listener on addr (e.g. "127.0.0.1:0" for an ephemeral
-// port). Call Serve to accept transfers.
+// port, or "0.0.0.0:0" to be reachable from other machines). Call Serve to
+// accept transfers.
+//
+// Binding a wildcard host is what makes the data plane usable across machines at
+// all (see ListenAddrFromEnv), but it also means s.ln.Addr() is then
+// "0.0.0.0:port" — an address no peer can dial. RegisterGrant therefore hands out
+// AdvertisedAddr(), not the raw listener address; see advertise.go.
 func (s *Server) Listen(addr string) error {
 	tlsConf, err := newSelfSignedTLS(s.identity)
 	if err != nil {
 		return err
 	}
-	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
-		MaxIncomingStreams: 256,
-		EnableDatagrams:    false,
-	})
+	ln, err := quic.ListenAddr(addr, tlsConf, s.tuning.serverConfig())
 	if err != nil {
 		return fmt.Errorf("dataplane: listen: %w", err)
 	}

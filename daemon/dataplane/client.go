@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 
 	contract "github.com/hash066/cerberus/contract/go"
@@ -34,6 +35,19 @@ type Client struct {
 	// fresh ephemeral identity (a real, verifiable key — just not the node's
 	// durable PeerID), preserving the pre-mTLS zero-argument call sites.
 	cert tls.Certificate
+
+	// tuning is the QUIC transport tuning this client dials with (quicconf.go).
+	// Previously the dialer passed a literally empty &quic.Config{} and inherited
+	// every quic-go default, including no keep-alive.
+	tuning Tuning
+
+	// transport, when non-nil, is a shared quic.Transport every Send dials
+	// through, so all transfers reuse ONE UDP socket instead of quic.DialAddr
+	// opening a fresh socket per transfer. Nil (the default) keeps the
+	// DialAddr-per-transfer behaviour, whose socket quic-go closes with the
+	// connection — so the default Client remains safe to construct, use once and
+	// discard, exactly as existing call sites do. See SetTransport.
+	transport *quic.Transport
 }
 
 // NewClient returns a data-plane client whose mTLS certificate is bound to a
@@ -65,7 +79,40 @@ func NewClientWithIdentity(identity ed25519.PrivateKey) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{cert: cert}, nil
+	return &Client{cert: cert, tuning: DefaultTuning()}, nil
+}
+
+// SetTuning overrides the QUIC transport tuning this client dials with (see
+// quicconf.go). Not safe to call concurrently with Send.
+func (c *Client) SetTuning(t Tuning) { c.tuning = t }
+
+// SetTransport makes every subsequent Send dial through tr, so all transfers
+// share ONE UDP socket rather than opening a fresh one per transfer
+// (quic.DialAddr's behaviour, which is what this client does when tr is nil).
+//
+// The caller OWNS tr and must Close it; the Client never does. That ownership
+// split is why this is opt-in rather than the default: the existing call sites
+// construct a Client, Send once and drop it (`dataplane.NewClient().SendBytes(…)`),
+// and silently giving each one a socket it never closes would leak a UDP socket
+// per transfer. Callers that make many transfers should build one Transport, one
+// Client, and reuse both. Not safe to call concurrently with Send.
+func (c *Client) SetTransport(tr *quic.Transport) { c.transport = tr }
+
+// dial opens a QUIC connection to addr, through the shared transport when one is
+// installed and via quic.DialAddr otherwise. Both paths use the SAME tls.Config
+// and quic.Config, so socket reuse cannot change the security posture or the
+// tuning — only which socket the packets leave from.
+func (c *Client) dial(ctx context.Context, addr string, expect contract.PeerID) (*quic.Conn, error) {
+	tlsConf := clientTLS(expect, c.cert)
+	conf := c.tuning.clientConfig()
+	if c.transport == nil {
+		return quic.DialAddr(ctx, addr, tlsConf, conf)
+	}
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return c.transport.Dial(ctx, ua, tlsConf, conf)
 }
 
 // Send streams a blob to the server described by ep, authorized by ep.Cap and
@@ -127,7 +174,7 @@ func (c *Client) send(ctx context.Context, ep Endpoint, r io.Reader, n uint64) (
 			fmt.Sprintf("blob %d bytes exceeds quota %d", n, ep.Quota.Bytes))
 	}
 
-	conn, err := quic.DialAddr(ctx, ep.Addr, clientTLS(ep.ServerPeerID, c.cert), &quic.Config{})
+	conn, err := c.dial(ctx, ep.Addr, ep.ServerPeerID)
 	if err != nil {
 		return nil, contract.Errf(contract.ErrPartitioned, err.Error())
 	}
