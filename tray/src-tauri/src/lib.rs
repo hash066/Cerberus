@@ -513,6 +513,83 @@ fn spawn_daemon(app: &tauri::AppHandle) {
     }
 }
 
+// ---- system tray ------------------------------------------------------------
+//
+// This app is named "tray" and is described as a system-tray app by the README,
+// QUICKSTART, the install guide and the website ("adds a wolf icon to your system
+// tray"). Until now none of that was true: there was no tray icon anywhere in
+// this crate, just a 1120x760 window.
+//
+// It matters beyond the name. This app OWNS a background daemon: it spawns
+// cerberusd as a sidecar and kills it on exit. Without a tray, closing the window
+// tore down the mesh — the opposite of what a node is for. Now closing the window
+// hides it, the mesh keeps running, and quitting is an explicit choice from the
+// tray menu (which still stops the daemon, so we never orphan it).
+
+/// show_main brings the dashboard window back from the tray.
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let open = MenuItem::with_id(app, "open", "Open Cerberus", true, None::<&str>)?;
+    let hide = MenuItem::with_id(app, "hide", "Hide window", true, None::<&str>)?;
+    // Named "Quit Cerberus (stops the daemon)" rather than "Quit", because it is
+    // not just closing a window: it stops this machine's node and drops it out of
+    // the mesh. That consequence belongs in the label, not in a doc nobody reads.
+    let quit = MenuItem::with_id(
+        app,
+        "quit",
+        "Quit Cerberus (stops the daemon)",
+        true,
+        None::<&str>,
+    )?;
+    let menu = Menu::with_items(app, &[&open, &hide, &quit])?;
+
+    TrayIconBuilder::with_id("cerberus")
+        // The window icon doubles as the tray icon: one asset, and it is the wolf
+        // the install guide promises.
+        .icon(app.default_window_icon().cloned().ok_or_else(|| {
+            tauri::Error::AssetNotFound("no default window icon to use as the tray icon".into())
+        })?)
+        .tooltip("Cerberus — mesh control")
+        .menu(&menu)
+        // Left-click opens the dashboard; the menu is the right-click surface.
+        // menu_on_left_click(false) keeps the two from fighting on Windows.
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main(app),
+            "hide" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+            // app.exit runs RunEvent::Exit, which kills the daemon child — so the
+            // one path that stops the node is also the one that cleans up after it.
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 // ---- entrypoint -------------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -523,8 +600,27 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(DaemonChild(Mutex::new(None)))
         .setup(|app| {
-            spawn_daemon(&app.handle());
+            spawn_daemon(app.handle());
+            // A tray that fails to build is not fatal: the dashboard window still
+            // works, and losing the tray is better than refusing to start. But say
+            // so loudly rather than silently shipping the thing we just claimed to
+            // have fixed.
+            if let Err(e) = build_tray(app.handle()) {
+                eprintln!("cerberus: system tray unavailable ({e}); the window still works. \
+                           On Linux this usually means no app-indicator library (libayatana-appindicator3).");
+            }
             Ok(())
+        })
+        // Closing the window hides it to the tray instead of quitting: this
+        // process owns the daemon, so "close the window" must not mean "drop this
+        // machine out of the mesh". Quit is an explicit tray-menu choice.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             daemon_status,

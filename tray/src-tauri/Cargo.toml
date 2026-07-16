@@ -8,8 +8,8 @@
 [package]
 name = "tray"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Cerberus — mesh control tray app"
+authors = ["Cerberus contributors"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -25,7 +25,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon is what makes this crate's name true. Without it there is no tray
+# icon at all — the app was a 1120x760 window that killed the daemon when you
+# closed it, while the README, the install guide and the website all described a
+# system-tray app. Linux additionally needs libayatana-appindicator3-dev, which
+# CI already installs (see .github/workflows/release.yml).
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 # Native clipboard access so "copy operator token" goes through the OS clipboard
 # via the Rust core (the webview asks; Rust writes) rather than a browser API.
