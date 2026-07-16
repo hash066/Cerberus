@@ -27,6 +27,17 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+// Path reports the file this store was opened at. Callers use it to place
+// sibling durable state in the same directory (daemon/system derives the /cer/fs
+// shard directory from it) without threading a second path parameter through
+// every constructor.
+func (s *Store) Path() string {
+	if s.db == nil {
+		return ""
+	}
+	return s.db.Path()
+}
+
 // Close flushes and closes the store.
 func (s *Store) Close() error {
 	if s.db == nil {

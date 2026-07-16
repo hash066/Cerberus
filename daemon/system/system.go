@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -88,8 +89,11 @@ type System struct {
 	// shard store directly — e.g. to prove a shard genuinely left this node for a
 	// remote peer, rather than merely that a file round-trips (which would also
 	// pass under an all-local placement bug). Not part of the public API.
-	fsStore     *dfsFSStore
-	localShards *dfs.MemShardStore
+	fsStore *dfsFSStore
+	// localShards is the INTERFACE, not the in-memory type: a composed daemon
+	// with a durable store gets a DiskShardStore here (shards must be as durable
+	// as the metadata that names them), while db == nil keeps the mem store.
+	localShards dfs.ShardStore
 	fsMeta      MetaStore // replicated metadata store backing /cer/fs
 }
 
@@ -251,9 +255,12 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	// data-plane session, e.g. for staging tensors). HONEST REMAINING GAP: the
 	// scheduler can now PLACE a GPU/VRAM-bound task on a node by free-VRAM
 	// telemetry (scheduler.PlaceGPU), but the composed daemon does not yet
-	// automatically debit a node's live VRAM quota as sessions run, nor does it
-	// auto-route an opened device to the placement result — those accounting steps
-	// remain. None of this is a §8 Frontier item (no fake zk-WASM / RDMA).
+	// auto-route an opened device to the placement result — that step remains.
+	// It does NOT debit a live VRAM quota as sessions run, and deliberately so:
+	// free VRAM is MEASURED (daemon/gpu.VRAMSnapshot), which sees EVERY consumer
+	// on the box, whereas a debit ledger would know only Cerberus's own sessions
+	// and would advertise "nothing booked, 4 GiB free" while a game holds 3 GiB.
+	// See docs/gpu.md. None of this is a §8 Frontier item (no fake zk-WASM / RDMA).
 	ns := ninep.New(kernel)
 	// The VRAM device's quota is this node's MEASURED VRAM, not a guess. When the
 	// probe cannot see a GPU (no driver, unsupported OS — see daemon/gpu/vramprobe*.go)
@@ -321,7 +328,30 @@ func Compose(ctx context.Context, kernel contract.CapKernel, site string, db *st
 	if err != nil {
 		return nil, fmt.Errorf("shard cap signer: %w", err)
 	}
-	localShards := dfs.NewMemShardStore()
+	// This node's own shard bytes. DURABILITY MUST MATCH THE METADATA STORE: when
+	// db is non-nil the path->Manifest map above is bbolt-backed and survives a
+	// restart, so the SHARDS must too. Pairing durable metadata with an in-memory
+	// shard store (which is what this was) meant /cer/fs came back after a restart
+	// still listing every file and unable to read any of them — `fs get` failed
+	// with "too few shards given: have 0 valid shards, need 4". A filesystem that
+	// confidently lists data it has lost is worse than one that admits it stored
+	// nothing.
+	//
+	// Shards live beside cerberus.db so both halves of a node's /cer/fs state sit
+	// in one directory and share its lifetime. db == nil (tests) keeps the
+	// in-memory store, which is then correct rather than lossy: nothing else in
+	// that configuration is durable either.
+	var localShards dfs.ShardStore
+	if db != nil && db.Path() != "" {
+		shardDir := filepath.Join(filepath.Dir(db.Path()), "shards")
+		disk, derr := dfs.NewDiskShardStore(shardDir)
+		if derr != nil {
+			return nil, fmt.Errorf("open durable shard store: %w", derr)
+		}
+		localShards = disk
+	} else {
+		localShards = dfs.NewMemShardStore()
+	}
 	fab.ServeShards(NewLocalShardServer(localShards), mesh.SelfIssuerResolver, func() int64 { return time.Now().Unix() }, nil)
 	fab.ServeMeta(NewLocalMetaServer(localMeta), mesh.SelfIssuerResolver, func() int64 { return time.Now().Unix() }, nil)
 	scatterShards := NewRemoteScatterShardStore(localShards, fab, shardSigner, site)
