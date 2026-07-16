@@ -145,8 +145,11 @@ func (f *Fabric) handleComponentFetchStream(
 
 	// Fail closed: verify mesh-fabric membership BEFORE store.Has/store.Get is
 	// ever called — a request with no/invalid envelope learns nothing about
-	// this node's component store, not even whether a CID is present.
-	if _, verr := verifyComponentFetchCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked); verr != nil {
+	// this node's component store, not even whether a CID is present. The cap must
+	// name THIS site's mesh-fabric resource: "membership" is a claim about a
+	// specific fabric, so any cap carrying RightRead for anything else (a shard
+	// read, a mic monitor) must not stand in for it.
+	if _, verr := verifyComponentFetchCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked, MeshFabricResource(f.site)); verr != nil {
 		_ = writeComponentFetchError(ss, verr.Error())
 		return
 	}
@@ -183,6 +186,7 @@ func verifyComponentFetchCap(
 	resolveIssuer IssuerPubResolver,
 	now func() int64,
 	isRevoked auth.RevocationPredicate,
+	wantResource contract.ResourceRef,
 ) (auth.Grant, error) {
 	if resolveIssuer == nil {
 		return auth.Grant{}, fmt.Errorf("mesh: no issuer resolver configured for component-fetch")
@@ -204,6 +208,9 @@ func verifyComponentFetchCap(
 	}
 	if !grantHasRight(grant, contract.RightRead) {
 		return auth.Grant{}, fmt.Errorf("mesh: component-fetch capability lacks required right %q", contract.RightRead)
+	}
+	if err := grantCoversResource("component-fetch", grant, wantResource); err != nil {
+		return auth.Grant{}, err
 	}
 	return grant, nil
 }

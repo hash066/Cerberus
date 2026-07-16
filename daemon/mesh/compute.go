@@ -261,15 +261,31 @@ func (f *Fabric) handleComputeStream(s network.Stream, h ComputeHandler) {
 // now returns the current unix time (inject a fixed value in tests). isRevoked
 // may be nil (signature + window only). requiredRight, when non-empty, is also
 // enforced: the verified grant must convey it (e.g. contract.RightExec).
+//
+// wantResource is the resource THIS gate guards: the verified grant must name it
+// exactly, or the task is refused before it runs. It is a parameter rather than
+// something derived from f.site because there is no single site-derived answer —
+// three different callers legitimately gate this one protocol on three different
+// resources:
+//
+//	daemon/compute.WireWorker          → mesh.MeshComputeResource(site)
+//	daemon/system.RegisterPipelineWorker → system.PipelineResource(site)
+//	test/e2e/node                      → {KindGPU, "/cer/e2e/wasm/<node-id>"}
+//
+// Each matches what its own requester mints. Making the guarded resource explicit
+// at the wiring site also makes "what does this gate actually protect?" a visible
+// decision by whoever composes the daemon, rather than an implicit consequence of
+// a config field — which is precisely how it came to be unchecked.
 func (f *Fabric) ServeComputeSigned(
 	h SignedComputeHandler,
 	resolveIssuer IssuerPubResolver,
 	now func() int64,
 	isRevoked auth.RevocationPredicate,
 	requiredRight contract.Right,
+	wantResource contract.ResourceRef,
 ) {
 	f.host.SetStreamHandler(computeProto, func(s network.Stream) {
-		f.handleSignedComputeStream(s, h, resolveIssuer, now, isRevoked, requiredRight)
+		f.handleSignedComputeStream(s, h, resolveIssuer, now, isRevoked, requiredRight, wantResource)
 	})
 }
 
@@ -280,6 +296,7 @@ func (f *Fabric) handleSignedComputeStream(
 	now func() int64,
 	isRevoked auth.RevocationPredicate,
 	requiredRight contract.Right,
+	wantResource contract.ResourceRef,
 ) {
 	ss := newStreamSession(s)
 	defer func() { _ = ss.Close() }()
@@ -296,7 +313,7 @@ func (f *Fabric) handleSignedComputeStream(
 	}
 	task := req.Task.toTask()
 
-	grant, verr := verifySignedCap(task.Caps, req.Issuer, resolveIssuer, now, isRevoked, requiredRight)
+	grant, verr := verifySignedCap(task.Caps, req.Issuer, resolveIssuer, now, isRevoked, requiredRight, wantResource, "compute")
 	if verr != nil {
 		// Fail closed: no bytes/work — report the denial to the requester.
 		_ = writeComputeError(ss, task.TaskID, verr.Error())
@@ -328,9 +345,17 @@ func (f *Fabric) handleSignedComputeStream(
 }
 
 // verifySignedCap extracts the signed envelope from the task's cap slot, resolves
-// the issuer key it names, and Verifies it. It is the single fail-closed gate the
-// worker applies before running: a missing, malformed, forged, tampered,
-// wrong-issuer, expired, or revoked cap returns an error and the task never runs.
+// the issuer key it names, Verifies it, and confirms it is scoped to
+// wantResource. It is the single fail-closed gate the worker applies before
+// running: a missing, malformed, forged, tampered, wrong-issuer, expired, or
+// revoked cap — or one issued for a DIFFERENT resource — returns an error and the
+// task never runs.
+//
+// wantResource is why this function is shared safely between compute.go and
+// gpu.go. Both require RightExec, so before the scope check existed the two gates
+// were interchangeable: a cap for MeshComputeResource(site) opened the GPU
+// endpoint and a cap for MeshGpuResource(site) ran WASM. The right was identical;
+// only the resource distinguished them, and nobody looked at it. See capscope.go.
 func verifySignedCap(
 	caps [][]byte,
 	claimedIssuer contract.PeerID,
@@ -338,6 +363,8 @@ func verifySignedCap(
 	now func() int64,
 	isRevoked auth.RevocationPredicate,
 	requiredRight contract.Right,
+	wantResource contract.ResourceRef,
+	protocol string,
 ) (auth.Grant, error) {
 	if resolveIssuer == nil {
 		return auth.Grant{}, fmt.Errorf("mesh: no issuer resolver configured")
@@ -368,6 +395,9 @@ func verifySignedCap(
 	}
 	if requiredRight != "" && !grantHasRight(grant, requiredRight) {
 		return auth.Grant{}, fmt.Errorf("mesh: signed capability lacks required right %q", requiredRight)
+	}
+	if err := grantCoversResource(protocol, grant, wantResource); err != nil {
+		return auth.Grant{}, err
 	}
 	return grant, nil
 }

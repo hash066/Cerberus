@@ -50,14 +50,23 @@ func newGpuTestPair(t *testing.T) (requester, worker *Fabric, cleanup func()) {
 	}
 }
 
-// gpuExecCap mints a signed exec cap on a fresh issuer key for a GPU resource and
-// returns the envelope, the issuer public key, and the issuer PeerID.
+// gpuExecCap mints a signed exec cap on a fresh issuer key for the resource
+// ServeGpuSigned actually guards — MeshGpuResource of the "test" site both nodes
+// in gpuPair are built with — and returns the envelope, the issuer public key,
+// and the issuer PeerID.
+//
+// This used to mint an arbitrary "/cer/dev/gpu/0". That passed only because the
+// gate ignored grant.Resource, which is precisely the bug: the round-trip test
+// asserted "a validly signed exec cap is accepted" while proving nothing about
+// WHICH resource it was for. It also matters for the rejection tests below —
+// minting the wrong resource would let them pass on a scope denial instead of the
+// unknown-issuer/revocation/missing-right cause each one is actually pinning.
 func gpuExecCap(t *testing.T, rights []contract.Right) (env []byte, issuerPub ed25519.PublicKey, issuerID contract.PeerID) {
 	t.Helper()
 	sc, pub := newTestSignedCap(t)
 	copy(issuerID[:], pub)
 	grant, err := auth.NewGrant(
-		contract.ResourceRef{Kind: contract.KindGPU, Path: "/cer/dev/gpu/0"},
+		MeshGpuResource("test"),
 		rights, nil, time.Hour)
 	if err != nil {
 		t.Fatalf("new grant: %v", err)
@@ -91,7 +100,7 @@ func TestSignedGpuRoundTrip(t *testing.T) {
 	var handlerCalls int
 	worker.ServeGpuSigned(func(_ context.Context, req GpuRequest, g auth.Grant) (GpuResult, error) {
 		handlerCalls++
-		if g.Resource.Path != "/cer/dev/gpu/0" {
+		if g.Resource.Path != MeshGpuResource("test").Path {
 			t.Errorf("handler saw wrong resource: %+v", g.Resource)
 		}
 		// Deterministic vector-add so the test asserts a real value flowed back.

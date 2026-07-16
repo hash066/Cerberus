@@ -112,7 +112,10 @@ func (f *Fabric) handleMetaStream(
 		return
 	}
 
-	if _, verr := verifyMetaCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked, requiredRight); verr != nil {
+	// Fail closed BEFORE any local metadata access, and only for a cap actually
+	// issued for THIS site's metadata service — not merely one that happens to
+	// carry the right right for something else.
+	if _, verr := verifyMetaCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked, requiredRight, MeshMetaResource(f.site)); verr != nil {
 		_ = writeMetaError(ss, verr.Error())
 		return
 	}
@@ -162,6 +165,11 @@ func metaRightFor(op MetaOp) (contract.Right, error) {
 	}
 }
 
+// verifyMetaCap resolves the issuer key, Verifies the envelope, enforces the
+// required right, and checks the grant is scoped to wantResource
+// (MeshMetaResource(site)) — without that last step a cap minted for any other
+// KindFS resource carrying RightWrite could rewrite this node's /cer/fs
+// manifests. See capscope.go.
 func verifyMetaCap(
 	env []byte,
 	claimedIssuer contract.PeerID,
@@ -169,6 +177,7 @@ func verifyMetaCap(
 	now func() int64,
 	isRevoked auth.RevocationPredicate,
 	requiredRight contract.Right,
+	wantResource contract.ResourceRef,
 ) (auth.Grant, error) {
 	if resolveIssuer == nil {
 		return auth.Grant{}, fmt.Errorf("mesh: no issuer resolver configured for meta RPC")
@@ -190,6 +199,9 @@ func verifyMetaCap(
 	}
 	if requiredRight != "" && !grantHasRight(grant, requiredRight) {
 		return auth.Grant{}, fmt.Errorf("mesh: meta capability lacks required right %q", requiredRight)
+	}
+	if err := grantCoversResource("meta", grant, wantResource); err != nil {
+		return auth.Grant{}, err
 	}
 	return grant, nil
 }

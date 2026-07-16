@@ -272,6 +272,13 @@ func Run(ctx context.Context, cfg Config) error {
 		func() int64 { return time.Now().Unix() },
 		auth.RevocationPredicateFromIssuer(nil), // no revocation store wired in the demo
 		contract.RightExec,
+		// Scope the gate to the very resource grantExecCap hands out at discovery.
+		// This is the one mesh gate whose issuer trust is a real anchor set
+		// (resolveIssuerKey consults trustedKeys, not SelfIssuerResolver), so the
+		// scope check is fully load-bearing here: it is what makes the narrow,
+		// worker-granted exec cap mean "run WASM on node X" instead of "do anything
+		// on node X that happens to want RightExec".
+		wasmExecResource(cfg.ID),
 	)
 	// Answer peer component-fetch requests from our own local content store, so
 	// another node whose local cidstore misses can fetch the real bytes from us
@@ -397,8 +404,18 @@ func (s *server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 // wire authority a peer presents on dispatch and this node Verifies against its
 // own (exchanged) issuer pubkey; (2) an in-process kernel handle for the
 // belt-and-suspenders kernel check. The two describe the same grant.
+// wasmExecResource is this node's per-node wasm-exec resource: the thing
+// grantExecCap grants standing on, and the thing ServeComputeSigned's gate
+// guards. Both go through this one function so the mint and the check cannot
+// drift apart — a scope check that compares against a slightly different literal
+// than the minter used is worse than none, because it fails closed in production
+// and looks correct in review.
+func wasmExecResource(nodeID string) contract.ResourceRef {
+	return contract.ResourceRef{Kind: contract.KindGPU, Path: "/cer/e2e/wasm/" + nodeID}
+}
+
 func (s *server) grantExecCap() (contract.CapHandle, []byte, error) {
-	res := contract.ResourceRef{Kind: contract.KindGPU, Path: "/cer/e2e/wasm/" + s.self.ID}
+	res := wasmExecResource(s.self.ID)
 	handle, err := s.kernel.Mint(res, []contract.Right{contract.RightExec}, nil)
 	if err != nil {
 		return 0, nil, err
