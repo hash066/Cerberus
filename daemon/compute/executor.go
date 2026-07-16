@@ -80,50 +80,86 @@ func (e *PreferRemoteExecutor) Dispatch(ctx context.Context, t contract.ComputeT
 	h := contract.PromiseHandle(e.next)
 	e.mu.Unlock()
 
-	var rec dispatchRecord
-	worker, remote, ok := e.pickWorker()
-	if ok {
-		if e.sched != nil && !e.sched.AcquireCPU(worker, scheduler.ThreadsPerTask) {
-			ok = false
-		}
-	}
-	if ok {
-		if remote {
-			res, where, err := e.dispatchRemote(ctx, worker, t)
-			if e.sched != nil {
-				e.sched.ReleaseCPU(worker, scheduler.ThreadsPerTask)
-			}
-			if err == nil {
-				rec = dispatchRecord{result: res, where: where}
-			} else {
-				localRes, localErr := e.dispatchLocal(ctx, t)
-				if localErr != nil {
-					return 0, fmt.Errorf("remote: %v; local fallback: %w", err, localErr)
-				}
-				rec = dispatchRecord{result: localRes, where: "local"}
-			}
-		} else {
-			if e.sched != nil {
-				defer e.sched.ReleaseCPU(worker, scheduler.ThreadsPerTask)
-			}
-			localRes, err := e.dispatchLocal(ctx, t)
-			if err != nil {
-				return 0, err
-			}
-			rec = dispatchRecord{result: localRes, where: "local"}
-		}
-	} else {
-		localRes, err := e.dispatchLocal(ctx, t)
-		if err != nil {
-			return 0, err
-		}
-		rec = dispatchRecord{result: localRes, where: "local"}
+	rec, err := e.run(ctx, t)
+	if err != nil {
+		return 0, err
 	}
 
 	e.mu.Lock()
 	e.results[h] = rec
 	e.mu.Unlock()
 	return h, nil
+}
+
+// run places and executes one task, keeping CPU-pool accounting balanced on
+// every path.
+//
+// Every acquire is paired with a DEFERRED release, so no branch (or panic) can
+// leak a thread. The remote path additionally releases explicitly, before the
+// local fallback runs, so the worker's slot is not held while the work is
+// actually happening here; the deferred release is then a no-op. Previously the
+// remote release was a bare call with no defer, and the local fallback ran with
+// no accounting at all.
+func (e *PreferRemoteExecutor) run(ctx context.Context, t contract.ComputeTask) (dispatchRecord, error) {
+	worker, remote, ok := e.pickWorker(t)
+
+	release := func() {}
+	if ok && e.sched != nil {
+		if !e.sched.AcquireCPU(worker, scheduler.ThreadsPerTask) {
+			ok = false
+		} else {
+			var once sync.Once
+			release = func() {
+				once.Do(func() { e.sched.ReleaseCPU(worker, scheduler.ThreadsPerTask) })
+			}
+			defer release()
+		}
+	}
+
+	if !ok {
+		// No placement (no peers, or every node saturated). Run here as a last
+		// resort — same as before — but account it against self rather than
+		// silently running unmetered work.
+		return e.runLocalAccounted(ctx, t)
+	}
+
+	if !remote {
+		res, err := e.dispatchLocal(ctx, t)
+		if err != nil {
+			return dispatchRecord{}, err
+		}
+		return dispatchRecord{result: res, where: "local"}, nil
+	}
+
+	res, where, err := e.dispatchRemote(ctx, worker, t)
+	if err == nil {
+		return dispatchRecord{result: res, where: where}, nil
+	}
+	release() // remote is not running it; hand the slot back before falling back
+	local, lerr := e.runLocalAccounted(ctx, t)
+	if lerr != nil {
+		return dispatchRecord{}, fmt.Errorf("remote: %v; local fallback: %w", err, lerr)
+	}
+	return local, nil
+}
+
+// runLocalAccounted runs a task on this node with the local thread accounted in
+// the pool. A saturated local pool does NOT refuse the task: this is the
+// last-resort path and failing here would drop work that has nowhere else to
+// go. The accounting records the over-subscription honestly instead of hiding
+// the run entirely, which is what the unaccounted fallback used to do.
+func (e *PreferRemoteExecutor) runLocalAccounted(ctx context.Context, t contract.ComputeTask) (dispatchRecord, error) {
+	if e.sched != nil && e.fabric != nil {
+		self := e.fabric.PeerID()
+		if e.sched.AcquireCPU(self, scheduler.ThreadsPerTask) {
+			defer e.sched.ReleaseCPU(self, scheduler.ThreadsPerTask)
+		}
+	}
+	res, err := e.dispatchLocal(ctx, t)
+	if err != nil {
+		return dispatchRecord{}, err
+	}
+	return dispatchRecord{result: res, where: "local"}, nil
 }
 
 func (e *PreferRemoteExecutor) Resolve(_ context.Context, p contract.PromiseHandle) (contract.ComputeResult, error) {
@@ -147,21 +183,33 @@ func (e *PreferRemoteExecutor) dispatchLocal(ctx context.Context, t contract.Com
 	return e.local.Resolve(ctx, promise)
 }
 
-// pickWorker selects the node with the most free CPU in the cluster pool. When
-// the scheduler is unset or every node is saturated, it falls back to round-robin
-// over connected peers (legacy behaviour).
-func (e *PreferRemoteExecutor) pickWorker() (worker contract.PeerID, remote bool, ok bool) {
+// pickWorker selects the node the scheduler's cost model ranks best for t. When
+// the scheduler is unset it falls back to round-robin over connected peers
+// (legacy behaviour); when every node is infeasible it reports ok=false and the
+// caller runs the task locally as a last resort.
+//
+// This asks BestNodeByCost, NOT BestNode. BestNode ranks on free POOL THREADS
+// alone, which is blind to how busy the machines actually are: two idle-pool
+// nodes both report "all threads free" no matter that one is pegged at 100%
+// host CPU, so they tie and the winner fell out of Go's randomized map
+// iteration order. The load signal — NodeTelemetry.Compute.Flops, i.e. peak
+// FLOPS scaled by live host utilization (daemon/system.localTelemetry) — is
+// only read by the cost model, and the cost model was only reachable through
+// Place, which nothing in production calls. So "telemetry-driven placement" was
+// real in the cost model and absent from the path that actually dispatches
+// work. BestNodeByCost applies that same ranking here, which also means
+// dispatch now honours the hard constraints Place always did and this path
+// never did: a thermally throttling node, a node below MinVRAM, and a node
+// about to sleep are no longer valid targets.
+func (e *PreferRemoteExecutor) pickWorker(t contract.ComputeTask) (worker contract.PeerID, remote bool, ok bool) {
 	if e.fabric == nil {
 		return contract.PeerID{}, false, false
 	}
 	self := e.fabric.PeerID()
 
 	if e.sched != nil {
-		if best, _, have := e.sched.BestNode(nil); have {
-			if best == self {
-				return self, false, true
-			}
-			return best, true, true
+		if best, have := e.sched.BestNodeByCost(t, nil); have {
+			return best, best != self, true
 		}
 		return contract.PeerID{}, false, false
 	}
