@@ -272,8 +272,53 @@ func (m *Monitor) Get() VRAM {
 	return snap
 }
 
+// Refresh starts a re-measurement NOW, without waiting out the TTL.
+//
+// # Why this exists: the cache lies at session boundaries
+//
+// Serve-stale-while-revalidating is right for a 2 Hz telemetry tick, but it means
+// a snapshot can be up to TTL old, and the moment it is MOST wrong is exactly when
+// an offload session starts or ends — the two instants when this node's VRAM
+// changes by hundreds of MiB at once. Measured on the RTX 3050: a session holding a
+// 400k-token KV cache moves free VRAM by ~1 GiB, and the cached snapshot took ~2s
+// to catch up.
+//
+// The damaging direction is teardown. When a session ends the tensors are gone
+// immediately, but the node keeps ADVERTISING the busy number for up to TTL, so it
+// loses placements it should win and looks fuller than it is. Refreshing at that
+// boundary makes the mesh see the recovered capacity as soon as the probe can
+// report it.
+//
+// It never blocks, and never makes Get block: callers keep receiving the previous
+// snapshot (whose AsOf stays honest about its age) until the new measurement lands.
+// A refresh already in flight is not duplicated.
+//
+// On a COLD monitor it deliberately does nothing. Get's first call probes
+// synchronously anyway, and marking the cache warm here would let a concurrent Get
+// read a zero-valued snapshot — indistinguishable from "this machine has no GPU",
+// which is precisely the fabrication this file exists to prevent.
+func (m *Monitor) Refresh() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.warm || m.refreshing {
+		return
+	}
+	m.refreshing = true
+	go func() {
+		v := m.probeFn()()
+		m.mu.Lock()
+		m.snap = v
+		m.refreshing = false
+		m.mu.Unlock()
+	}()
+}
+
 // defaultMonitor backs the package-level VRAMSnapshot.
 var defaultMonitor = NewMonitor()
+
+// RefreshVRAM asks the daemon's shared snapshot to re-measure now. Call it after
+// something has materially changed this node's VRAM — see Monitor.Refresh.
+func RefreshVRAM() { defaultMonitor.Refresh() }
 
 // VRAMSnapshot is the daemon's entry point: a cached, never-blocking (after the
 // first call) VRAM reading suitable for a 2 Hz telemetry sampler.

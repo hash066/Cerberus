@@ -215,6 +215,11 @@ func (s *sessionConn) Close() error {
 			s.timer.Stop()
 		}
 		s.w.rpc.CloseLocal()
+		// The child is dead, so its tensors are gone and this node's VRAM is free
+		// again RIGHT NOW. Without this the cached snapshot keeps advertising the
+		// busy figure for up to its TTL, and the node loses placements it should
+		// win while looking fuller than it is. Non-blocking.
+		gpu.RefreshVRAM()
 		s.w.logf("llama: offload session CLOSED — ggml-rpc-server terminated")
 	})
 	return err
