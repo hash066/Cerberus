@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hash066/cerberus/daemon/auth"
+	"github.com/hash066/cerberus/daemon/gpu"
 	"github.com/hash066/cerberus/daemon/mesh"
 )
 
@@ -28,7 +29,14 @@ type WorkerConfig struct {
 	Revoked auth.RevocationPredicate
 	// Threads maps to ggml-rpc-server's -t. Zero uses upstream's default.
 	Threads int
-	// Device maps to -d (e.g. "Vulkan0"). Empty auto-detects.
+	// Device names the ggml device(s) to lend, e.g. "Vulkan1", or "Vulkan0,Vulkan1"
+	// to lend several. These are ggml's OWN device IDs (see ListDevices); a bare
+	// index like "1" is refused, because nvidia-smi and Vulkan number devices
+	// differently and guessing lends the wrong card — see devices.go.
+	//
+	// Empty does NOT mean "let upstream decide": upstream's no--d default serves
+	// EVERY device and splits work across all of them, including the integrated GPU.
+	// Empty means "resolve the single device telemetry advertises" — DefaultDevice.
 	Device string
 	// Cache enables ggml-rpc-server's -c tensor file cache.
 	Cache bool
@@ -67,10 +75,18 @@ func WireWorker(fab *mesh.Fabric, cfg WorkerConfig) error {
 		return err
 	}
 
+	// Resolve WHICH GPU this node lends before registering, so the answer appears in
+	// the startup log rather than being discovered when a peer's job runs on the
+	// wrong card.
+	device, err := resolveWorkerDevice(context.Background(), bins, cfg.Device, logf)
+	if err != nil {
+		return err
+	}
+
 	be := &worker{
 		rpc: NewRPCServer(bins, RPCServerConfig{
 			Threads: cfg.Threads,
-			Device:  cfg.Device,
+			Device:  device,
 			Cache:   cfg.Cache,
 		}),
 		build: bins.Build,
@@ -84,6 +100,53 @@ func WireWorker(fab *mesh.Fabric, cfg WorkerConfig) error {
 		"peers; the capability gate limits who can connect, it does not sandbox them.",
 		mesh.LlamaRPCResource(cfg.Site).Path, bins.Build)
 	return nil
+}
+
+// resolveWorkerDevice decides the -d value this node's worker will run with, and
+// says so out loud.
+//
+// An operator's explicit choice is VALIDATED, not trusted: an ID that does not
+// exist on this node is refused here, at startup, with the real device table —
+// rather than at the first peer's session, as an opaque child-process exit.
+//
+// The empty (default) case is the one that matters. See DefaultDevice for why "no
+// -d" is not an acceptable default: it lends every GPU including the iGPU and
+// contradicts the single-device VRAM number telemetry publishes.
+func resolveWorkerDevice(ctx context.Context, bins Binaries, want string, logf func(string, ...any)) (string, error) {
+	devs, err := ListDevices(ctx, bins)
+	if err != nil {
+		if want != "" {
+			// The operator named a device and we cannot check it. Refusing beats
+			// lending a card we could not identify.
+			return "", fmt.Errorf("llama: cannot honour device %q: %w", want, err)
+		}
+		// Nothing was named and nothing could be enumerated. Fall back to upstream's
+		// behaviour, but never silently — this is the state where the iGPU gets
+		// conscripted and no log explains it.
+		logf("llama: WARNING could not enumerate ggml devices (%v); falling back to llama.cpp's "+
+			"default, which serves EVERY device on this node (including any integrated GPU) and "+
+			"splits peers' work across them. Set Device explicitly to lend one card.", err)
+		return "", nil
+	}
+	if want != "" {
+		sel, err := SelectDevice(devs, want)
+		if err != nil {
+			return "", err
+		}
+		logf("llama: lending ggml device(s) %s — named explicitly by the operator", sel)
+		return sel, nil
+	}
+	if d, why, ok := DefaultDevice(devs, gpu.VRAMSnapshot()); ok {
+		logf("llama: lending ggml device %s — chosen because %s. "+
+			"(llama.cpp's own default would instead serve all %d device(s) on this node and split "+
+			"peers' work across them; set Device to override, e.g. a comma-separated list.)",
+			d, why, len(devs))
+		return d.ID, nil
+	}
+	// No accelerators at all: "every device" is just the CPU, so upstream's default
+	// is already the honest answer.
+	logf("llama: no ggml accelerators on this node — offload sessions will run on the CPU device")
+	return "", nil
 }
 
 // worker implements mesh.LlamaBackend over a supervised ggml-rpc-server.
