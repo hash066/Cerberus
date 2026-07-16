@@ -4,6 +4,12 @@
 > Honest about maturity by design (per [ARCHITECTURE.md §8](ARCHITECTURE.md)). It pairs with:
 > [ARCHITECTURE.md](ARCHITECTURE.md) (the canonical spec), [HANDOFF.md](HANDOFF.md) (deep technical "where things stand"),
 > [CONTRACT.md](CONTRACT.md) (the frozen integration seam), and the per-feature designs in [docs/verticals/](docs/verticals/).
+>
+> **For "what works today", the canonical table is the one at the top of
+> [README.md](README.md#what-works-today-v01-beta--honest)** — every row cites a
+> code path. This document is the *roadmap*: it says where things are going and
+> tracks phase-by-phase history, which is a different job. Where the two
+> disagree, README wins.
 
 **Status legend** — used throughout:
 
@@ -106,8 +112,8 @@ Honest list of the missing/partial pieces, grouped by theme. Each maps to a road
 - ✅ **Wasmtime component model** (`core/runtime`, optional feature) — WASI-P2 still a documented hook (needs a `cargo-component` fixture).
 - ⛔ **GPU dispatch** (wgpu / MLX) — the `gpu`/`vram` capability actually running work on a GPU. *The one MLP item left; needs real hardware.*
 - ✅ **QUIC byte-quota data plane** (`daemon/dataplane`) — bulk transfer enforced before *and* during the stream; **wired to 9P `ctl` grants** and **carrying audio** (`daemon/audiolink`). *Remaining: PeerID-pin the data-plane TLS; true RDMA zero-copy is Frontier.*
-- ✅ **9P wire server** (hugelgupf/p9) serving the cap-gated namespace under the supervisor — **FUSE/WinFsp** mounts so remote devices appear as local paths are still 🧪 (kernel-driver-bound).
-- ✅ **Audio sharing (mic/speaker)** transport over the data plane (packetize + jitter-buffer + DLL clock-sync) — **OS capture/playback** (CoreAudio/WASAPI/PipeWire) is still ⛔ a labelled stub; not wired into a live daemon session yet.
+- ✅ **9P wire server** (hugelgupf/p9) serving the cap-gated namespace under the supervisor — **mounts landed**: `cerberusd -mount` is a ✅ real FUSE mount on **Linux** (pure-Go go-fuse straight to `/dev/fuse`, no cgo; verified on WSL2), 🧪 **unverified on Windows** (code path exists via cgofuse→WinFsp; needs the driver), ⛔ not shipped on macOS (macFUSE needs a kext + reboot). Caveat that matters: **`/cer/fs` is not browsable through a mount** — fs files aren't enumerated and a read-open returns `ENOSYS` (`wire.go:256`); bytes ride the data plane by design.
+- ✅ **Audio sharing (mic/speaker)** transport over the data plane (packetize + jitter-buffer + DLL clock-sync), **wired into a live daemon session**. OS capture/playback is now ✅ **real on Windows** (WASAPI) and ✅ **real on Linux** (PulseAudio native protocol, pure Go, no cgo). ⛔ **macOS CoreAudio is written but has NEVER been compiled or run** — it sits behind `//go:build darwin && cgo && cerberus_coreaudio` and a default macOS build gets the honest stub. PipeWire needs no separate backend: PipeWire ships `pipewire-pulse` (a PulseAudio-protocol server, on by default on every PipeWire distro), so one PulseAudio-protocol client covers both — see the reasoning in `daemon/audio/os_linux.go`.
 - 🧪 **Distributed filesystem** (`/cer/fs`): IPLD + Reed-Solomon erasure coding.
 
 **C. Make memory, economy & lifecycle production-shaped**
@@ -146,7 +152,7 @@ Each phase has a **goal**, concrete **deliverables**, a **Definition of Done (Do
 - **F2** ⛔ **Deferred** — **GPU dispatch** via wgpu/MLX needs a real GPU to validate honestly; not faked. Next pass on real hardware.
 - **F3** ✅ **QUIC zero-copy data plane** (`daemon/dataplane`): capability + byte-quota-bound bulk transfer, enforced before *and* during the stream. The unlock for VRAM + audio sharing. *Remaining: PeerID-pin the data-plane TLS.*
 - **F4** ✅ **9P2000.L wire server** (`daemon/ninep`, hugelgupf/p9) over the cap-gated namespace; per-connection capability; `ctl`→endpoint invariant held. *FUSE/WinFsp mount = labelled stub (kernel-driver-bound).*
-- **F5** ✅ **Network audio** (`daemon/audio`): packetized sender/receiver, reordering jitter buffer, DLL drift control, gap-fill concealment. *OS capture (CoreAudio/WASAPI/PipeWire) = labelled stub.*
+- **F5** ✅ **Network audio** (`daemon/audio`): packetized sender/receiver, reordering jitter buffer, DLL drift control, gap-fill concealment. *OS capture: **real** on Windows (WASAPI) and Linux (PulseAudio protocol, pure Go — also covers PipeWire via pipewire-pulse). macOS CoreAudio is written but **never compiled**, behind an opt-in build tag.*
 - **Cross-cut wiring** ✅ (`daemon/system`, `daemon/ninep`, `daemon/audiolink`): 9P `.../ctl` open → `dataplane.RegisterGrant` → returns the real dialable endpoint (ARCHITECTURE §4.1); **audio rides the data plane**; the 9P wire server **and** data-plane receiver are served under the daemon supervisor. End-to-end + race tested.
 - **DoD (remaining):** open a remote GPU and run a real (small) inference shard (F2, real hardware); mount a peer device in Explorer/Finder (FUSE/WinFsp); stream a **live OS** mic across the mesh (the transport is done; OS capture is the stub left).
 

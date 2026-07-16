@@ -19,16 +19,41 @@ validates and bounds the request, maps it to a Cerberus `ComputeTask`, and
 dispatches it through the **real WebAssembly executor** (wazero), returning an
 OpenAI-shaped envelope. The scheduler/runtime place and run the task on the mesh.
 
+> [!WARNING]
+> **Without a chat backend, this gateway answers for models it does not have,
+> and its token counts are fabricated.** Both are known bugs; read this before
+> you build against it.
+>
+> `componentFor` ([`gateway.go:160`](../daemon/gateway/gateway.go)) resolves an
+> unknown model name straight to a component CID, which falls through to the
+> seeded `hello-shard`. So on a stock daemon, `POST {"model":"gpt-4o"}` returns
+> **HTTP 200** with `"content": "1337"` — verified by running it. An unknown
+> model should 404.
+>
+> Worse, that path's `usage` block is invented: `prompt_tokens` is the
+> **character count** of your prompt and `completion_tokens` is the **byte
+> length** of the reply ([`chat.go:186`](../daemon/gateway/chat.go)). There is no
+> tokenizer in it. A field named `prompt_tokens` holding a character count is a
+> fabricated measurement, and every OpenAI client will read it as tokens.
+>
+> **Run `cerberusd -llama-model <file.gguf>` and this becomes a different
+> endpoint** — a real `llama-server` serves it, with a real tokenizer, sampler
+> and genuine `usage`. The bug is the fallback, not the llama path.
+
 **Be aware, honestly:**
-- The **wired component in v0.1 is the demo `hello-shard` WASM module**, not a
-  large language model. So the `assistant` message `content` you get back is that
-  component's output — the request/response *shape* is genuine OpenAI, the *model*
-  behind it is the demo shard. Swapping in a real LLM component is a
-  component-swap behind the same interface, not a rewrite.
-- **`/v1/chat/completions` (POST)** is implemented.
-- **`/v1/models` and streaming (`stream: true`, SSE)** are **not yet implemented**
-  in the v0.1 gateway. Sections below show the intended client shape and mark
-  clearly what works now versus what is planned.
+- **Two modes.** With `-llama-model`, a real llama.cpp model is served
+  (`cmd/cerberusd/main.go:509` → `gw.SetInference`). Without it, the wired
+  component is the demo `hello-shard` WASM module and the `content` you get back
+  is that component's output — genuine OpenAI *shape*, WASM shard behind it.
+- **`/v1/models` lists what is registered — WASM shards, plus your llama model
+  if you passed one.** `BuiltinInferenceModels()` returns nil by design; a stock
+  daemon logs `0 inference model(s) registered on gateway` at boot. The split-MLP
+  fixture is deliberately **not** advertised here — a fixture in a test is
+  honest; a fixture on `/v1/models` pretending to be a chat model is not.
+- **Distributed inference is not wired.** `-llama-rpc` exists but the forwarder
+  that would bridge a local `llama-server` to a capability-gated remote worker is
+  constructed by no binary. Single-node chat works; splitting a model across
+  peers does not. See [README.md](../README.md).
 
 ---
 
@@ -36,9 +61,9 @@ OpenAI-shaped envelope. The scheduler/runtime place and run the task on the mesh
 
 | Method | Path | Status | Auth (right) |
 |---|---|---|---|
-| `POST` | `/v1/chat/completions` | ✅ implemented | `exec` |
-| `GET`  | `/v1/models` | 🚧 planned (not in v0.1) | `exec`/`read` |
-| —      | streaming (`stream: true`) | 🚧 planned (not in v0.1) | `exec` |
+| `POST` | `/v1/chat/completions` | ✅ implemented — real LLM with `-llama-model`; **otherwise answers to any model name, see the warning above** | `exec` |
+| `GET`  | `/v1/models` | ✅ implemented (WASM shards + your `-llama-model`, if any) | `exec`/`read` |
+| —      | streaming (`stream: true`) | ✅ implemented — real SSE: role-priming chunk, content deltas, `finish_reason`, `data: [DONE]` | `exec` |
 
 ---
 
@@ -181,18 +206,30 @@ for chunk in stream:
     print(delta, end="", flush=True)
 ```
 
-Until then, requests are handled as a single non-streaming response regardless of
-a `stream` field — and note that strict decoding means you should omit fields the
-v0.1 gateway doesn't accept (send only `model` and `messages`).
+`stream: true` is real. The gateway emits a role-priming chunk, one or more
+content deltas, a `finish_reason` chunk, then `data: [DONE]`, flushing as it
+writes. Note that strict decoding rejects unknown fields — send only the fields
+documented here.
 
 ---
 
-## `GET /v1/models` (planned)
+## `GET /v1/models`
 
-A models-list endpoint is **not implemented in v0.1**. When added it will return
-the OpenAI `{"object":"list","data":[...]}` shape describing the components the
-gateway can dispatch. For now, treat `model` as a free-form label that is echoed
-back and used to scope the task id.
+Implemented. Returns the OpenAI `{"object":"list","data":[...]}` shape describing
+the components the gateway can dispatch:
+
+```json
+{"object":"list","data":[{"id":"hello-shard","object":"model","created":1784174905,
+ "owned_by":"cerberus","component_cid":"hello-shard"}]}
+```
+
+**These are WASM components, not language models**, and the list is exactly as
+short as it looks — a stock daemon advertises `hello-shard` and nothing else.
+
+Do **not** infer that a name absent from this list is rejected by
+`/v1/chat/completions`: it isn't (see the warning at the top). `model` is
+currently a free-form label that gets echoed back, resolved to a component CID,
+and used to scope the task id.
 
 ---
 

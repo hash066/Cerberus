@@ -81,6 +81,12 @@ so use an overlay:
 
 ## What works vs. what's in progress (honest)
 
+> This is the **tester's view** — what you'll hit in the first hour, in the order
+> you'll hit it. The canonical Real/Partial/Stub matrix, with a code path behind
+> every row, is the table at the top of
+> **[README.md](README.md#what-works-today-v01-beta--honest)**. If the two ever
+> disagree, README wins and this table is the bug.
+
 | Capability | Status |
 |---|---|
 | Run WASM workloads locally + **on a remote peer** | ✅ works |
@@ -89,8 +95,16 @@ so use an overlay:
 | Belief-conflict detect / list / resolve | ✅ works |
 | GPU compute (`gpu <kernel>`) | ✅ real compute; **`backend: cpu-software`** by default. Physical GPU (`gpu-wgpu`) needs a from-source build — see `docs/gpu.md` |
 | Target a peer's GPU (`gpu <kernel> … --on <peer>`) | ✅ works — capability-checked on the peer; reports the backend the peer actually used |
-| Pipeline inference (`pipeline-run`) | ✅ works — split-MLP fixture layers placed across nodes, activations over the data plane. LLM backends (`--backend llamacpp`/`mlx`) are engine seams that honestly report `-mock` without real weights |
+| Pipeline placement (`pipeline-run`) | ✅ works — layers placed across nodes by live telemetry, activations over the data plane. The model is a **4×4 MLP fixture**, not an LLM: no tokenizer, weights, KV-cache or sampler |
+| Single-node LLM chat (`cerberusd -llama-model <file.gguf>`) | ⚠️ **new, opt-in, lightly tested.** Starts a real `llama-server`; `/v1/chat/completions` then serves a real model with real token counts. The v0.1 `--backend llamacpp`/`mlx` mocks were **deleted**, not repaired, and those values now fail loudly |
+| Splitting a model across two machines | ❌ **not wired.** `-llama-worker` serves tensor work over a cap-gated mesh session (its `ggml-rpc-server` is loopback-only); `-llama-rpc` is a raw TCP dial that bypasses the mesh and can't reach it. The forwarder that would bridge them is written but constructed by no binary. Don't try to demo this |
+| `/v1/chat/completions` **without** `-llama-model` | ⚠️ **known bug — do not build on it.** It returns HTTP 200 for *any* model name (`{"model":"gpt-4o"}` → `"1337"`, the WASM shard's output) and its `usage` counts are fabricated from character/byte lengths. An unknown model should 404 |
+| Lending your GPU to peers (`-llama-worker`) | ⚠️ **off by default, and leave it off unless you understand it.** It exposes `ggml-rpc`, a C++ deserializer that trusts its client and is not sandboxed (CVE-2026-34159 was a pre-auth RCE in it). Cerberus gates it with a signed, resource-scoped capability; read the flag's doc first |
 | Audio session (local loopback) | ✅ works |
-| Cross-node mic/speaker (`audio play/monitor --on`) | ✅ wired + capability-gated; needs two machines with real mic/speaker to *hear* |
+| Cross-node mic/speaker (`audio play/monitor --on`) | ✅ wired + capability-gated on **Windows** (WASAPI) and **Linux** (PulseAudio, pure Go, no cgo); needs two machines with a real mic/speaker to *hear*. **macOS: never compiled** — the CoreAudio backend is behind an opt-in build tag and has never been built or run |
+| VRAM reported by `cerberus devices` | ✅ measured, not assumed — matches `nvidia-smi` exactly (RTX 3050: 4.0 GiB). A card we can't measure shows `quota=0 B` (honest unknown), never a plausible default |
+| Mount the namespace (`cerberusd -mount`) | ⚠️ **Linux only.** Real FUSE mount, verified on WSL2. **Windows is unverified** — needs the WinFsp driver, which we have not tested against. `/cer/fs` is **not** browsable through a mount either way (use `fs get`/`cat`) |
 
-Report anything that errors or surprises you — that's what the beta is for.
+Report anything that errors or surprises you — that's what the beta is for. The
+⚠️ rows above are there because we ran them; if you find a ✅ row that doesn't
+hold on your machine, that's the most useful bug you can file.

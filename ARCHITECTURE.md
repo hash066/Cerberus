@@ -369,22 +369,30 @@ The thesis: Kubernetes/Ray assume a benevolent homogeneous datacenter; the cloud
 
 ## 8. Maturity Matrix (honest margins)
 
-| Capability | Status |
-|---|---|
-| Zenoh+libp2p hybrid fabric, OTP supervision | **Shippable** |
-| OCap on WASM Component Model | **Shippable** (best-in-class) |
-| CRDT memory merge | **Shippable** / semantic-conflict policy **Frontier** |
-| WASM component execution, tensor/pipeline sharding | **Shippable** |
-| Promise pipelining (CapTP) | **Shippable** |
-| Real-time very-large-model inference over Wi-Fi | **Frontier** (latency-bound) |
-| 9P control-plane namespace + FUSE/WinFsp | **Shippable** |
-| RDMA-over-Thunderbolt data plane | **Shippable on Mac**, Frontier elsewhere |
-| IPLD weight delivery | **Shippable** |
-| eUTXO settlement (optimistic) | **Buildable** |
-| zk-WASM proof-of-inference | **Frontier** (~100× overhead) |
-| Host-level TEE memory shielding on consumer desktops | **Frontier** (hardware-limited) |
-| Scheduling brain (baseline) | **Shippable** / multi-objective optimality **Frontier** |
-| Distributed capability revocation | **Buildable** (propagation is the hard part) |
+> **Read the two columns separately.** *Design verdict* is this spec's judgement
+> about whether a thing is buildable at all — Shippable / Buildable / Frontier.
+> *In the tree today* is what a `git clone` actually gets you. They are not the
+> same axis, and a Shippable design with nothing behind it is still nothing.
+> **[README.md](README.md) is the authority on implementation status**; this
+> table exists to keep the design verdicts and the reality visibly adjacent so
+> neither can quietly drift from the other.
+
+| Capability | Design verdict | In the tree today |
+|---|---|---|
+| Zenoh+libp2p hybrid fabric, OTP supervision | **Shippable** | Real: libp2p/QUIC mesh, mDNS discovery, supervisor tree |
+| OCap on WASM Component Model | **Shippable** (best-in-class) | Real: caps are resource-scoped in the pure-Go kernel that ships **and at every mesh gate** (`daemon/mesh/capscope.go`, per-protocol denial tests). Residual: the `-tags ffi` Rust kernel cannot scope at all — the frozen C ABI takes no resource — but releases are pure Go |
+| CRDT memory merge | **Shippable** / semantic-conflict policy **Frontier** | Real merge + belief-conflict surfacing |
+| WASM component execution, tensor/pipeline sharding | **Shippable** | Real. The pipeline shards a **4×4 MLP fixture**, not a model |
+| Promise pipelining (CapTP) | **Shippable** | Partial: promise/resolve exists; the trust bootstrap is the self-issuer model, **not full CapTP** |
+| Real-time very-large-model inference over Wi-Fi | **Frontier** (latency-bound) — *and the measurement below is why* | Partial: `-llama-model` runs a real `llama-server` **single-node** (new, opt-in). **Splitting a model across peers is NOT wired end-to-end** — the worker (`-llama-worker`, mesh-served, loopback-bound) and the client (`-llama-rpc`, raw TCP) do not connect; the forwarder that would bridge them is constructed by no binary. **Measured with upstream llama.cpp: ~45 tok/s distributed vs ~396 tok/s single-node — ~9× SLOWER.** Structural, not a tuning bug. The value is fitting a model that fits nowhere, **never** speed. The Frontier verdict was correct and the numbers confirm it |
+| 9P control-plane namespace + FUSE/WinFsp | **Shippable** | Namespace real. **FUSE real on Linux** (verified, WSL2). **WinFsp unverified** — needs a driver we have not tested. macOS not shipped. `/cer/fs` is **not** browsable through a mount (`wire.go:256` → `ENOSYS`) |
+| RDMA-over-Thunderbolt data plane | **Frontier** — *the previous "Shippable on Mac" was a design aspiration, not a measurement, and it contradicted both the README and the test below* | **Stub.** `EndpointRDMA` is a constant no code path uses, and `daemon/hostinfo/hostinfo_test.go:63` **fails the build if any interface ever claims RDMA**. Thunderbolt *link classification* is real (`iface_linux.go:78`) — classifying a link is not transporting over it |
+| IPLD weight delivery | **Shippable** | Partial: content-addressed (CID) component store; no weight delivery, because there are no weights |
+| eUTXO settlement (optimistic) | **Buildable** | Partial: durable usage ledger + working fraud-proof challenge. **No value moves** |
+| zk-WASM proof-of-inference | **Frontier** (~100× overhead) | **Stub.** Documented design only |
+| Host-level TEE memory shielding on consumer desktops | **Frontier** (hardware-limited) | **Stub.** Cerberus sandboxes workloads; it does **not** protect a workload from a hostile host |
+| Scheduling brain (baseline) | **Shippable** / multi-objective optimality **Frontier** | Real baseline: telemetry-driven placement (VRAM measured, not assumed) + lid-drop reroute |
+| Distributed capability revocation | **Buildable** (propagation is the hard part) | Real: durable, gossiped mesh-wide, survives restart |
 
 ---
 
