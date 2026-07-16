@@ -17,7 +17,9 @@ func TestPublisherEmitsTelemetryAndSpans(t *testing.T) {
 
 	fab := stub.NewFabric()
 	kernel := stub.NewCapKernel()
-	capH, _ := kernel.Mint(contract.ResourceRef{Kind: contract.KindTopic}, nil, nil)
+	capH, _ := kernel.Mint(
+		contract.ResourceRef{Kind: contract.KindTopic, Path: "cerberus/local/telemetry/**"},
+		[]contract.Right{contract.RightRead, contract.RightWrite}, nil)
 
 	sub, err := fab.Subscribe(ctx, "cerberus/local/telemetry/**", capH)
 	if err != nil {
@@ -125,7 +127,9 @@ func TestTelemetryGoesThroughCapGate(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		fab := &capFabric{kernel: kernel, got: make(chan contract.Sample, 4)}
-		capH, _ := kernel.Mint(contract.ResourceRef{Kind: contract.KindTopic}, nil, nil)
+		capH, _ := kernel.Mint(
+			contract.ResourceRef{Kind: contract.KindTopic, Path: "cerberus/local/telemetry/**"},
+			[]contract.Right{contract.RightRead, contract.RightWrite}, nil)
 		pub, err := New(Config{Fabric: fab, Cap: capH, Site: "local", PeerID: pid, Hz: 4, Sample: sampler, Tracer: tracer})
 		if err != nil {
 			t.Fatalf("new: %v", err)

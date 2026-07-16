@@ -45,8 +45,8 @@ func TestSchedulerPlacementStorm(t *testing.T) {
 		t.Skip("skipping placement storm in -short mode")
 	}
 	const (
-		nodes    = 50
-		workers  = 32
+		nodes     = 50
+		workers   = 32
 		perWorker = 400 // 12,800 placements total
 	)
 	s := loadedScheduler(nodes)
@@ -54,11 +54,11 @@ func TestSchedulerPlacementStorm(t *testing.T) {
 	before := goroutineCountSettled()
 
 	var (
-		placed    int64
-		rerouted  int64
-		badPlace  int64
+		placed     int64
+		rerouted   int64
+		badPlace   int64
 		badReroute int64
-		wg        sync.WaitGroup
+		wg         sync.WaitGroup
 	)
 	start := time.Now()
 	for w := 0; w < workers; w++ {
@@ -136,7 +136,9 @@ func TestRevocationStormConverges(t *testing.T) {
 		if err != nil {
 			t.Fatalf("issuer %d: %v", i, err)
 		}
-		topicCa, _ := kernel.Mint(contract.ResourceRef{Kind: contract.KindTopic, Path: auth.DefaultRevocationTopic}, nil, nil)
+		topicCa, _ := kernel.Mint(
+			contract.ResourceRef{Kind: contract.KindTopic, Path: auth.DefaultRevocationTopic},
+			[]contract.Right{contract.RightRead, contract.RightWrite}, nil)
 		g := auth.NewRevocationGossip(fab, auth.DefaultRevocationTopic, topicCa)
 		g.HookPublish(iss)
 		mesh[i] = &meshNode{iss: iss, gossip: g}

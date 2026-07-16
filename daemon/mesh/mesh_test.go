@@ -60,13 +60,17 @@ func TestTwoNodeExchange(t *testing.T) {
 	}
 
 	// --- (a) pub/sub exchange over the site bus ---
-	capSub, _ := kB.Mint(contract.ResourceRef{Kind: contract.KindTopic}, nil, nil)
+	capSub, _ := kB.Mint(
+		contract.ResourceRef{Kind: contract.KindTopic, Path: "cerberus/test/telemetry/**"},
+		[]contract.Right{contract.RightRead}, nil)
 	ch, err := b.Subscribe(ctx, "cerberus/test/telemetry/**", capSub)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 
-	capPub, _ := kA.Mint(contract.ResourceRef{Kind: contract.KindTopic}, nil, nil)
+	capPub, _ := kA.Mint(
+		contract.ResourceRef{Kind: contract.KindTopic, Path: "cerberus/test/telemetry/**"},
+		[]contract.Right{contract.RightWrite}, nil)
 	want := []byte("hello-fabric")
 
 	// Gossipsub needs the subscription to propagate; publish on a ticker until
@@ -215,8 +219,13 @@ func TestPublishSubscribeCapGate(t *testing.T) {
 		t.Fatal("publish without a cap was allowed")
 	}
 
-	// Valid topic cap -> allowed.
-	capH, _ := k.Mint(contract.ResourceRef{Kind: contract.KindTopic}, nil, nil)
+	// Valid topic cap -> allowed. It must name the key expression it authorizes
+	// and carry the rights it will be used with: the kernel scopes a capability
+	// to its resource and its rights, so a pathless/rightless mint authorizes
+	// nothing (which is exactly what makes this test meaningful).
+	capH, _ := k.Mint(
+		contract.ResourceRef{Kind: contract.KindTopic, Path: "cerberus/test/telemetry/**"},
+		[]contract.Right{contract.RightRead, contract.RightWrite}, nil)
 	if _, err := f.Subscribe(ctx, "cerberus/test/telemetry/**", capH); err != nil {
 		t.Fatalf("subscribe with valid cap denied: %v", err)
 	}

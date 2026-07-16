@@ -137,7 +137,9 @@ func TestConcurrentPublishSubscribeNoCorruption(t *testing.T) {
 	}
 	defer f.Close()
 
-	capH, err := k.Mint(contract.ResourceRef{Kind: contract.KindTopic}, nil, nil)
+	capH, err := k.Mint(
+		contract.ResourceRef{Kind: contract.KindTopic, Path: "cerberus/test/**"},
+		[]contract.Right{contract.RightRead, contract.RightWrite}, nil)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}

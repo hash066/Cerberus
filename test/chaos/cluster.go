@@ -83,7 +83,9 @@ func (c *cluster) addNode(t *testing.T, dir, id string) *node {
 
 	// Topic capability so this node may publish/subscribe revocation gossip; the
 	// Fabric facade gates every pub/sub on it (no ambient authority).
-	topicCa, err := kernel.Mint(contract.ResourceRef{Kind: contract.KindTopic, Path: auth.DefaultRevocationTopic}, nil, nil)
+	topicCa, err := kernel.Mint(
+		contract.ResourceRef{Kind: contract.KindTopic, Path: auth.DefaultRevocationTopic},
+		[]contract.Right{contract.RightRead, contract.RightWrite}, nil)
 	if err != nil {
 		t.Fatalf("mint topic cap for %s: %v", id, err)
 	}

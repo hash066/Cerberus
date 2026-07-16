@@ -50,7 +50,9 @@ func TestCPUPoolExposesLocalAndRemoteCPU(t *testing.T) {
 
 	// A valid minted capability can walk the local CPU device and open its ctl to
 	// a data-plane endpoint; an unknown handle is denied (no ambient authority).
-	h, err := kernel.Mint(contract.ResourceRef{Kind: contract.KindCPU, Path: "/cer/dev/cpu/local/0"}, nil, nil)
+	h, err := kernel.Mint(
+		contract.ResourceRef{Kind: contract.KindCPU, Path: "/cer/dev/cpu/local/0"},
+		[]contract.Right{contract.RightRead, contract.RightAlloc}, nil)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -65,16 +67,30 @@ func TestCPUPoolExposesLocalAndRemoteCPU(t *testing.T) {
 		t.Fatal("expected unknown-capability open of cpu ctl to be denied")
 	}
 
-	// The peer's CPU device is present too.
+	// The peer's CPU device is present too. It needs its OWN capability: the
+	// local device's cap does not reach it (a capability is scoped to the
+	// resource it names), so reusing h here would prove nothing about presence
+	// and would make the "device is gone" assertion below pass for the wrong
+	// reason.
 	peerDir := "/cer/dev/cpu/" + peerShortHex(peer) + "/0"
-	if err := ns.Walk(peerDir, h); err != nil {
+	ph, err := kernel.Mint(
+		contract.ResourceRef{Kind: contract.KindCPU, Path: peerDir},
+		[]contract.Right{contract.RightRead, contract.RightAlloc}, nil)
+	if err != nil {
+		t.Fatalf("mint peer cap: %v", err)
+	}
+	if err := ns.Walk(peerDir, ph); err != nil {
 		t.Fatalf("walk remote cpu device: %v", err)
+	}
+	// And the local device's capability must NOT reach the peer's device.
+	if err := ns.Walk(peerDir, h); err == nil {
+		t.Fatal("the local CPU device's capability was accepted for the PEER's CPU device — ambient authority")
 	}
 
 	// Peer leaves the mesh view -> next refresh drops its device; local remains.
 	src.snaps = src.snaps[:1]
 	pool.refresh()
-	if err := ns.Walk(peerDir, h); err == nil {
+	if err := ns.Walk(peerDir, ph); err == nil {
 		t.Fatal("expected remote CPU device to be unregistered after the peer left")
 	}
 	if err := ns.Walk(localDir, h); err != nil {
