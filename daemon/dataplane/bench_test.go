@@ -431,3 +431,49 @@ func BenchmarkTransfer_RTT0_Big_Untuned(b *testing.B) {
 func BenchmarkTransfer_RTT0_Big_Tuned(b *testing.B) {
 	benchRigN(b, 0, DefaultTuning(), benchPayloadBig)
 }
+
+// TestHandshakeIdleTimeoutIsSetOnBothLegs pins the fix for the misdiagnosed
+// flake, and pins WHY it was misdiagnosed.
+//
+// quic-go reports BOTH a handshake-phase timeout and a post-handshake idle
+// timeout as the identical string "timeout: no recent network activity"
+// (internal/qerr/errors.go). The flake was read as the second and fixed with a
+// KeepAlivePeriod — but a keep-alive only exists on an established connection, so
+// it cannot affect a dial. HandshakeIdleTimeout is the timeout that governs the
+// dial, and leaving it zero inherits quic-go's 5s: the same
+// inherit-an-unconsidered-default bug quicconf.go was written to fix.
+//
+// Both legs must carry it: the client dials, so the client leg is the one that
+// matters most here, and it is historically the leg that was left empty.
+func TestHandshakeIdleTimeoutIsSetOnBothLegs(t *testing.T) {
+	d := DefaultTuning()
+	if d.HandshakeIdleTimeout == 0 {
+		t.Fatal("DefaultTuning leaves HandshakeIdleTimeout zero, which inherits quic-go's " +
+			"5s default. That is the timeout governing the dial, and the phase the " +
+			"'no recent network activity' flake actually occurs in")
+	}
+	if d.HandshakeIdleTimeout <= d.KeepAlivePeriod {
+		t.Fatalf("HandshakeIdleTimeout %v <= KeepAlivePeriod %v: the handshake must be "+
+			"given more room than one keep-alive interval", d.HandshakeIdleTimeout, d.KeepAlivePeriod)
+	}
+	for name, cfg := range map[string]*quic.Config{
+		"client": d.clientConfig(),
+		"server": d.serverConfig(),
+	} {
+		if cfg.HandshakeIdleTimeout != d.HandshakeIdleTimeout {
+			t.Errorf("%s leg HandshakeIdleTimeout = %v, want %v (a value set on Tuning but "+
+				"dropped in base() is worse than not having the knob)",
+				name, cfg.HandshakeIdleTimeout, d.HandshakeIdleTimeout)
+		}
+		if cfg.KeepAlivePeriod != d.KeepAlivePeriod {
+			t.Errorf("%s leg KeepAlivePeriod = %v, want %v", name, cfg.KeepAlivePeriod, d.KeepAlivePeriod)
+		}
+	}
+
+	// untunedTuning must NOT carry it: it reproduces the pre-change config, whose
+	// handshake timeout really was quic-go's 5s default.
+	if untunedTuning().HandshakeIdleTimeout != 0 {
+		t.Fatal("untunedTuning must reproduce the OLD config exactly, which left " +
+			"HandshakeIdleTimeout unset")
+	}
+}

@@ -98,14 +98,31 @@ type Tuning struct {
 	// (512 KiB / 15 MiB).
 	InitialConnectionReceiveWindow uint64
 	MaxConnectionReceiveWindow     uint64
-	// MaxIdleTimeout is how long a connection may see no inbound packet before
-	// it is declared dead. KeepAlivePeriod must be comfortably smaller or a
-	// merely-stalled peer gets torn down (the flake described above).
+	// MaxIdleTimeout is how long an ESTABLISHED connection may see no inbound
+	// packet before it is declared dead. KeepAlivePeriod must be comfortably
+	// smaller or a merely-stalled peer gets torn down.
 	MaxIdleTimeout time.Duration
 	// KeepAlivePeriod is how often this side sends a keep-alive ping on an
-	// otherwise idle connection. Zero disables keep-alives — which is exactly
-	// the setting that produced the "no recent network activity" flake.
+	// otherwise idle connection. Zero disables keep-alives.
+	//
+	// SCOPE, because this was already misread once: a keep-alive only exists on an
+	// ESTABLISHED connection. It does nothing during the handshake, so it cannot
+	// prevent a dial from failing — see HandshakeIdleTimeout.
 	KeepAlivePeriod time.Duration
+	// HandshakeIdleTimeout bounds the handshake: quic-go applies it INSTEAD of
+	// MaxIdleTimeout until the handshake completes, and derives the dial timeout
+	// from it (2x). Zero means quic-go's 5s default.
+	//
+	// This exists because MaxIdleTimeout/KeepAlivePeriod do NOT cover the dial.
+	// The "timeout: no recent network activity" flake was diagnosed as a
+	// post-handshake idle timeout and fixed with a keep-alive; it then kept
+	// happening, because quic-go's IdleTimeoutError returns that IDENTICAL string
+	// for both phases (internal/qerr/errors.go) and the failure was actually in
+	// the handshake. Observed: daemon/system's
+	// TestComposeGpuDeviceRunsKernelOverDataPlane failing in 10.29s from
+	// Client.Send's dial — which a 30s MaxIdleTimeout cannot produce, and a 5s
+	// handshake timeout can.
+	HandshakeIdleTimeout time.Duration
 	// MaxIncomingStreams caps concurrent inbound bidirectional streams (one
 	// transfer per stream).
 	MaxIncomingStreams int64
@@ -169,9 +186,24 @@ func DefaultTuning() Tuning {
 		// 30s idle with a 5s keep-alive: a peer must miss six keep-alives before
 		// we call it dead. The old config had the same 30s idle timeout (quic-go's
 		// default) but NO keep-alive at all, so a merely-stalled receiver was
-		// indistinguishable from a dead one. This is the flake fix.
+		// indistinguishable from a dead one.
 		MaxIdleTimeout:  30 * time.Second,
 		KeepAlivePeriod: 5 * time.Second,
+
+		// The handshake gets the same tolerance the established connection got,
+		// and for the same reason: a peer that is briefly starved (a loaded box
+		// running the full test suite, or a real machine under load) must not be
+		// mistaken for an absent one. quic-go's 5s default was never chosen here,
+		// it was inherited — the same class of bug as the empty &quic.Config{}
+		// this file was written to fix.
+		//
+		// HONESTY: this is NOT yet proven to fix the observed flake. It is the
+		// timeout that actually governs the phase the flake occurs in, which the
+		// keep-alive was not; but the flake also shows up as a libp2p mesh dial
+		// timeout in the same runs, which points at the BOX failing to complete
+		// connection setup under full-suite load rather than at this constant. See
+		// the lane report for the runs and the honest read.
+		HandshakeIdleTimeout: 20 * time.Second,
 
 		MaxIncomingStreams: 256,
 
@@ -211,6 +243,7 @@ func (t Tuning) base() *quic.Config {
 		MaxConnectionReceiveWindow:     t.MaxConnectionReceiveWindow,
 		MaxIdleTimeout:                 t.MaxIdleTimeout,
 		KeepAlivePeriod:                t.KeepAlivePeriod,
+		HandshakeIdleTimeout:           t.HandshakeIdleTimeout,
 		EnableDatagrams:                t.EnableDatagrams,
 	}
 }
