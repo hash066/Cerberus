@@ -4,25 +4,49 @@
 // (daemon/dfs, Phase G2) into the capability-gated 9P namespace so that
 // /cer/fs/<path> is a real, capability-checked file you can write and read.
 //
-// The defining invariant of vertical 04 (ARCHITECTURE.md §3.5) is preserved
-// exactly: 9P read/write NEVER carries bulk file bytes. Opening a /cer/fs path
-// returns a DATA-PLANE ENDPOINT (a DataEndpoint, just like a device `.../ctl`),
-// and the file bytes flow over the QUIC data plane referenced by that endpoint —
-// never over the 9P wire. The 9P layer only names the file, checks the
-// capability, and mints the grant; the bulk bytes ride the data plane.
+// TWO READ PATHS, AND WHY (read this before "simplifying" one away).
 //
-// Direction of flow (the data plane is send-only: a client sends to a server):
-//   - WRITE /cer/fs/<path>: the 9P caller HAS the bytes and wants the daemon to
-//     store them. The caller becomes the data-plane sender; the daemon's
-//     data-plane receiver streams the bytes straight into dfs.Put and records the
-//     returned Manifest keyed by <path>. This is the natural fit for the existing
-//     receive-only data plane and is fully real.
-//   - READ /cer/fs/<path>: the daemon HAS the bytes (it resolves <path> to its
-//     Manifest and runs dfs.Get) and the caller wants them. Whoever holds the
-//     bytes sends them, so the daemon becomes the data-plane sender and streams
-//     dfs.Get's output to a receiver the caller supplies (a RecvEndpoint: the
-//     caller runs its own data-plane receiver and registers an inbound grant on
-//     it). The daemon dials that receiver and sends. No file byte touches 9P.
+// The invariant vertical 04 states is precise, and it is about DEVICES: "Tensor/
+// VRAM bytes never traverse 9P read/write; opening a CONTROL FILE returns a
+// data-plane endpoint". Its rejected-alternatives table names the excluded design
+// exactly: «Naive "VRAM as a file you read()"». That invariant is intact and
+// untouched here — a device `.../ctl` still returns a DataEndpoint and never
+// bytes.
+//
+// /cer/fs is a different thing, and the architecture says so: §3.5 lists it as
+// "IPLD/Reed-Solomon distributed filesystem" and vertical 04 §3 specifies it as a
+// JuiceFS-style split. JuiceFS is a filesystem you MOUNT and read() — a
+// distributed filesystem whose files cannot be read by `cat` is not a filesystem.
+// So /cer/fs supports both:
+//
+//   - BULK, out-of-band (BeginRead/OpenFSRead + RecvEndpoint). The daemon holds
+//     the bytes, so it is the data-plane SENDER: it dials a receiver the caller
+//     supplies and streams dfs.Get's output there. Zero file bytes touch 9P. This
+//     is what the CLI/gateway drive for whole-file transfers, and it stays the
+//     path for anything large moving between nodes.
+//   - RANGED, in-band (OpenFSReader + FSReader.ReadAt). A mounted filesystem
+//     cannot drive the path above: the kernel's read(2) arrives as (offset,
+//     count) and wants bytes in a buffer, and there is nowhere in that syscall to
+//     hand back "here is a QUIC endpoint, go dial it". A RecvEndpoint read can
+//     only be driven by a bespoke client that stands up its own receiver — never
+//     by `cat`. So a ranged read answers from the dfs engine directly, and the
+//     bytes ride the 9P/FUSE reply for the last local hop into the caller.
+//
+// What that last hop does NOT do is turn 9P into the cluster's data plane: the
+// CROSS-NODE traffic is still shard fetches over the mesh (see the ShardStore in
+// daemon/system), exactly as before. 9P carries only the final hop out of the
+// daemon that already holds the reconstructed bytes — the same hop JuiceFS's own
+// FUSE mount performs. The ranged read is also chunk-granular, not whole-file
+// (daemon/dfs's File), so it costs one erasure-coded chunk, not the file.
+//
+// WRITE /cer/fs/<path>: the 9P caller HAS the bytes and wants the daemon to store
+// them. The caller becomes the data-plane sender; the daemon's data-plane
+// receiver streams the bytes straight into dfs.Put and records the returned
+// Manifest keyed by <path>. This is the natural fit for the receive-only data
+// plane and is fully real. NOTE that this is an out-of-band write only: writing
+// THROUGH a mount (`cp x /mnt/cerberus/fs/x`) does not work, because the 9P node
+// is a templatefs.ReadOnlyFile whose WriteAt is EROFS and whose Create is
+// ENOTDIR. That is reported, not faked — see wire.go's node.Open.
 //
 // The mechanics (dfs + dataplane) live entirely in the composition layer
 // (daemon/system), injected here through the FSStore seam, so this package stays
@@ -81,13 +105,39 @@ type RecvEndpoint struct {
 	ServerPeerID contract.PeerID `json:"server_peer_id,omitempty"`
 }
 
+// FSEntry is one file stored in /cer/fs: its full namespace path and its size in
+// bytes. It is what enumeration (FSList → Readdir) and stat (FSStat → GetAttr)
+// return, so `ls -l` through a mount reports real names and real sizes.
+type FSEntry struct {
+	// Path is the full namespace path, e.g. "/cer/fs/notes.txt".
+	Path string `json:"path"`
+	// Size is the file's length in bytes (the dfs Manifest's TotalBytes).
+	Size int64 `json:"size"`
+}
+
+// FSReader is an open, random-access view of ONE /cer/fs file, handed back by
+// FSStore.OpenRead after the namespace has capability-checked the path.
+//
+// It is a ReaderAt and not a Reader because that is the shape of the question a
+// mounted filesystem asks: the kernel reads a file as (offset, count), never as
+// a stream from zero. Backing it with an io.ReaderAt lets the dfs engine
+// reconstruct only the erasure-coded chunks a read actually touches, so serving
+// a 4 KiB read of a 4 GiB file costs one chunk, not the whole file (see
+// daemon/dfs's File).
+type FSReader interface {
+	// ReadAt fills p from off, per the io.ReaderAt contract (a short read
+	// always carries a non-nil error; reading past the end gives io.EOF).
+	ReadAt(p []byte, off int64) (int, error)
+	// Size is the file's total length in bytes.
+	Size() int64
+	// Close releases the reader's buffers.
+	Close() error
+}
+
 // FSStore is the seam the composition layer implements to back /cer/fs with the
 // real filesystem engine (daemon/dfs) and the real data plane (daemon/dataplane).
 // The 9P namespace calls it after a capability check; it owns all dfs + data-plane
 // mechanics so this package couples to neither.
-//
-// Bulk file content always moves over the data plane, never over 9P, upholding
-// the vertical 04 §3.5 invariant.
 type FSStore interface {
 	// BeginWrite authorizes storing a file at path. It registers a
 	// capability-bound data-plane transfer (under the namespace-assigned
@@ -100,6 +150,18 @@ type FSStore interface {
 	// data-plane sender for a read. It returns once the transfer completes (or
 	// fails). An unknown path is denied.
 	BeginRead(path string, cap contract.CapHandle, recv RecvEndpoint) error
+	// List returns every file stored in /cer/fs. The namespace filters the
+	// result down to the entries the asking capability may read before any name
+	// is exposed (see Server.FSList / Server.ListChildren) — List itself does no
+	// capability check and must never be reachable except through them.
+	List() ([]FSEntry, error)
+	// Stat returns the entry for exactly path, or an error if no file was
+	// written there. Like List, it is called only after a capability check.
+	Stat(path string) (FSEntry, error)
+	// OpenRead returns a random-access reader over the file at path, or an error
+	// if no file was written there. Like List, it is called only after a
+	// capability check. The caller must Close the reader.
+	OpenRead(path string) (FSReader, error)
 }
 
 // SetFSStore installs the /cer/fs backend. Call it once at composition time,
@@ -178,6 +240,127 @@ func (s *Server) OpenFSWrite(path string, cap contract.CapHandle) (DataEndpoint,
 			"/cer/fs has no filesystem backend wired (SetFSStore); the dfs+data-plane bridge is installed by daemon/system.Compose")
 	}
 	return store.BeginWrite(full, cap, transferID)
+}
+
+// fsBackend returns the wired FSStore, or the PARTITIONED error every /cer/fs
+// entry point reports when the composition layer never installed one.
+func (s *Server) fsBackend() (FSStore, error) {
+	s.mu.Lock()
+	store := s.fs
+	s.mu.Unlock()
+	if store == nil {
+		return nil, contract.Errf(contract.ErrPartitioned,
+			"/cer/fs has no filesystem backend wired (SetFSStore); the dfs+data-plane bridge is installed by daemon/system.Compose")
+	}
+	return store, nil
+}
+
+// FSList returns every file in /cer/fs that cap is authorized to READ — the
+// enumeration counterpart to WalkFS, and the source ListChildren (and therefore
+// a mount's Readdir) draws /cer/fs entries from.
+//
+// The filter is the load-bearing part: each candidate is put through the SAME
+// check WalkFS would apply to it (read on that file's own fsResource), so a
+// listing can never name a file the capability could not walk to. A capability
+// scoped to /cer/fs sees every file beneath it; one scoped to /cer/fs/a.txt sees
+// only a.txt; one scoped to a device sees nothing here at all.
+func (s *Server) FSList(cap contract.CapHandle) ([]FSEntry, error) {
+	store, err := s.fsBackend()
+	if err != nil {
+		return nil, err
+	}
+	all, err := store.List()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]FSEntry, 0, len(all))
+	for _, e := range all {
+		if s.check(cap, "read", fsResource(e.Path)) == nil {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// FSIsDir reports whether path names a DIRECTORY within /cer/fs — that is, the
+// root itself, or a path some file this capability may read lives beneath.
+//
+// /cer/fs paths are logical: the metadata store records FILES, never directories,
+// so a directory exists exactly when it contains one. That also means an empty
+// directory cannot exist, and a directory a capability may not read into is
+// indistinguishable from one that is not there — both of which are the intended
+// answers rather than gaps.
+func (s *Server) FSIsDir(path string, cap contract.CapHandle) bool {
+	path = strings.TrimRight(path, "/")
+	if path == FSRoot {
+		return true
+	}
+	if !isFSPath(path) {
+		return false
+	}
+	// A real file AT this exact path is a file, not a directory. Asking this
+	// first keeps the common case — walking to a file — down to a single
+	// metadata lookup, instead of enumerating the whole store (which, against
+	// the replicated store, fans out to mesh peers) on every walk hop.
+	if _, err := s.FSStat(path, cap); err == nil {
+		return false
+	}
+	entries, err := s.FSList(cap)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Path, path+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// FSStat returns the entry for one /cer/fs file, gated by a read capability on
+// it. A path that was never written is reported as not existing (rather than as
+// an empty file), which is what stops a mount from showing phantom zero-byte
+// files for invented names — the /cer/fs analogue of the device phantom-path fix
+// documented on Server.Walk.
+func (s *Server) FSStat(path string, cap contract.CapHandle) (FSEntry, error) {
+	sub, ok := fsSubPath(path)
+	if !ok {
+		return FSEntry{}, contract.Errf(contract.ErrDenied, "not an fs file path: "+path)
+	}
+	full := FSRoot + "/" + sub
+	if err := s.check(cap, "read", fsResource(full)); err != nil {
+		return FSEntry{}, err
+	}
+	store, err := s.fsBackend()
+	if err != nil {
+		return FSEntry{}, err
+	}
+	return store.Stat(full)
+}
+
+// OpenFSReader opens a /cer/fs file for RANGED, in-band reading and returns a
+// random-access reader over it, gated by a read capability on the file. It is
+// the read path a MOUNT uses: the kernel asks for (offset, count) and this
+// answers with bytes, reconstructing only the erasure-coded chunks the range
+// touches (see the package note above for why the out-of-band OpenFSRead cannot
+// serve a mount, and daemon/dfs's File for the cost of this one).
+//
+// A path that was never written is denied — a read of a path that does not exist
+// fails, it does not fabricate bytes. The caller must Close the reader.
+func (s *Server) OpenFSReader(path string, cap contract.CapHandle) (FSReader, error) {
+	sub, ok := fsSubPath(path)
+	if !ok {
+		return nil, contract.Errf(contract.ErrDenied, "not an fs file path: "+path)
+	}
+	full := FSRoot + "/" + sub
+	if err := s.check(cap, "read", fsResource(full)); err != nil {
+		return nil, err
+	}
+	store, err := s.fsBackend()
+	if err != nil {
+		return nil, err
+	}
+	return store.OpenRead(full)
 }
 
 // OpenFSRead opens a /cer/fs file for reading. The daemon holds the bytes, so it

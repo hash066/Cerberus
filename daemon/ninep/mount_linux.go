@@ -21,11 +21,14 @@
 // THE CAPABILITY INVARIANT (CLAUDE.md golden rule 5): exactly as on Windows,
 // every callback below (Lookup/Getattr/Open/Read/Readdir/Write) is implemented
 // by walking/opening a real 9P2000.L client connection obtained from
-// DialCap(ns, cap) — the same entry point wire.go's WireServer uses for network
-// peers, and the same capability-checked logic (Server.Walk/Open/ReadInfo/
-// WalkFS/OpenFSWrite, all gated by kernel.Verify). There is no second,
-// unguarded path from the mountpoint into the namespace: a mount bound to
-// capability X sees and opens exactly what a 9P client bound to X sees.
+// DialCaps(ns, caps) — the same entry point wire.go's WireServer uses for
+// network peers, and the same capability-checked logic (Server.Walk/Open/
+// ReadInfo/WalkFS/OpenFSWrite/OpenFSReader, all gated by kernel.Verify). There
+// is no second, unguarded path from the mountpoint into the namespace: a mount
+// bound to capability set S sees and opens exactly what a 9P client bound to S
+// sees. That includes /cer/fs reads, which are served by the same cap-checked
+// Server.OpenFSReader a 9P peer reaches — the mount gets no private door to the
+// filesystem engine.
 package ninep
 
 import (
@@ -45,7 +48,7 @@ import (
 )
 
 // mount is the Linux entry point for Mount (see mount.go). It hosts a go-fuse
-// server backed by cfg.NS, scoped to cfg.Cap, at cfg.Mountpoint.
+// server backed by cfg.NS, scoped to cfg's capability set, at cfg.Mountpoint.
 //
 // Like the Windows implementation, this does not block: go-fuse's dispatch loop
 // runs on a background goroutine (server.Wait) and mount returns as soon as the
@@ -67,7 +70,7 @@ func mount(cfg MountConfig) error {
 		return contract.Errf(contract.ErrDenied, "mount: mountpoint "+cfg.Mountpoint+" exists but is not a directory")
 	}
 
-	cl, closer, err := DialCap(cfg.NS, cfg.Cap)
+	cl, closer, err := DialCaps(cfg.NS, cfg.caps()...)
 	if err != nil {
 		return contract.Errf(contract.ErrPartitioned, "mount: dialing the in-process 9P namespace failed: "+err.Error())
 	}
@@ -77,7 +80,7 @@ func mount(cfg MountConfig) error {
 		return contract.Errf(contract.ErrDenied, "mount: attach to /cer with the given capability failed: "+err.Error())
 	}
 
-	m := &linuxMount{ns: cfg.NS, cap: cfg.Cap, root: root, client: cl, closer: closer, mountpoint: cfg.Mountpoint}
+	m := &linuxMount{ns: cfg.NS, caps: cfg.caps(), root: root, client: cl, closer: closer, mountpoint: cfg.Mountpoint}
 	rootNode := &p9node{m: m, path: "", isDir: true}
 
 	server, err := fs.Mount(cfg.Mountpoint, rootNode, &fs.Options{
@@ -147,12 +150,12 @@ func mountSetupError(mountpoint string, err error) error {
 }
 
 // linuxMount is one live Linux mount: the go-fuse server plus the single 9P
-// client connection (bound to exactly one capability by DialCap) that every
-// callback is served from. It implements mount.go's mountHandle.
+// client connection (bound to exactly one capability SET by DialCaps) that
+// every callback is served from. It implements mount.go's mountHandle.
 type linuxMount struct {
-	ns         *Server            // used only by Readdir, via the cap-gated ListChildren
-	cap        contract.CapHandle // the single capability this mount is bound to
-	root       p9.File            // the /cer root, attached once for the life of the mount
+	ns         *Server              // used only by Readdir, via the cap-gated ListChildren
+	caps       []contract.CapHandle // the capability set this mount is bound to
+	root       p9.File              // the /cer root, attached once for the life of the mount
 	client     *p9.Client
 	closer     func() error
 	mountpoint string
@@ -208,14 +211,14 @@ type p9node struct {
 // mutating ones (Mkdir/Rmdir/Unlink/Rename/Setattr), which therefore return
 // ENOSYS from go-fuse's defaults rather than being silently faked.
 var (
-	_ fs.InodeEmbedder  = (*p9node)(nil)
-	_ fs.NodeLookuper   = (*p9node)(nil)
-	_ fs.NodeReaddirer  = (*p9node)(nil)
-	_ fs.NodeGetattrer  = (*p9node)(nil)
-	_ fs.NodeOpener     = (*p9node)(nil)
-	_ fs.NodeReader     = (*p9node)(nil)
-	_ fs.NodeWriter     = (*p9node)(nil)
-	_ fs.FileReleaser   = (*p9handle)(nil)
+	_ fs.InodeEmbedder = (*p9node)(nil)
+	_ fs.NodeLookuper  = (*p9node)(nil)
+	_ fs.NodeReaddirer = (*p9node)(nil)
+	_ fs.NodeGetattrer = (*p9node)(nil)
+	_ fs.NodeOpener    = (*p9node)(nil)
+	_ fs.NodeReader    = (*p9node)(nil)
+	_ fs.NodeWriter    = (*p9node)(nil)
+	_ fs.FileReleaser  = (*p9handle)(nil)
 )
 
 func (n *p9node) childPath(name string) string {
@@ -257,18 +260,29 @@ func (n *p9node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*
 // identical check Walk performs per entry, so a listing can never name an entry
 // the capability could not walk to.
 func (n *p9node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	names := n.m.ns.ListChildren(nsPath(n.path), n.m.cap)
+	names := listChildrenCaps(n.m.ns, nsPath(n.path), n.m.caps)
 	entries := make([]fuse.DirEntry, 0, len(names))
 	for _, name := range names {
-		// ctl/info/alloc are the namespace's only leaves; everything else a
-		// listing yields is a directory (structural ancestor, device dir, or
-		// the /cer/fs root) — the same classification wire.go's node.Walk makes
-		// via isLeaf.
+		child := nsPath(n.childPath(name))
+		// ctl/info/alloc are the namespace's only device leaves; everything else
+		// a listing yields under /cer/dev is a directory (structural ancestor or
+		// device dir) — the same classification wire.go's node.Walk makes via
+		// isLeaf.
+		//
+		// /cer/fs cannot use that rule: its entries are stored FILES, and only
+		// the namespace knows which names are files and which are directories
+		// implied by a nested path. Falling through to isLeaf here would report
+		// every file in fs/ as a folder.
 		mode := uint32(syscall.S_IFDIR)
-		if isLeaf(name) {
+		switch {
+		case isFSPath(child):
+			if !fsIsDirCaps(n.m.ns, child, n.m.caps) {
+				mode = syscall.S_IFREG
+			}
+		case isLeaf(name):
 			mode = syscall.S_IFREG
 		}
-		entries = append(entries, fuse.DirEntry{Name: name, Mode: mode, Ino: fnv64(nsPath(n.childPath(name)))})
+		entries = append(entries, fuse.DirEntry{Name: name, Mode: mode, Ino: fnv64(child)})
 	}
 	return fs.NewListDirStream(entries), 0
 }
@@ -321,16 +335,39 @@ func (n *p9node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32,
 		f.Close()
 		return nil, 0, toLinuxErrno(err)
 	}
-	return &p9handle{file: f}, 0, 0
+	// A /cer/fs file is served by RANGED reads (see Read): it may be arbitrarily
+	// large, so its bytes must never be slurped into memory the way a small
+	// ctl/info descriptor is.
+	ranged := isFSPath(nsPath(n.path)) && nsPath(n.path) != FSRoot
+	return &p9handle{file: f, ranged: ranged}, 0, 0
 }
 
-// Read serves the descriptor bytes captured at Open (the ctl/info/fs-write
-// DataEndpoint JSON, or the info JSON) — never device bytes, upholding the
-// vertical 04 §3.5 invariant end to end through the mount.
+// Read serves a file's bytes through the capability-bound 9P client.
+//
+// A /cer/fs file is read RANGED: the kernel's (offset, count) goes straight
+// through as a 9P read, which the server answers out of the dfs engine by
+// reconstructing only the erasure-coded chunks that range touches. This is the
+// load-bearing difference from a slurp — a stored file can be arbitrarily large,
+// so reading 4 KiB of a 4 GiB file must cost about 4 KiB, not 4 GiB. (The p9
+// client's ReadAt already splits one request across as many 9P messages as the
+// negotiated msize needs, so a single call fills dest or hits EOF.)
+//
+// A device ctl/info leaf is unchanged: it is a small DESCRIPTOR (the DataEndpoint
+// JSON — never device bytes, upholding the vertical 04 §3.5 invariant end to end
+// through the mount), so it is fetched once and cached for the handle's life.
 func (n *p9node) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	h, ok := f.(*p9handle)
 	if !ok {
 		return nil, syscall.EBADF
+	}
+	if h.ranged {
+		got, err := h.file.ReadAt(dest, off)
+		// A short read is normal at end-of-file; only a genuine error that
+		// produced no bytes at all is a failure.
+		if err != nil && err != io.EOF && got == 0 {
+			return nil, toLinuxErrno(err)
+		}
+		return fuse.ReadResultData(dest[:got]), 0
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -364,12 +401,16 @@ func (n *p9node) Write(ctx context.Context, f fs.FileHandle, data []byte, off in
 	return uint32(written), 0
 }
 
-// p9handle is what a FUSE file handle refers to: the walked+opened p9.File plus
-// its descriptor bytes, captured lazily on first Read.
+// p9handle is what a FUSE file handle refers to: the walked+opened p9.File plus,
+// for a small descriptor leaf, its bytes captured lazily on first Read.
+//
+// ranged marks a /cer/fs file, whose reads are passed through at their requested
+// offset instead of being cached whole (see Read). data stays nil for those.
 type p9handle struct {
-	mu   sync.Mutex
-	file p9.File
-	data []byte
+	mu     sync.Mutex
+	file   p9.File
+	data   []byte
+	ranged bool
 }
 
 // Release closes the underlying 9P file when the kernel drops the handle.
@@ -415,7 +456,9 @@ func toLinuxErrno(err error) syscall.Errno {
 	if ce, ok := err.(*contract.CapError); ok {
 		switch ce.Code {
 		case contract.ErrDenied:
-			if strings.Contains(ce.Msg, "no such path") {
+			// "no such file" is the /cer/fs store's report for a path that was
+			// never written — an absence, not a denial (see wire.go's toErrno).
+			if strings.Contains(ce.Msg, "no such path") || strings.Contains(ce.Msg, "no such file") {
 				return syscall.ENOENT
 			}
 			return syscall.EACCES
