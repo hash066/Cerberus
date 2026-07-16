@@ -16,14 +16,36 @@ import (
 type MountConfig struct {
 	// Mountpoint is the host path to mount at (e.g. "/mnt/cerberus" or "X:").
 	Mountpoint string
-	// Cap is the capability the mounted view is scoped to (per-principal namespace).
+	// Cap is the capability the mounted view is scoped to (per-principal
+	// namespace). Use Caps instead to mount a principal holding several.
 	Cap contract.CapHandle
+	// Caps is the full set of capabilities the mounted view is scoped to — the
+	// principal's keyring. When it is non-empty, Cap is ignored.
+	//
+	// A set is necessary because a capability is scoped to ONE resource: a
+	// ResourceRef names a single Kind at a single path, and the kernel checks
+	// that exactly. So no single handle can authorize both a device
+	// (/cer/dev/vram/local/0, KindVRAM) and the filesystem (/cer/fs, KindFS),
+	// and a mount meant to show both must name both. The mounted view is exactly
+	// the union of what these capabilities separately authorize — each access is
+	// still authorized by one specific capability that covers that exact
+	// resource, so this is a keyring, not a widening (see wire.go's capSet).
+	Caps []contract.CapHandle
 	// NS is the capability-gated namespace to present. Every filesystem callback
 	// (Getattr/Open/Read/Readdir/...) is served by walking/opening THIS namespace
 	// over the real 9P2000.L wire (see wire.go's DialCap), so the mount is a
 	// second TRANSPORT onto the same capability-checked Server, never a second,
 	// unguarded access path (CLAUDE.md golden rule 5: no ambient authority).
 	NS *Server
+}
+
+// caps returns the capability set this mount is bound to, treating the singular
+// Cap as a set of one so existing callers keep working unchanged.
+func (c MountConfig) caps() []contract.CapHandle {
+	if len(c.Caps) > 0 {
+		return c.Caps
+	}
+	return []contract.CapHandle{c.Cap}
 }
 
 // Mount mounts the 9P capability namespace as a real host filesystem.
@@ -114,6 +136,42 @@ func unmountRegistered(mountpoint string) error {
 		return contract.Errf(contract.ErrDenied, "unmount: "+mountpoint+" is not mounted by this process")
 	}
 	return h.unmount()
+}
+
+// --- shared capability-set helpers ------------------------------------------
+
+// listChildrenCaps is Server.ListChildren for a capability SET: the union of
+// what each capability may see, deduplicated, in a stable order.
+//
+// It is the enumeration counterpart to wire.go's capSet.try, and carries the
+// same authority: every name here came out of a ListChildren call that applied
+// the full per-entry capability check for ONE capability, so the union names
+// exactly what this keyring could walk to and nothing more. Two capabilities are
+// never combined to reveal a name neither would reveal alone.
+func listChildrenCaps(ns *Server, dir string, caps []contract.CapHandle) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range caps {
+		for _, name := range ns.ListChildren(dir, c) {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// fsIsDirCaps is Server.FSIsDir for a capability set: a path is a directory if
+// any held capability can see a file beneath it.
+func fsIsDirCaps(ns *Server, path string, caps []contract.CapHandle) bool {
+	for _, c := range caps {
+		if ns.FSIsDir(path, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- shared path helpers ----------------------------------------------------

@@ -131,9 +131,14 @@ func (s *Server) IsAncestorDir(path string) bool {
 // dir is a namespace path (e.g. "/cer", "/cer/dev", "/cer/dev/vram/AA/0"); the
 // returned names are single path components, deduplicated. A device directory
 // itself (e.g. "/cer/dev/vram/AA/0") additionally lists the fixed leaves
-// "ctl" and "info" once the read check on that device passes. /cer/fs is
-// listed as a bare structural entry (its files are named by the caller, not
-// enumerated — the metadata store is not a directory listing source in v0.1).
+// "ctl" and "info" once the read check on that device passes.
+//
+// /cer/fs IS enumerated, from the metadata store, filtered by FSList to exactly
+// the files cap may read. It previously listed as a bare structural entry with
+// no contents ("the metadata store is not a directory listing source in v0.1"),
+// which meant fs/ appeared as a permanently EMPTY directory through a mount —
+// files written with `cerberus fs put` were invisible to `ls`. The metadata
+// store always knew them; nothing enumerated it.
 func (s *Server) ListChildren(dir string, cap contract.CapHandle) []string {
 	dir = strings.TrimRight(dir, "/")
 	seen := map[string]bool{}
@@ -181,9 +186,46 @@ func (s *Server) ListChildren(dir string, cap contract.CapHandle) []string {
 		}
 	}
 
-	if dir == "/cer" || dir == rootPath {
-		if s.fs != nil {
-			add("fs")
+	// --- /cer/fs ---
+	//
+	// Read s.fs under the lock: SetFSStore may run concurrently (the bare
+	// `if s.fs != nil` this replaces was an unsynchronized read of a field the
+	// mutex above exists to protect).
+	s.mu.Lock()
+	store := s.fs
+	s.mu.Unlock()
+	if store == nil {
+		return out // no filesystem backend: /cer/fs does not exist at all.
+	}
+
+	if dir == rootPath {
+		// The fs root is a structural entry, listed without a capability for the
+		// same reason WalkFS lets any caller traverse to it: reaching the root
+		// exposes no file. The check fires on the entries below.
+		add("fs")
+	}
+
+	if dir == FSRoot || strings.HasPrefix(dir, FSRoot+"/") {
+		// FSList has already applied the identical read check WalkFS would apply
+		// to each file, so every name reaching this loop is one this capability
+		// could genuinely walk to. An intermediate directory component is
+		// therefore named only when the cap can read some real file beneath it —
+		// a directory here is inferred from the files it holds, so an empty one
+		// cannot exist to be leaked.
+		entries, err := s.FSList(cap)
+		if err != nil {
+			return out
+		}
+		for _, e := range entries {
+			rest, ok := strings.CutPrefix(e.Path, dir+"/")
+			if !ok || rest == "" {
+				continue
+			}
+			if i := strings.IndexByte(rest, '/'); i >= 0 {
+				add(rest[:i])
+			} else {
+				add(rest)
+			}
 		}
 	}
 	return out

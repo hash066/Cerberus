@@ -257,6 +257,167 @@ func (f *FS) Get(man Manifest) (io.ReadCloser, error) {
 	return io.NopCloser(&out), nil
 }
 
+// --- random access ---------------------------------------------------------
+
+// readCacheChunks bounds how many reconstructed chunks ONE open File retains.
+// It exists because the kernel reads a mounted file in small slices (FUSE issues
+// 128 KiB reads by default) while the smallest thing dfs can reconstruct is a
+// whole ChunkSize chunk: without a cache, a sequential read of one 1 MiB chunk
+// would re-fetch and re-decode its shards eight times over. Four chunks is
+// enough to absorb the kernel's readahead reordering while bounding an open
+// file's cache at 4*ChunkSize (4 MiB at the default chunk size) REGARDLESS of
+// the file's total size — reading 4 GiB never buffers 4 GiB.
+const readCacheChunks = 4
+
+// File is a random-access reader over a stored file. It is what makes /cer/fs
+// mountable: a FUSE/9P read arrives as (offset, count) and must be answered
+// without materializing the whole file, which Get cannot do (Get reconstructs
+// every chunk into one buffer, so serving a 4 KiB read of a 4 GiB file through
+// it would cost 4 GiB of RAM).
+//
+// File instead reconstructs ONLY the chunks that overlap the requested range,
+// and caches the last readCacheChunks of them. The costs, stated plainly:
+//
+//   - MEMORY is bounded by readCacheChunks*ChunkSize per open file plus the
+//     k+m shards of the chunk being decoded — independent of file size.
+//   - READ AMPLIFICATION is a whole chunk. The smallest unit dfs can verify is
+//     a shard (a shard's bytes are checked against its CID; half a shard cannot
+//     be), and the smallest unit it can Reconstruct is a chunk's shard set, so a
+//     4 KiB read of a cold chunk fetches that chunk's shards (k+m*ChunkSize/k
+//     bytes = 1.5 MiB at the defaults). Sequential reads amortize this to ~1x
+//     via the cache; small random reads scattered across a large file do not.
+//     A future optimization can fetch only the data shards spanning the range
+//     when all of them are intact and fall back to full reconstruction
+//     otherwise; this deliberately reuses the proven getChunk path instead, so
+//     integrity and parity verification are identical on every read.
+//   - CONCURRENCY: reads on one File serialize on its cache mutex.
+//
+// A File is a read-only view of the Manifest passed to Open: it resolves no
+// names and re-reads no metadata, so a concurrent overwrite of the same /cer/fs
+// path cannot tear an in-flight read.
+type File struct {
+	fs  *FS
+	man Manifest
+	enc reedsolomon.Encoder
+
+	mu     sync.Mutex
+	cached []cachedChunk // most-recently-used first
+}
+
+// cachedChunk is one reconstructed chunk held in File's LRU. data is never
+// mutated after it is built, so a reader may copy out of it after the cache
+// lock is dropped (an eviction only forgets the slice; the bytes stay valid).
+type cachedChunk struct {
+	idx  int
+	data []byte
+}
+
+// Open returns a random-access reader over the file described by man. It
+// validates the manifest up front so a malformed one fails here rather than
+// silently mis-addressing bytes at read time.
+func (f *FS) Open(man Manifest) (*File, error) {
+	if man.DataShards <= 0 || man.ParityShards <= 0 {
+		return nil, errors.New("dfs: manifest has invalid shard counts")
+	}
+	if man.ChunkSize <= 0 {
+		return nil, errors.New("dfs: manifest has invalid chunk size")
+	}
+	total := man.DataShards + man.ParityShards
+	for i, cm := range man.Chunks {
+		if len(cm.ShardCIDs) != total {
+			return nil, fmt.Errorf("dfs: chunk %d has %d shard cids, want %d", i, len(cm.ShardCIDs), total)
+		}
+		// Random access maps a byte offset to a chunk with off/ChunkSize, which
+		// is only correct because Put fills every chunk but the last to exactly
+		// ChunkSize. Verify that rather than trust it: a manifest that violates
+		// it would otherwise read the wrong bytes with no error at all.
+		if i < len(man.Chunks)-1 && cm.ChunkBytes != man.ChunkSize {
+			return nil, fmt.Errorf(
+				"dfs: chunk %d holds %d bytes but the chunk size is %d — only the final chunk may be short",
+				i, cm.ChunkBytes, man.ChunkSize)
+		}
+	}
+	enc, err := reedsolomon.New(man.DataShards, man.ParityShards)
+	if err != nil {
+		return nil, fmt.Errorf("dfs: new encoder: %w", err)
+	}
+	return &File{fs: f, man: man, enc: enc}, nil
+}
+
+// Size is the file's total length in bytes.
+func (fl *File) Size() int64 { return fl.man.TotalBytes }
+
+// Close releases the chunk cache. The File is unusable for further reads only
+// in the sense that its cache is cold; it holds no OS resources.
+func (fl *File) Close() error {
+	fl.mu.Lock()
+	fl.cached = nil
+	fl.mu.Unlock()
+	return nil
+}
+
+// ReadAt implements io.ReaderAt over the reconstructed file. It reconstructs
+// only the chunks the requested range touches. Per the io.ReaderAt contract it
+// returns a non-nil error whenever n < len(p); a read that runs off the end of
+// the file returns io.EOF.
+func (fl *File) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, errors.New("dfs: read at negative offset")
+	}
+	if off >= fl.man.TotalBytes {
+		return 0, io.EOF
+	}
+	n := 0
+	for n < len(p) {
+		cur := off + int64(n)
+		if cur >= fl.man.TotalBytes {
+			return n, io.EOF
+		}
+		idx := int(cur / int64(fl.man.ChunkSize))
+		within := int(cur % int64(fl.man.ChunkSize))
+		chunk, err := fl.chunk(idx)
+		if err != nil {
+			return n, err
+		}
+		if within >= len(chunk) {
+			// The manifest claims more bytes than its chunks hold. Report EOF
+			// rather than spin: TotalBytes and the chunk lengths disagree.
+			return n, io.EOF
+		}
+		n += copy(p[n:], chunk[within:])
+	}
+	return n, nil
+}
+
+// chunk returns chunk idx, reconstructing it through the same integrity-checked
+// getChunk path Get uses, and caches it MRU-first.
+func (fl *File) chunk(idx int) ([]byte, error) {
+	fl.mu.Lock()
+	defer fl.mu.Unlock()
+
+	for i, cc := range fl.cached {
+		if cc.idx == idx {
+			copy(fl.cached[1:i+1], fl.cached[:i]) // move-to-front
+			fl.cached[0] = cc
+			return cc.data, nil
+		}
+	}
+	if idx < 0 || idx >= len(fl.man.Chunks) {
+		return nil, fmt.Errorf("dfs: chunk %d out of range (file has %d chunks)", idx, len(fl.man.Chunks))
+	}
+	data, err := fl.fs.getChunk(fl.enc, fl.man.Chunks[idx], fl.man.DataShards)
+	if err != nil {
+		return nil, fmt.Errorf("dfs: reconstruct chunk %d: %w", idx, err)
+	}
+	fl.cached = append([]cachedChunk{{idx: idx, data: data}}, fl.cached...)
+	if len(fl.cached) > readCacheChunks {
+		fl.cached = fl.cached[:readCacheChunks]
+	}
+	return data, nil
+}
+
+var _ io.ReaderAt = (*File)(nil)
+
 // getChunk fetches, integrity-checks, reconstructs and joins one chunk.
 func (f *FS) getChunk(enc reedsolomon.Encoder, cm ChunkManifest, k int) ([]byte, error) {
 	shards := make([][]byte, len(cm.ShardCIDs))

@@ -281,6 +281,63 @@ func (s *dfsFSStore) manifestFor(path string) (dfs.Manifest, bool) {
 	return s.meta.Get(path)
 }
 
+// List returns every file recorded in the metadata store, with the size taken
+// from each file's Manifest. This is what lets a mount's `ls` show real files
+// with real sizes: the namespace's ListChildren draws /cer/fs entries from here
+// (through Server.FSList, which filters them to the asking capability first).
+//
+// A path whose Manifest has vanished between the key listing and the lookup is
+// skipped rather than reported at size zero — a file is listed only if its
+// metadata is genuinely readable.
+func (s *dfsFSStore) List() ([]ninep.FSEntry, error) {
+	paths, err := s.meta.List()
+	if err != nil {
+		return nil, fmt.Errorf("fs list: %w", err)
+	}
+	out := make([]ninep.FSEntry, 0, len(paths))
+	for _, p := range paths {
+		man, ok := s.meta.Get(p)
+		if !ok {
+			continue
+		}
+		out = append(out, ninep.FSEntry{Path: p, Size: man.TotalBytes})
+	}
+	return out, nil
+}
+
+// Stat returns the entry for exactly path. A path that was never written is
+// reported as absent (ErrDenied "no such file", which the 9P layer maps to
+// ENOENT) rather than as a zero-byte file.
+func (s *dfsFSStore) Stat(path string) (ninep.FSEntry, error) {
+	man, ok := s.meta.Get(path)
+	if !ok {
+		return ninep.FSEntry{}, contract.Errf(contract.ErrDenied, "no such file: "+path)
+	}
+	return ninep.FSEntry{Path: path, Size: man.TotalBytes}, nil
+}
+
+// OpenRead resolves path to its Manifest and returns a random-access reader over
+// the erasure-coded file. The reader reconstructs only the chunks each read
+// touches (dfs.File), so a mount can serve an arbitrary (offset, count) read
+// without materializing the whole file — the reason this exists alongside
+// BeginRead, which streams a WHOLE file out over the data plane and cannot be
+// driven by a read(2). Shard fetches inside it still go to peers over the mesh.
+func (s *dfsFSStore) OpenRead(path string) (ninep.FSReader, error) {
+	man, ok := s.meta.Get(path)
+	if !ok {
+		return nil, contract.Errf(contract.ErrDenied, "no such file: "+path)
+	}
+	f, err := s.fs.Open(man)
+	if err != nil {
+		// Return an explicit nil so the interface is nil, not a typed-nil
+		// *dfs.File wrapped in a non-nil FSReader.
+		return nil, fmt.Errorf("fs open %s: %w", path, err)
+	}
+	return f, nil
+}
+
+var _ ninep.FSStore = (*dfsFSStore)(nil)
+
 // BeginRead resolves path to its Manifest, reconstructs the file with dfs.Get,
 // and streams the bytes over the data plane to the receiver the caller supplied
 // in recv (the daemon is the sender for a read). An unknown path is denied — a

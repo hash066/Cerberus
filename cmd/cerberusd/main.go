@@ -805,36 +805,37 @@ func main() {
 // safe to call (it is a no-op when nothing was mounted), so the caller can
 // defer it unconditionally.
 //
-// WHICH CAPABILITY THE MOUNT IS SCOPED TO (CLAUDE.md golden rule 5 — no
+// WHICH CAPABILITIES THE MOUNT IS SCOPED TO (CLAUDE.md golden rule 5 — no
 // ambient authority). A mount is a TRANSPORT onto the namespace, not a second,
-// unguarded way in: daemon/ninep's mount dials the namespace through DialCap,
+// unguarded way in: daemon/ninep's mount dials the namespace through DialCaps,
 // so every Getattr/Open/Read/Readdir the OS issues re-enters the same
-// capability-checked Walk/Open path a 9P network peer goes through. That means
-// the mount must name exactly one capability, and the view it presents is
-// whatever THAT capability authorizes — no more. We mint one here with the
-// SAME resource and rights daemon/system.Compose mints for the 9P wire server
-// (its devCap: read+alloc over /cer/dev/vram/local/0), deliberately, so the
-// drive letter and the wire server present the identical view and the
-// invariant "a mount bound to cap X sees exactly what a 9P client bound to
-// cap X sees" is true by construction rather than by coincidence. Minting a
-// second handle of the same shape (rather than reusing Compose's) is what
-// keeps this out of daemon/system: Compose does not export devCap, and the
-// namespace + kernel it DOES export are all this needs.
+// capability-checked Walk/Open path a 9P network peer goes through. The view it
+// presents is whatever the capabilities it names authorize — no more.
 //
-// HONEST LIMIT — this is capability-SHAPED, not yet capability-SCOPED. Neither
-// capability kernel in this repo actually checks the resource a handle names:
-// the default pure-Go kernel (contract/go/stub.CapKernel.Verify) ignores the
-// Request argument entirely, and the real Rust kernel behind `-tags ffi` is
-// handed only (handle, op, now) across the C ABI — cerberus_cap_verify takes no
-// resource parameter at all (core/cabi/include/cerberus.h). So today any live,
-// unrevoked handle carrying the right verb passes the check for ANY resource,
-// and this mount consequently shows the whole namespace rather than just the
-// VRAM device its handle names. Revocation and rights ARE enforced, so a
-// revoked handle really does blind the mount. This is a kernel gap, not a mount
-// gap — the mount asks the same question the wire server asks and gets the same
-// answer — but it must not be described as per-resource scoping until
-// cerberus_cap_verify learns to take the resource. Do not present this as
-// per-device isolation (CLAUDE.md "Maturity honesty").
+// WHY A SET AND NOT ONE HANDLE. This used to mint exactly one capability
+// (read+alloc over /cer/dev/vram/local/0, mirroring Compose's devCap) on the
+// reasoning that "the mount must name exactly one capability". That reasoning
+// held only while the kernel ignored scope. It no longer does: the pure-Go
+// kernel that ships now enforces revocation, rights AND scope, and it compares
+// the resource exactly (contract/go/stub's sameResource — Kind must match, and
+// the granted path must COVER the requested one at a separator boundary). A
+// ResourceRef names one Kind at one path, so no single handle can authorize both
+// KindVRAM at /cer/dev/vram/local/0 and KindFS at /cer/fs. That is the kernel
+// refusing to mint a god-cap, and it is correct.
+//
+// The consequence was that scoping silently shrank this mount to the one VRAM
+// device its handle named: /cer/fs was invisible through the drive no matter
+// what was stored in it. A principal entitled to both holds TWO capabilities, so
+// the mount now names both and its view is exactly their union — every access is
+// still authorized by one specific capability that genuinely covers that exact
+// resource (see ninep's capSet). Minting these handles here rather than reusing
+// Compose's is what keeps this out of daemon/system: Compose does not export
+// devCap, and the namespace + kernel it DOES export are all this needs.
+//
+// The fs capability is READ-ONLY, deliberately: writing THROUGH the mount does
+// not work (the 9P node is a templatefs.ReadOnlyFile — see daemon/ninep/fs.go),
+// so granting write here would advertise an authority the drive cannot exercise.
+// Files are written with `cerberus fs put` and read back through the mount.
 //
 // WHY THIS IS A PLAIN CALL AND NOT A SUPERVISED SERVICE. ninep.Mount does not
 // block: on every platform it hands the kernel driver's dispatch loop to a
@@ -864,15 +865,23 @@ func mountNamespace(kernel contract.CapKernel, ns *ninep.Server, mountpoint stri
 		return noop
 	}
 
-	mountCap, err := kernel.Mint(
+	devCap, err := kernel.Mint(
 		contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/local/0"},
 		[]contract.Right{contract.RightRead, contract.RightAlloc}, nil)
 	if err != nil {
-		log.Printf("cerberusd: -mount %s disabled: minting the mount capability failed: %v", mountpoint, err)
+		log.Printf("cerberusd: -mount %s disabled: minting the device mount capability failed: %v", mountpoint, err)
 		return noop
 	}
+	fsCap, err := kernel.Mint(
+		contract.ResourceRef{Kind: contract.KindFS, Path: ninep.FSRoot},
+		[]contract.Right{contract.RightRead}, nil)
+	if err != nil {
+		log.Printf("cerberusd: -mount %s disabled: minting the /cer/fs mount capability failed: %v", mountpoint, err)
+		return noop
+	}
+	mountCaps := []contract.CapHandle{devCap, fsCap}
 
-	cfg := ninep.MountConfig{Mountpoint: mountpoint, Cap: mountCap, NS: ns}
+	cfg := ninep.MountConfig{Mountpoint: mountpoint, Caps: mountCaps, NS: ns}
 	if err := ninep.Mount(cfg); err != nil {
 		// The error is already specific and actionable (e.g. it names WinFsp and
 		// links the installer when the Windows driver is missing) — surface it
@@ -881,7 +890,9 @@ func mountNamespace(kernel contract.CapKernel, ns *ninep.Server, mountpoint stri
 		return noop
 	}
 
-	log.Printf("cerberusd: 9P namespace mounted at %s (scoped to capability %d — the same read+alloc view the 9P wire server serves)", mountpoint, mountCap)
+	log.Printf("cerberusd: 9P namespace mounted at %s (scoped to capabilities %d [read+alloc on /cer/dev/vram/local/0] "+
+		"and %d [read on %s] — the same capability-checked view the 9P wire server serves)",
+		mountpoint, devCap, fsCap, ninep.FSRoot)
 	return func() {
 		if err := ninep.Unmount(cfg); err != nil {
 			log.Printf("cerberusd: unmounting %s failed: %v", mountpoint, err)

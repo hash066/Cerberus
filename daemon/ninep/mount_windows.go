@@ -16,14 +16,14 @@
 //
 // THE CAPABILITY INVARIANT (CLAUDE.md golden rule 5): every FileSystemInterface
 // callback below (Getattr/Open/Read/Write/Readdir/...) is implemented by
-// walking/opening a real 9P2000.L client connection obtained from DialCap(ns,
-// cap) — the exact same entry point wire.go's WireServer uses for network
+// walking/opening a real 9P2000.L client connection obtained from DialCaps(ns,
+// caps) — the exact same entry point wire.go's WireServer uses for network
 // peers, and the exact same attacher/node capability-checked logic
-// (Server.Walk/Open/ReadInfo/WalkFS/OpenFSWrite, all gated by kernel.Verify)
-// that ninep_test.go and wire_test.go already exercise. There is no second,
-// unguarded path from the mounted drive letter into the namespace: a mount
-// bound to capability X can see and open exactly what a 9P client bound to
-// capability X could see and open over the wire, no more.
+// (Server.Walk/Open/ReadInfo/WalkFS/OpenFSWrite/OpenFSReader, all gated by
+// kernel.Verify) that ninep_test.go and wire_test.go already exercise. There is
+// no second, unguarded path from the mounted drive letter into the namespace: a
+// mount bound to capability set S can see and open exactly what a 9P client
+// bound to S could see and open over the wire, no more.
 package ninep
 
 import (
@@ -49,7 +49,8 @@ const winfspInstallHint = "WinFsp not installed (or its DLL could not be located
 	"install it from https://winfsp.dev/rel/ (or `winget install WinFsp.WinFsp`) and retry"
 
 // mount is the Windows entry point for Mount (see mount.go). It hosts a
-// cgofuse file system backed by cfg.NS, scoped to cfg.Cap, at cfg.Mountpoint.
+// cgofuse file system backed by cfg.NS, scoped to cfg's capability set, at
+// cfg.Mountpoint.
 //
 // Mount()'s underlying cgofuse call is BLOCKING (it runs the FUSE dispatch
 // loop until Unmount) and, when WinFsp cannot be found, cgofuse PANICS with
@@ -69,7 +70,7 @@ func mount(cfg MountConfig) error {
 		return contract.Errf(contract.ErrDenied, "mount: MountConfig.Mountpoint must not be empty")
 	}
 
-	cl, closer, err := DialCap(cfg.NS, cfg.Cap)
+	cl, closer, err := DialCaps(cfg.NS, cfg.caps()...)
 	if err != nil {
 		return contract.Errf(contract.ErrPartitioned, "mount: dialing the in-process 9P namespace failed: "+err.Error())
 	}
@@ -79,7 +80,7 @@ func mount(cfg MountConfig) error {
 		return contract.Errf(contract.ErrDenied, "mount: attach to /cer with the given capability failed: "+err.Error())
 	}
 
-	adapter := newWinfsAdapter(cfg.NS, cfg.Cap, root)
+	adapter := newWinfsAdapter(cfg.NS, cfg.caps(), root)
 	host := fuse.NewFileSystemHost(adapter)
 
 	if err := registerMount(cfg.Mountpoint, &mountedHost{host: host, client: cl, closer: closer, mountpoint: cfg.Mountpoint}); err != nil {
@@ -169,7 +170,7 @@ func unmount(cfg MountConfig) error {
 // --- FileSystemInterface adapter -------------------------------------------
 
 // winfsAdapter presents a 9P client connection (already bound to one
-// capability by DialCap — see mount()) as a cgofuse FileSystemInterface.
+// capability SET by DialCaps — see mount()) as a cgofuse FileSystemInterface.
 // Every method below does exactly one thing: translate the FUSE call into the
 // equivalent p9.File.Walk/Open/ReadAt/GetAttr call on the SAME client
 // connection wire.go serves, and translate the p9/contract error back into a
@@ -181,17 +182,17 @@ func unmount(cfg MountConfig) error {
 type winfsAdapter struct {
 	fuse.FileSystemBase
 
-	ns   *Server            // used only by Readdir, via the cap-gated ListChildren
-	cap  contract.CapHandle // the single capability this mount (and this adapter) is bound to
-	root p9.File            // the /cer root, attached once for the life of the mount
+	ns   *Server              // used only by Readdir, via the cap-gated ListChildren
+	caps []contract.CapHandle // the capability set this mount (and this adapter) is bound to
+	root p9.File              // the /cer root, attached once for the life of the mount
 
 	mu      sync.Mutex
 	handles map[uint64]*openHandle
 	nextFh  uint64
 }
 
-func newWinfsAdapter(ns *Server, cap contract.CapHandle, root p9.File) *winfsAdapter {
-	return &winfsAdapter{ns: ns, cap: cap, root: root, handles: map[uint64]*openHandle{}}
+func newWinfsAdapter(ns *Server, caps []contract.CapHandle, root p9.File) *winfsAdapter {
+	return &winfsAdapter{ns: ns, caps: caps, root: root, handles: map[uint64]*openHandle{}}
 }
 
 // openHandle is what a FUSE file handle (fi.fh) refers to: the walked p9.File
@@ -202,6 +203,7 @@ type openHandle struct {
 	isDir   bool
 	data    []byte   // ctl/info/fs-write descriptor bytes, captured lazily on first Read
 	entries []string // directory children, captured at Opendir
+	ranged  bool     // a /cer/fs file: reads pass through at their offset (see Read)
 }
 
 const invalidFh = ^uint64(0)
@@ -249,7 +251,9 @@ func toFuseErrno(err error) int {
 	if ce, ok := err.(*contract.CapError); ok {
 		switch ce.Code {
 		case contract.ErrDenied:
-			if strings.Contains(ce.Msg, "no such path") {
+			// "no such file" is the /cer/fs store's report for a path that was
+			// never written — an absence, not a denial (see wire.go's toErrno).
+			if strings.Contains(ce.Msg, "no such path") || strings.Contains(ce.Msg, "no such file") {
 				return fuse.ENOENT
 			}
 			return fuse.EACCES
@@ -341,7 +345,7 @@ func (a *winfsAdapter) Opendir(fusePath string) (int, uint64) {
 		_ = f.Close()
 		return -fuse.ENOTDIR, invalidFh
 	}
-	entries := a.ns.ListChildren(nsPath(fusePath), a.cap)
+	entries := listChildrenCaps(a.ns, nsPath(fusePath), a.caps)
 	fh := a.allocFh()
 	a.mu.Lock()
 	a.handles[fh] = &openHandle{file: f, isDir: true, entries: entries}
@@ -399,21 +403,42 @@ func (a *winfsAdapter) Open(fusePath string, flags int) (int, uint64) {
 		return -toFuseErrno(err), invalidFh
 	}
 	fh := a.allocFh()
+	// A /cer/fs file is served by RANGED reads (see Read): it may be arbitrarily
+	// large, so its bytes must never be slurped into memory the way a small
+	// ctl/info descriptor is.
+	ranged := isFSPath(nsPath(fusePath)) && nsPath(fusePath) != FSRoot
 	a.mu.Lock()
-	a.handles[fh] = &openHandle{file: f}
+	a.handles[fh] = &openHandle{file: f, ranged: ranged}
 	a.mu.Unlock()
 	return 0, fh
 }
 
-// Read reads the descriptor bytes captured at Open (the ctl/info/fs-write
-// DataEndpoint JSON, or the info JSON) — never device bytes, upholding the
-// vertical 04 §3.5 invariant end to end through the mount.
+// Read reads a file's bytes through the capability-bound 9P client.
+//
+// A /cer/fs file is read RANGED: WinFsp's (offset, count) goes straight through
+// as a 9P read, which the server answers out of the dfs engine by reconstructing
+// only the erasure-coded chunks that range touches — a stored file can be
+// arbitrarily large, so reading 4 KiB of a 4 GiB file must cost about 4 KiB, not
+// 4 GiB. This mirrors mount_linux.go's Read exactly; see its note.
+//
+// A device ctl/info leaf is unchanged: it is a small DESCRIPTOR (the
+// DataEndpoint JSON — never device bytes, upholding the vertical 04 §3.5
+// invariant end to end through the mount), fetched once and cached.
 func (a *winfsAdapter) Read(fusePath string, buff []byte, ofst int64, fh uint64) int {
 	a.mu.Lock()
 	h, ok := a.handles[fh]
 	a.mu.Unlock()
 	if !ok {
 		return -fuse.EBADF
+	}
+	if h.ranged {
+		got, err := h.file.ReadAt(buff, ofst)
+		// A short read is normal at end-of-file; only a genuine error that
+		// produced no bytes at all is a failure.
+		if err != nil && err != io.EOF && got == 0 {
+			return -toFuseErrno(err)
+		}
+		return got
 	}
 	if h.data == nil {
 		data, err := readAllFrom(h.file)
