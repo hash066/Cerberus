@@ -89,8 +89,14 @@ so use an overlay:
 | Belief-conflict detect / list / resolve | ✅ works |
 | GPU compute (`gpu <kernel>`) | ✅ real compute; **`backend: cpu-software`** by default. Physical GPU (`gpu-wgpu`) needs a from-source build — see `docs/gpu.md` |
 | Target a peer's GPU (`gpu <kernel> … --on <peer>`) | ✅ works — capability-checked on the peer; reports the backend the peer actually used |
-| Pipeline inference (`pipeline-run`) | ✅ works — split-MLP fixture layers placed across nodes, activations over the data plane. LLM backends (`--backend llamacpp`/`mlx`) are engine seams that honestly report `-mock` without real weights |
+| Pipeline placement (`pipeline-run`) | ✅ works — layers placed across nodes by live telemetry, activations over the data plane. The model is a **4×4 MLP fixture**, not an LLM: no tokenizer, weights, KV-cache or sampler |
+| LLM inference of any kind | ❌ **not wired.** The v0.1 `--backend llamacpp`/`mlx` seams were mocks and were **deleted**, not repaired — those values now fail loudly. `daemon/llama` (real llama.cpp) is written and unit-tested but **no binary imports it yet** |
+| `/v1/chat/completions` | ⚠️ **known bug — do not build on it.** It returns HTTP 200 for *any* model name (`{"model":"gpt-4o"}` → `"1337"`, the WASM shard's output) and its `usage` token counts are fabricated from character/byte lengths. There is no tokenizer in that path |
 | Audio session (local loopback) | ✅ works |
-| Cross-node mic/speaker (`audio play/monitor --on`) | ✅ wired + capability-gated; needs two machines with real mic/speaker to *hear* |
+| Cross-node mic/speaker (`audio play/monitor --on`) | ✅ wired + capability-gated on **Windows** (WASAPI) and **Linux** (PulseAudio, pure Go, no cgo); needs two machines with a real mic/speaker to *hear*. **macOS: never compiled** — the CoreAudio backend is behind an opt-in build tag and has never been built or run |
+| VRAM reported by `cerberus devices` | ✅ measured, not assumed — matches `nvidia-smi` exactly (RTX 3050: 4.0 GiB). A card we can't measure shows `quota=0 B` (honest unknown), never a plausible default |
+| Mount the namespace (`cerberusd -mount`) | ⚠️ **Linux only.** Real FUSE mount, verified on WSL2. **Windows is unverified** — needs the WinFsp driver, which we have not tested against. `/cer/fs` is **not** browsable through a mount either way (use `fs get`/`cat`) |
 
-Report anything that errors or surprises you — that's what the beta is for.
+Report anything that errors or surprises you — that's what the beta is for. The
+⚠️ rows above are there because we ran them; if you find a ✅ row that doesn't
+hold on your machine, that's the most useful bug you can file.
