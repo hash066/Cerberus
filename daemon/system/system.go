@@ -584,18 +584,24 @@ func localTelemetry(self contract.PeerID) contract.NodeTelemetry {
 	// box's real 4GB card and would have OOM'd it. Zero is honest and simply
 	// loses the ranking; a lie loses the job.
 	//
-	// RAM is still a literal — that is daemon/system/telemetry work in flight
-	// on another lane; do not read these two numbers as equally trustworthy.
+	// RAM is MEASURED too (daemon/hostinfo.RAM via localMemory). It is applied
+	// HERE rather than in localTelemetryWithLinks so that every caller gets it:
+	// four call sites sample this function (schedulerLoop, Compose, peripheral.go,
+	// pipeline.go), and only one of them goes through the links path. Wiring RAM
+	// there would have left the other three advertising a literal.
+	//
+	// localMemory returns the CURRENT value unchanged when the OS declines to
+	// report, so an honest "unknown" is the previous figure rather than 0 — the
+	// scheduler reads 0 as "this node has no memory" and would rank it out
+	// entirely.
 	vram := gpu.VRAMSnapshot()
 	return contract.NodeTelemetry{
 		PeerID:  self,
 		Compute: contract.Compute{PCores: cores, Flops: availFlops},
-		Memory: contract.Memory{
-			RAMTotal:  16_000_000_000,
-			RAMFree:   8_000_000_000,
+		Memory: localMemory(contract.Memory{
 			VRAMTotal: vram.Total(),
 			VRAMFree:  vram.Free(),
-		},
+		}),
 		Thermal: contract.Thermal{HeadroomC: 30},
 		Power:   contract.Power{Src: contract.PowerAC},
 	}
