@@ -3,6 +3,7 @@
 package ninep
 
 import (
+	"bytes"
 	"os"
 	"strings"
 	"testing"
@@ -204,4 +205,185 @@ func TestMountHonoursRevocation(t *testing.T) {
 	}
 	t.Fatal("after its capability was revoked, the mount still exposed the device's ctl leaf — " +
 		"a revoked capability must blind the mount, not merely future mounts")
+}
+
+// --- /cer/fs through a real mount -------------------------------------------
+
+// fsMountSetup builds a namespace with a real in-memory /cer/fs backend holding
+// two files, plus a registered device, so a mount test can prove BOTH subtrees
+// and the capability boundary between them.
+func fsMountSetup(t *testing.T) (*Server, *stub.CapKernel) {
+	t.Helper()
+	k := stub.NewCapKernel()
+	s := New(k)
+	s.Register("/cer/dev/vram/AA/0", contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/AA/0"})
+	s.SetFSStore(&fakeFSStore{files: map[string][]byte{
+		"/cer/fs/hello.txt":  []byte("hello from the distributed filesystem"),
+		"/cer/fs/docs/a.txt": []byte("nested"),
+	}})
+	return s, k
+}
+
+// TestMountReadsFSFile is the mount-level proof of the whole point of /cer/fs:
+// a file put into the filesystem is LISTED by a real readdir(2) with its real
+// size, and read(2) through the kernel returns its exact bytes.
+func TestMountReadsFSFile(t *testing.T) {
+	requireFuse(t)
+	ns, k := fsMountSetup(t)
+	fsCap, err := k.Mint(contract.ResourceRef{Kind: contract.KindFS, Path: FSRoot},
+		[]contract.Right{contract.RightRead}, nil)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	mnt := mountAt(t, ns, fsCap)
+
+	// readdir(2) must show the stored files — fs/ used to be permanently empty.
+	entries, err := os.ReadDir(mnt + "/fs")
+	if err != nil {
+		t.Fatalf("readdir /fs: %v", err)
+	}
+	names := map[string]os.DirEntry{}
+	for _, e := range entries {
+		names[e.Name()] = e
+	}
+	if _, ok := names["hello.txt"]; !ok {
+		t.Fatalf("a stored file must be listed through the mount, got %v", entries)
+	}
+	if names["hello.txt"].IsDir() {
+		t.Fatal("a stored FILE must not be listed as a directory")
+	}
+	if d, ok := names["docs"]; !ok || !d.IsDir() {
+		t.Fatalf("a directory implied by a nested file must list as a directory, got %v", entries)
+	}
+
+	// stat(2) must report the real size, not zero.
+	want := []byte("hello from the distributed filesystem")
+	st, err := os.Stat(mnt + "/fs/hello.txt")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if st.Size() != int64(len(want)) {
+		t.Fatalf("stat size = %d, want %d", st.Size(), len(want))
+	}
+
+	// read(2) must return the exact bytes.
+	got, err := os.ReadFile(mnt + "/fs/hello.txt")
+	if err != nil {
+		t.Fatalf("read /fs/hello.txt: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read through the mount returned %q, want %q", got, want)
+	}
+	nested, err := os.ReadFile(mnt + "/fs/docs/a.txt")
+	if err != nil || string(nested) != "nested" {
+		t.Fatalf("read nested file: %q, %v", nested, err)
+	}
+
+	// A ranged read (pread) must work — this is what makes a large file usable.
+	f, err := os.Open(mnt + "/fs/hello.txt")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	buf := make([]byte, 4)
+	if _, err := f.ReadAt(buf, 6); err != nil {
+		t.Fatalf("pread: %v", err)
+	}
+	if string(buf) != string(want[6:10]) {
+		t.Fatalf("pread returned %q, want %q", buf, want[6:10])
+	}
+
+	// A path that was never written must be absent, not a phantom empty file.
+	if _, err := os.Stat(mnt + "/fs/ghost.txt"); !os.IsNotExist(err) {
+		t.Fatalf("an unwritten /cer/fs path must stat as absent, got %v", err)
+	}
+}
+
+// TestMountFSCapabilityIsScopedToItsResource is the /cer/fs capability boundary,
+// proven over real OS file I/O: a mount bound to a DEVICE capability must not
+// see the filesystem, and one bound to a single FILE must see only that file.
+// A mount bound to capability X sees exactly what a 9P client bound to X sees —
+// the mount is a transport, not a second unguarded way in.
+func TestMountFSCapabilityIsScopedToItsResource(t *testing.T) {
+	requireFuse(t)
+	ns, k := fsMountSetup(t)
+
+	// A capability for the VRAM DEVICE only.
+	vramCap, err := k.Mint(contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/AA/0"},
+		[]contract.Right{contract.RightRead, contract.RightAlloc}, nil)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	// A capability for ONE file only.
+	oneFileCap, err := k.Mint(contract.ResourceRef{Kind: contract.KindFS, Path: "/cer/fs/hello.txt"},
+		[]contract.Right{contract.RightRead}, nil)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+
+	devMnt := mountAt(t, ns, vramCap)
+	oneMnt := mountAt(t, ns, oneFileCap)
+
+	// The device cap works on its own device (so this proves scoping, not a dead handle).
+	if _, err := os.Stat(devMnt + "/dev/vram/AA/0/ctl"); err != nil {
+		t.Fatalf("the device cap must see its own device: %v", err)
+	}
+	// ...and must reach NOTHING in the filesystem.
+	if b, err := os.ReadFile(devMnt + "/fs/hello.txt"); err == nil {
+		t.Fatalf("AMBIENT AUTHORITY: a mount bound to a VRAM capability read a /cer/fs file: %q", b)
+	}
+	if entries, err := os.ReadDir(devMnt + "/fs"); err == nil && len(entries) > 0 {
+		t.Fatalf("AMBIENT AUTHORITY: a mount bound to a VRAM capability enumerated /cer/fs: %v", entries)
+	}
+
+	// The single-file cap reads its file...
+	if _, err := os.ReadFile(oneMnt + "/fs/hello.txt"); err != nil {
+		t.Fatalf("a cap for hello.txt must read hello.txt: %v", err)
+	}
+	// ...and neither reads nor enumerates any other.
+	if b, err := os.ReadFile(oneMnt + "/fs/docs/a.txt"); err == nil {
+		t.Fatalf("AMBIENT AUTHORITY: a cap scoped to /cer/fs/hello.txt read /cer/fs/docs/a.txt: %q", b)
+	}
+	entries, err := os.ReadDir(oneMnt + "/fs")
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() != "hello.txt" {
+			t.Fatalf("AMBIENT AUTHORITY: a cap scoped to /cer/fs/hello.txt enumerated %q", e.Name())
+		}
+	}
+}
+
+// TestMountCapSetIsTheUnionAndNothingMore proves the keyring: a mount naming a
+// device capability AND a filesystem capability presents both subtrees — which
+// no single capability could, since scope is per (Kind, path) — while a mount
+// naming only one still presents only that one. The set is a union of real
+// grants, never a widening of either.
+func TestMountCapSetIsTheUnionAndNothingMore(t *testing.T) {
+	requireFuse(t)
+	ns, k := fsMountSetup(t)
+	vramCap, _ := k.Mint(contract.ResourceRef{Kind: contract.KindVRAM, Path: "/cer/dev/vram/AA/0"},
+		[]contract.Right{contract.RightRead, contract.RightAlloc}, nil)
+	fsCap, _ := k.Mint(contract.ResourceRef{Kind: contract.KindFS, Path: FSRoot},
+		[]contract.Right{contract.RightRead}, nil)
+
+	mnt := t.TempDir()
+	if err := Mount(MountConfig{NS: ns, Caps: []contract.CapHandle{vramCap, fsCap}, Mountpoint: mnt}); err != nil {
+		t.Fatalf("mount with a capability set: %v", err)
+	}
+	t.Cleanup(func() { _ = Unmount(MountConfig{Mountpoint: mnt}) })
+
+	if _, err := os.Stat(mnt + "/dev/vram/AA/0/ctl"); err != nil {
+		t.Fatalf("the keyring's device capability must still see the device: %v", err)
+	}
+	if _, err := os.ReadFile(mnt + "/fs/hello.txt"); err != nil {
+		t.Fatalf("the keyring's fs capability must still read the file: %v", err)
+	}
+	// The union is not a widening: a device NOT named by any held capability
+	// stays invisible.
+	ns.Register("/cer/dev/gpu/BB/0", contract.ResourceRef{Kind: contract.KindGPU, Path: "/cer/dev/gpu/BB/0"})
+	if _, err := os.Stat(mnt + "/dev/gpu/BB/0/ctl"); err == nil {
+		t.Fatal("AMBIENT AUTHORITY: a capability set exposed a device none of its members names")
+	}
 }
