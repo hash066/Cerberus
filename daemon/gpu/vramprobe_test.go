@@ -285,3 +285,94 @@ func TestProbeNeverErrorsOnThisMachine(t *testing.T) {
 		t.Logf("no GPU measurable on this machine (source=%s, err=%v)", v.Source, v.Err)
 	}
 }
+
+// Refresh must beat the TTL: after a session frees VRAM the node has to stop
+// advertising the busy figure, rather than under-reporting until the TTL expires.
+func TestMonitorRefreshBeatsTTL(t *testing.T) {
+	var mu sync.Mutex
+	free := uint64(1 << 29) // "busy"
+	m := &Monitor{TTL: time.Hour, probe: func() VRAM {
+		mu.Lock()
+		f := free
+		mu.Unlock()
+		return VRAM{Source: nvidiaSMISourceName, AsOf: time.Now(),
+			Devices: []Device{{Name: "gpu", TotalBytes: 1 << 30, FreeBytes: f}}}
+	}}
+	if got := m.Get().Free(); got != 1<<29 {
+		t.Fatalf("warm-up Free() = %d, want %d", got, uint64(1<<29))
+	}
+
+	// The session ends: VRAM is actually free again.
+	mu.Lock()
+	free = 1 << 30
+	mu.Unlock()
+
+	// Without Refresh the hour-long TTL would pin the stale value.
+	if got := m.Get().Free(); got != 1<<29 {
+		t.Fatalf("Free() = %d — cache should still be serving the stale value here", got)
+	}
+	m.Refresh()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if m.Get().Free() == 1<<30 {
+			return // converged despite the TTL
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Refresh did not re-measure: Get still serves the pre-teardown value")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Refresh must never make a caller block, even on a wedged probe.
+func TestMonitorRefreshNeverBlocksGet(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	m := &Monitor{TTL: time.Hour, probe: func() VRAM {
+		once.Do(func() {}) // first call (warm-up) returns immediately
+		select {
+		case <-release:
+		case <-time.After(5 * time.Second):
+		}
+		return VRAM{Source: nvidiaSMISourceName, AsOf: time.Now(),
+			Devices: []Device{{Name: "gpu", TotalBytes: 1 << 30, FreeBytes: 1 << 30}}}
+	}}
+	close(release) // let the synchronous warm-up through
+	_ = m.Get()
+
+	release = make(chan struct{}) // now wedge the probe
+	m.Refresh()
+	done := make(chan struct{})
+	go func() { _ = m.Get(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Get blocked behind a wedged Refresh — the telemetry tick would stall")
+	}
+}
+
+// A cold Monitor must not be faked warm: a concurrent Get would then read a zero
+// snapshot, which is indistinguishable from "this machine has no GPU".
+func TestMonitorRefreshColdDoesNotFabricate(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	m := &Monitor{TTL: time.Hour, probe: func() VRAM {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return VRAM{Source: nvidiaSMISourceName, AsOf: time.Now(),
+			Devices: []Device{{Name: "gpu", TotalBytes: 1 << 30, FreeBytes: 1 << 30}}}
+	}}
+	m.Refresh() // cold: must be a no-op
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("Refresh on a cold monitor probed %d times, want 0", got)
+	}
+	if v := m.Get(); !v.Known() || v.Free() != 1<<30 {
+		t.Fatalf("first Get after a cold Refresh must still return a real measurement, got %+v", v)
+	}
+}

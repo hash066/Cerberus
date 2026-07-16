@@ -207,12 +207,64 @@ next-best node becomes a hot standby, and the plan participates in the same
 the scheduler via `system.schedulerLoop` (subscribed to
 `cerberus/<site>/telemetry/**`).
 
+### Which GPU does this node lend? (the index mismatch)
+
+**Never map a device index across probes.** Two orderings are in play and they do
+not line up — measured on the RTX 3050 box, 2026-07-16:
+
+| | index 0 | index 1 |
+|---|---|---|
+| `nvidia-smi` (`daemon/gpu.Probe`) | **NVIDIA RTX 3050** (the dGPU) | — |
+| ggml/Vulkan (`-d`) | `Vulkan0` = **Intel Iris Xe** (the iGPU) | `Vulkan1` = NVIDIA RTX 3050 |
+
+The mismatch is structural: `nvidia-smi` enumerates only NVIDIA GPUs, Vulkan
+enumerates every Vulkan-capable device including the integrated one. On any
+iGPU+dGPU laptop the two disagree at index 0, so building `-d Vulkan0` from probe
+index 0 lends the **wrong card** while telemetry advertises the dGPU's VRAM. The
+sources also disagree numerically for the *same* card (nvidia-smi 4096 MiB total,
+Vulkan 3964 MiB — board memory vs Vulkan's heap budget), so they cannot be
+correlated by size either. **The name is the only common ground**, and it is what
+`llama.DefaultDevice` matches on; `llama.SelectDevice` refuses a bare integer.
+
+Also note `-d` is not "pick the best GPU" when omitted — at b10021 it means *serve
+every device*, splitting the model and KV cache across all of them. `daemon/llama`
+therefore resolves an explicit single device by default; multi-device is opt-in
+(`Device: "Vulkan0,Vulkan1"`). See `daemon/llama/devices.go`.
+
+### Live VRAM accounting: measured, deliberately not booked
+
+`PlaceGPU` reads free VRAM to choose a node, and that number is **live and
+measured**: a real ~1 GiB allocation on the 3050 moved `VRAMSnapshot().Free()`
+within ~2s and correctly flipped a two-node `PlaceGPU` to the peer (verified
+2026-07-16). `Monitor.Refresh` re-measures at session teardown so a node stops
+advertising the busy figure the moment its tensors are gone.
+
+A **booking ledger that debits a quota as sessions run is deliberately not built**,
+because it would be a second and worse source of truth:
+
+- It would only know Cerberus's own sessions. A user's game or browser holding
+  3 GiB would be invisible, so it would report "nothing booked, 4 GiB free" while
+  `nvidia-smi` says otherwise — exactly the plausible-looking lie
+  `daemon/gpu/vramprobe.go` exists to prevent. Measurement sees every consumer.
+- `contract.Quota.Bytes` is a **per-request ceiling, not a balance**
+  (`daemon/gpu/quota.go` compares; it never subtracts). Making it debitable
+  changes a frozen contract type — a cross-lane event (CONTRACT.md).
+- On the llama path a byte quota is **unenforceable by design**: after the
+  capability gate the stream is ggml-rpc's own protocol and Cerberus does not
+  parse it, because parsing it would rebuild the deserializer CVE-2026-34159 lived
+  in. `daemon/llama/quota.go` refuses a `Quota.Bytes` grant rather than pretend.
+  So the path that actually consumes VRAM has nowhere to hook a debit.
+
+What measurement genuinely cannot cover is the **admission race**: between placing
+a task and its allocation appearing in the probe there is a window (~2s observed).
+On the llama path that window is already closed by `RPCServer`'s hard single slot
+(`ErrBusy` on a second concurrent session), so a node cannot overcommit itself.
+
 ### Honest remaining gaps (not faked, not §8 Frontier)
 
-- **Live VRAM quota accounting.** `PlaceGPU` reads free VRAM to *choose* a node,
-  but the composed daemon does not yet *debit* a node's live VRAM as device
-  sessions run, nor auto-route an opened device to the placement result. Those
-  accounting/auto-routing steps remain.
+- **Auto-routing an opened device to a placement result.** `PlaceGPU` chooses a
+  node, but opening `/cer/dev/gpu/<peer>/0` does not consult that plan — the
+  caller picks the peer. That wiring remains.
 - **RDMA / true zero-copy** for the GPU data-plane session is Frontier (vertical
   04 §10); the session streams over QUIC (the "zero-copy intent"), not RDMA.
 - **zk-WASM proof-of-inference** and **host-TEE memory shielding** stay documented
@@ -231,6 +283,7 @@ the scheduler via `system.schedulerLoop` (subscribed to
 | `daemon/gpu/session.go` | GPU-over-data-plane session codec (`Serve` / `RequestSession`) for the 9P `/cer/dev/gpu` device path |
 | `daemon/dataplane/server.go` | `RegisterResponder` — the request/response session a GPU ctl grant uses |
 | `daemon/gpu/vramprobe*.go` | real per-device VRAM telemetry — see [docs/vram.md](vram.md) |
+| `daemon/llama/devices.go` | ggml device enumeration + name-based selection (the index-mismatch fix) |
 | `daemon/ffi/gpu_ffi.go` | cgo binding to `cerberus_gpu_submit` (`-tags ffi`) |
 | `daemon/ffi/gpu_ffi_ld.go` | extra Win32 link flags for the GPU build (`-tags "ffi ffigpu"`) |
 | `daemon/mesh/gpu.go` | cross-node GPU dispatch primitive (capability-gated) |
