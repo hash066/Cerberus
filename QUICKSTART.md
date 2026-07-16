@@ -91,13 +91,26 @@ Also worth a look — B's devices are now part of A's namespace view:
 
 ```powershell
 cerberus devices
-#   9P namespace devices (…):
-#     /cer/dev/vram/local/0    kind=vram   quota=2.0 GiB
-#     /cer/dev/gpu/local/0     kind=gpu    quota=16.0 MiB
-#     /cer/dev/cpu/local/0     kind=cpu    ...
-#     /cer/dev/audio/mic/0     kind=audio  name="…"
-#     ... pooled peer entries appear as /cer/dev/cpu/<peer8>/0 etc.
+#   9P namespace devices (8):
+#     /cer/dev/audio/91d02b…/mic/0      kind=audio  quota=0 B        name="Microphone Array (…)"  peer=91d02b…
+#     /cer/dev/audio/91d02b…/speaker/0  kind=audio  quota=0 B        name="Speakers (…)"          peer=91d02b…
+#     /cer/dev/audio/mic/0              kind=audio  quota=0 B        name="Microphone Array (…)"
+#     /cer/dev/audio/speaker/0          kind=audio  quota=0 B        name="Speakers (…)"
+#     /cer/dev/cpu/91d02b…/0            kind=cpu    quota=64.0 MiB   name="CPU 20 cores"          peer=91d02b…
+#     /cer/dev/cpu/local/0              kind=cpu    quota=64.0 MiB   name="Local CPU 20 cores"
+#     /cer/dev/gpu/local/0              kind=gpu    quota=16.0 MiB
+#     /cer/dev/vram/local/0             kind=vram   quota=4.0 GiB
 ```
+
+The peer's CPU and audio devices appear in your namespace as
+`/cer/dev/<kind>/<peer8>/0` — that is the pooling.
+
+The VRAM quota is **measured, not assumed**: `4.0 GiB` above is an RTX 3050
+Laptop GPU reporting its real 4096 MiB, read from the same `nvidia-smi` a human
+would run ([docs/vram.md](docs/vram.md)). If your card reports `quota=0 B`, that
+is the honest "unknown" — this host could not measure it, and the scheduler will
+treat the node as infeasible for VRAM-gated placement rather than send a model to
+a card that cannot hold it.
 
 ### Different networks (Tailscale)
 
@@ -177,7 +190,7 @@ never claims a GPU it didn't use.
 
 ## 6. Pipeline inference across both nodes
 
-The daemon ships a layer-split inference demo: the scheduler splits a model's
+The daemon ships a layer-split pipeline demo: the scheduler splits a model's
 layers into shards, places them across the mesh by live telemetry, and streams
 activations stage-to-stage over the QUIC data plane.
 
@@ -185,21 +198,51 @@ activations stage-to-stage over the QUIC data plane.
 cerberus pipeline-run
 #   Model:   split-mlp-demo
 #   Backend: cpu-software
-#     layers 0-1 on 3fce4a… (local) 1.2ms
-#     layers 2-3 on 91d02b… (remote) 8.7ms
-#   Output (16 bytes): …
+#     layers 0-1 on 6bd905b1… (remote) 85.2ms
+#     layers 2-3 on 61939825… (local)   0s
+#   Content: [split-mlp fixture cpu-software] activation: [0.8165, 0.8181, 0.8198, 0.8214]
+#   Output (16 bytes): c408513f0472513f44db513f8644523f
 ```
 
 Each stage line names the node that executed it and whether it was `local` or
 `remote` — placement is the scheduler's call, made from telemetry, and the
 printout is the truth of what happened.
 
-**Honesty note:** `split-mlp-demo` is a real 4-layer MLP fixture — real math,
-real cross-node orchestration, deliberately *not* a language model. The
-llama.cpp/MLX engine seams exist (`cerberus pipeline-run --model tinyllama-1b
---backend llamacpp`) but report `llamacpp-mock`/`mlx-mock` unless you wire real
-weights and sidecars — see `test/llm_pipeline_e2e` for that setup. Cerberus is
-not claiming production LLM serving today.
+**Read this before you get excited.** `split-mlp-demo` is a 4-layer × 4-dim MLP
+**fixture** with weights from a formula. It has no tokenizer, no weights file, no
+KV-cache and no sampler — it is not a language model and never was. What is real
+here is the *distribution machinery*: scheduler placement from live telemetry, a
+signed capability checked before the remote stage runs, and an activation that
+genuinely crossed a QUIC data plane to another machine. That machinery is the
+product; the fixture is how we test it honestly without a model.
+
+There is **no LLM path through Cerberus today**. v0.1 shipped `--model
+tinyllama-1b --backend llamacpp` and `--backend mlx`; all of it was mock and all
+of it was deleted (commit `72a0f4a`) rather than repaired. The `--model` and
+`--backend` flags still parse, but every removed value is now rejected to your
+face instead of quietly running a 4-float toy under a real engine's name:
+
+```powershell
+cerberus pipeline-run --backend llamacpp
+#   pipeline-run: inference: backend "llamacpp" is not provided by this package —
+#   the "llamacpp" mock was removed; real llama.cpp inference lives in
+#   daemon/llama (llama-server + ggml-rpc-server), not behind this flag
+
+cerberus pipeline-run --model tinyllama-1b
+#   pipeline-run: inference: unknown model "tinyllama-1b"
+```
+
+`daemon/llama` — supervise a real `llama-server` / `ggml-rpc-server` over a
+capability-gated tunnel — is written and unit-tested, but **no binary imports it
+yet**, so there is nothing to run here. When it lands, the pitch will be *"run a
+model that fits on no single machine you own, safely"*, never *"go faster"*:
+splitting a model over a LAN is materially **slower** than one machine that can
+hold it, because activations cross the network at every layer boundary.
+
+> The `/v1/chat/completions` endpoint will still answer you — with `"1337"`, for
+> any model name, with invented token counts. That is a known bug; see the
+> warning in [README.md](README.md#what-works-today-v01-beta--honest). Don't
+> build on it.
 
 ## 7. Write a file on A, read it on B
 
@@ -273,10 +316,63 @@ Bonus surfaces, same capability gate:
 - **Agents:** wire Claude Code/Cursor to `cerberus-mcp` and ask it to "check
   the mesh, then run hello.wasm on the other node" — see [docs/mcp.md](docs/mcp.md).
 - **OpenAI SDKs:** `base_url=http://localhost:8080/v1`, Bearer = the operator
-  token; `GET /v1/models` lists the WASM shards and pipeline models — see
-  [docs/gateway.md](docs/gateway.md).
+  token. `GET /v1/models` lists **WASM shards only** — the pipeline fixture is
+  deliberately not advertised there, and no LLM is served. Read the
+  `/v1/chat/completions` warning in [README.md](README.md) before you point a
+  client at it — see [docs/gateway.md](docs/gateway.md).
 - **Dashboard:** the tray app shows nodes, devices, workloads, wallet
   transactions, and belief conflicts live.
+
+---
+
+## 10. Optional: mount the namespace as a real filesystem
+
+`cerberusd -mount` presents the 9P capability namespace as a host filesystem, so
+a file manager can browse it. The mounted view is scoped to a capability and
+shows exactly what a 9P client holding the same capability sees — it is a second
+*transport* onto the same checked namespace, not a second, unguarded path.
+
+```bash
+# Linux — real. Verified on WSL2 (kernel 6.6, real /dev/fuse): reads through the
+# mount are served by the kernel, and `ctl` hands back a data-plane descriptor
+# rather than device bytes. Pure-Go go-fuse: no cgo, no libfuse, nothing to install.
+mkdir -p /mnt/cerberus && cerberusd -mount /mnt/cerberus
+ls  /mnt/cerberus/dev/vram/local/0        # -> ctl  info
+cat /mnt/cerberus/dev/vram/local/0/info   # names the resource kind
+```
+
+```powershell
+# Windows — UNVERIFIED. The code path exists (cgofuse's nocgo binding against
+# the WinFsp driver, which is what the default no-cgo build selects), but we
+# have not tested it against a real WinFsp install. Needs https://winfsp.dev/rel/
+cerberusd.exe -mount X:
+```
+
+**What you cannot do through a mount:** browse or read `/cer/fs`. The metadata
+store is not a directory-listing source, so fs files are not enumerated, and a
+read-open over 9P returns `ENOSYS` — file bytes ride the data plane, never the
+9P control plane ([`daemon/ninep/wire.go:256`](daemon/ninep/wire.go)). "Put a
+file, drag it out of Explorer" is **not** a thing Cerberus does. Use
+`cerberus fs get`/`cat` (section 7), which drive the data-plane read path.
+
+macOS is deliberately not shipped: macFUSE needs a kernel extension, a reboot,
+and carries licence terms we're not dragging users into.
+
+### Data plane across machines
+
+Bulk bytes (file shards, activations, audio) ride a separate QUIC data plane
+from the control plane, and it defaults to `-dataplane-listen 0.0.0.0:0` — i.e.
+reachable from other machines, which is what section 7's "write on A, read on B"
+depends on. You only need to touch these if the default can't work:
+
+```powershell
+cerberusd.exe -dataplane-listen 0.0.0.0:7443   # pin a port for a firewall rule
+cerberusd.exe -dataplane-advertise 100.x.y.z   # only behind NAT/port-forward
+```
+
+Leave `-dataplane-advertise` empty unless you must set it: empty means "ask the
+OS routing table which local address reaches this peer," which is the correct
+answer on a multi-homed box and a wrong-by-construction guess if you hardcode it.
 
 ## Troubleshooting
 
