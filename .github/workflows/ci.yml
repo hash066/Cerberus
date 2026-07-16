@@ -56,6 +56,51 @@ jobs:
         # spurious package timeouts on cold Windows/macOS runners.
         run: go test -timeout 30m ./...
 
+  # ---------------------------------------------------------------- macOS CoreAudio
+  # daemon/audio's macOS backend (os_darwin.go) is the ONE cgo file in the package,
+  # gated behind `darwin && cgo && cerberus_coreaudio`. The `go` job above already
+  # runs macos-latest but pins CGO_ENABLED=0, so it compiles os_darwin_stub.go and
+  # NEVER touches the real backend — which is exactly why that file shipped having
+  # literally never been through a compiler. Verifiable without a Mac:
+  #
+  #   $ CGO_ENABLED=0 GOOS=darwin go list -f '{{.GoFiles}}' ./daemon/audio/
+  #   [... os_darwin_stub.go ...]
+  #
+  # No build on any other platform can reach it either: cgo needs clang AND Apple's
+  # CoreAudio/AudioToolbox frameworks, which are not redistributable (osxcross/zig
+  # ship a macOS libc, not the frameworks). This job is the only thing that compiles
+  # that file. See daemon/audio/osdispatch_test.go for the (GOOS,cgo)->file matrix
+  # this complements — that test pins which file is SELECTED; only a compiler can
+  # say whether it BUILDS.
+  #
+  # Hard gate, not advisory: if this cannot be made green, delete os_darwin.go
+  # rather than keep shipping code nobody has ever compiled.
+  #
+  # Do NOT "fix" this by flipping the `go` job's CGO_ENABLED — that pin is
+  # load-bearing for the Windows WinFsp mount (see its comment above).
+  audio-coreaudio:
+    name: audio CoreAudio compile (macos)
+    runs-on: macos-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go build -tags cerberus_coreaudio ./daemon/audio/
+        run: go build -tags cerberus_coreaudio ./daemon/audio/
+      - name: go vet -tags cerberus_coreaudio ./daemon/audio/
+        # vet also type-checks os_darwin_test.go, which `go build` skips.
+        run: go vet -tags cerberus_coreaudio ./daemon/audio/
+      - name: go test -tags cerberus_coreaudio ./daemon/audio/
+        # Live mic/speaker tests skip on ErrNoAudioDevice (same policy as
+        # os_windows_test.go / os_linux_test.go), and GitHub's macOS runners have
+        # no audio endpoint — so this is a compile+unit gate, not a hardware gate.
+        # It will not flake for lack of a microphone.
+        run: go test -tags cerberus_coreaudio -timeout 10m ./daemon/audio/
+
   golangci-lint:
     name: golangci-lint
     runs-on: ubuntu-latest
