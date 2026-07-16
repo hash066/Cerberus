@@ -72,6 +72,11 @@ func WireWorker(fab *mesh.Fabric, cfg WorkerConfig) error {
 		now,
 		cfg.Revoked,
 		contract.RightExec,
+		// The gate guards THIS site's mesh-compute resource, which is exactly what
+		// PreferRemoteExecutor.mintExecCap issues against. Before this was passed, a
+		// cap for any other resource carrying RightExec (mesh-gpu, llama-rpc) ran
+		// WASM here.
+		mesh.MeshComputeResource(cfg.Site),
 	)
 	fab.ServeComponentFetch(cfg.Store, mesh.SelfIssuerResolver, now, cfg.Revoked)
 	return nil

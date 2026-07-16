@@ -145,8 +145,14 @@ func (f *Fabric) handleSignedGpuStream(
 
 	// Same fail-closed capability gate as the signed compute path: a missing,
 	// malformed, forged, tampered, wrong-issuer, expired, or revoked cap — or one
-	// that does not convey RightExec — returns an error and the kernel never runs.
-	grant, verr := verifySignedCap(req.Caps, req.Issuer, resolveIssuer, now, isRevoked, contract.RightExec)
+	// that does not convey RightExec, or one issued for a resource OTHER than this
+	// node's mesh-gpu — returns an error and the kernel never runs.
+	//
+	// The resource check is what keeps this gate distinct from the compute gate.
+	// Both demand RightExec, so without it the two were interchangeable: a peer
+	// granted a cap to run a WASM workload could instead drive this node's physical
+	// GPU, and a cap for mesh-gpu could run arbitrary WASM. See capscope.go.
+	grant, verr := verifySignedCap(req.Caps, req.Issuer, resolveIssuer, now, isRevoked, contract.RightExec, MeshGpuResource(f.site), "gpu")
 	if verr != nil {
 		_ = writeGpuError(ss, verr.Error())
 		return

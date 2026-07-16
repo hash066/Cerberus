@@ -73,8 +73,12 @@ func TestSignedComputeRoundTrip(t *testing.T) {
 	var issuerPeerID contract.PeerID
 	copy(issuerPeerID[:], issuerPub)
 
+	// Mint against the resource the worker's gate actually guards. This used to be
+	// an arbitrary "/cer/dev/gpu/0", which proved nothing: the gate ignored
+	// grant.Resource entirely, so EVERY cap passed and the "valid cap is allowed"
+	// half of this test was vacuous.
 	grant, err := auth.NewGrant(
-		contract.ResourceRef{Kind: contract.KindGPU, Path: "/cer/dev/gpu/0"},
+		MeshComputeResource("test"),
 		[]contract.Right{contract.RightExec},
 		nil, time.Hour)
 	if err != nil {
@@ -97,11 +101,11 @@ func TestSignedComputeRoundTrip(t *testing.T) {
 	var handlerCalled int32
 	worker.ServeComputeSigned(func(_ context.Context, task contract.ComputeTask, g auth.Grant) (contract.ComputeResult, error) {
 		handlerCalled++
-		if g.Resource.Path != "/cer/dev/gpu/0" {
+		if g.Resource.Path != MeshComputeResource("test").Path {
 			t.Errorf("handler saw wrong resource: %+v", g.Resource)
 		}
 		return contract.ComputeResult{TaskID: task.TaskID, OK: true, Output: []byte("ran")}, nil
-	}, resolver, func() int64 { return time.Now().Unix() }, nil, contract.RightExec)
+	}, resolver, func() int64 { return time.Now().Unix() }, nil, contract.RightExec, MeshComputeResource("test"))
 
 	task := contract.ComputeTask{TaskID: []byte("signed-t1"), Component: []byte("cid"), Caps: [][]byte{env}}
 	res, err := requester.RequestComputeSigned(ctx, worker.PeerID(), task, issuerPeerID, contract.CapHandle(0))
@@ -145,7 +149,7 @@ func TestSignedComputeRejectsUnknownIssuer(t *testing.T) {
 	}
 
 	issuerSC, _ := newTestSignedCap(t)
-	grant, err := auth.NewGrant(contract.ResourceRef{Kind: contract.KindGPU}, []contract.Right{contract.RightExec}, nil, time.Hour)
+	grant, err := auth.NewGrant(MeshComputeResource("test"), []contract.Right{contract.RightExec}, nil, time.Hour)
 	if err != nil {
 		t.Fatalf("new grant: %v", err)
 	}
@@ -160,7 +164,7 @@ func TestSignedComputeRejectsUnknownIssuer(t *testing.T) {
 	worker.ServeComputeSigned(func(_ context.Context, task contract.ComputeTask, g auth.Grant) (contract.ComputeResult, error) {
 		handlerCalled = true
 		return contract.ComputeResult{TaskID: task.TaskID, OK: true}, nil
-	}, resolver, func() int64 { return time.Now().Unix() }, nil, contract.RightExec)
+	}, resolver, func() int64 { return time.Now().Unix() }, nil, contract.RightExec, MeshComputeResource("test"))
 
 	var randomIssuer contract.PeerID
 	_, _ = rand.Read(randomIssuer[:])
@@ -206,7 +210,7 @@ func TestSignedComputeRejectsRevokedCap(t *testing.T) {
 	var issuerPeerID contract.PeerID
 	copy(issuerPeerID[:], issuerPub)
 
-	grant, err := auth.NewGrant(contract.ResourceRef{Kind: contract.KindGPU}, []contract.Right{contract.RightExec}, nil, time.Hour)
+	grant, err := auth.NewGrant(MeshComputeResource("test"), []contract.Right{contract.RightExec}, nil, time.Hour)
 	if err != nil {
 		t.Fatalf("new grant: %v", err)
 	}
@@ -233,7 +237,7 @@ func TestSignedComputeRejectsRevokedCap(t *testing.T) {
 	worker.ServeComputeSigned(func(_ context.Context, task contract.ComputeTask, g auth.Grant) (contract.ComputeResult, error) {
 		handlerCalled = true
 		return contract.ComputeResult{TaskID: task.TaskID, OK: true}, nil
-	}, resolver, func() int64 { return time.Now().Unix() }, isRevoked, contract.RightExec)
+	}, resolver, func() int64 { return time.Now().Unix() }, isRevoked, contract.RightExec, MeshComputeResource("test"))
 
 	task := contract.ComputeTask{TaskID: []byte("t"), Caps: [][]byte{env}}
 	res, err := requester.RequestComputeSigned(ctx, worker.PeerID(), task, issuerPeerID, contract.CapHandle(0))
@@ -278,7 +282,7 @@ func TestSignedComputeRejectsMissingRequiredRight(t *testing.T) {
 	copy(issuerPeerID[:], issuerPub)
 
 	// Grant conveys only RightRead, but the worker requires RightExec.
-	grant, err := auth.NewGrant(contract.ResourceRef{Kind: contract.KindGPU}, []contract.Right{contract.RightRead}, nil, time.Hour)
+	grant, err := auth.NewGrant(MeshComputeResource("test"), []contract.Right{contract.RightRead}, nil, time.Hour)
 	if err != nil {
 		t.Fatalf("new grant: %v", err)
 	}
@@ -297,7 +301,7 @@ func TestSignedComputeRejectsMissingRequiredRight(t *testing.T) {
 	worker.ServeComputeSigned(func(_ context.Context, task contract.ComputeTask, g auth.Grant) (contract.ComputeResult, error) {
 		handlerCalled = true
 		return contract.ComputeResult{TaskID: task.TaskID, OK: true}, nil
-	}, resolver, func() int64 { return time.Now().Unix() }, nil, contract.RightExec)
+	}, resolver, func() int64 { return time.Now().Unix() }, nil, contract.RightExec, MeshComputeResource("test"))
 
 	task := contract.ComputeTask{TaskID: []byte("t"), Caps: [][]byte{env}}
 	res, err := requester.RequestComputeSigned(ctx, worker.PeerID(), task, issuerPeerID, contract.CapHandle(0))
@@ -339,7 +343,7 @@ func TestSignedComputeRejectsMissingEnvelope(t *testing.T) {
 	resolver := func(contract.PeerID) (ed25519.PublicKey, bool) { return nil, false }
 	worker.ServeComputeSigned(func(_ context.Context, task contract.ComputeTask, g auth.Grant) (contract.ComputeResult, error) {
 		return contract.ComputeResult{TaskID: task.TaskID, OK: true}, nil
-	}, resolver, func() int64 { return time.Now().Unix() }, nil, contract.RightExec)
+	}, resolver, func() int64 { return time.Now().Unix() }, nil, contract.RightExec, MeshComputeResource("test"))
 
 	// No Caps at all.
 	task := contract.ComputeTask{TaskID: []byte("t")}
@@ -356,7 +360,7 @@ func TestSignedComputeRejectsMissingEnvelope(t *testing.T) {
 // nil IssuerPubResolver — a configuration bug (ServeComputeSigned wired
 // without a resolver) must fail closed, not panic.
 func TestVerifySignedCapNoResolver(t *testing.T) {
-	_, err := verifySignedCap([][]byte{[]byte("x")}, contract.PeerID{}, nil, nil, nil, "")
+	_, err := verifySignedCap([][]byte{[]byte("x")}, contract.PeerID{}, nil, nil, nil, "", MeshComputeResource("test"), "compute")
 	if err == nil {
 		t.Fatal("verifySignedCap with a nil resolver must return an error")
 	}

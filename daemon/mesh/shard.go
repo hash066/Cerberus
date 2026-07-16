@@ -223,8 +223,9 @@ func (f *Fabric) handleShardStream(
 	}
 
 	// Fail closed: verify the signed capability BEFORE touching local at all — no
-	// store mutation and no read happens on a missing/invalid envelope.
-	if _, verr := verifyShardCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked, requiredRight); verr != nil {
+	// store mutation and no read happens on a missing/invalid envelope, or on one
+	// issued for some resource other than THIS site's shard-placement service.
+	if _, verr := verifyShardCap(req.Cap, req.Issuer, resolveIssuer, now, isRevoked, requiredRight, MeshShardResource(f.site)); verr != nil {
 		_ = writeShardError(ss, verr.Error())
 		return
 	}
@@ -264,8 +265,14 @@ func shardRightFor(op ShardOp) (contract.Right, error) {
 }
 
 // verifyShardCap extracts the signed envelope from the request, resolves the
-// issuer key it names, and Verifies it — the single fail-closed gate applied
-// before any local shard store access. It mirrors compute.go's verifySignedCap.
+// issuer key it names, Verifies it, and checks it is scoped to wantResource —
+// the single fail-closed gate applied before any local shard store access. It
+// mirrors compute.go's verifySignedCap.
+//
+// wantResource is this node's MeshShardResource(site). Without that comparison
+// any validly-signed cap carrying RightWrite would authorize writing into this
+// node's shard store, and any carrying RightRead would authorize reading it —
+// including caps minted for a completely unrelated service. See capscope.go.
 func verifyShardCap(
 	env []byte,
 	claimedIssuer contract.PeerID,
@@ -273,6 +280,7 @@ func verifyShardCap(
 	now func() int64,
 	isRevoked auth.RevocationPredicate,
 	requiredRight contract.Right,
+	wantResource contract.ResourceRef,
 ) (auth.Grant, error) {
 	if resolveIssuer == nil {
 		return auth.Grant{}, fmt.Errorf("mesh: no issuer resolver configured for shard RPC")
@@ -294,6 +302,9 @@ func verifyShardCap(
 	}
 	if requiredRight != "" && !grantHasRight(grant, requiredRight) {
 		return auth.Grant{}, fmt.Errorf("mesh: shard capability lacks required right %q", requiredRight)
+	}
+	if err := grantCoversResource("shard", grant, wantResource); err != nil {
+		return auth.Grant{}, err
 	}
 	return grant, nil
 }
